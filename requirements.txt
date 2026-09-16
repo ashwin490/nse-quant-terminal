@@ -17,4 +17,6 @@ optuna
 requests
 jugaad-data
 feedparser
+beautifulsoup4
 streamlit-autorefresh
+supabase
