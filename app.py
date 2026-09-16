@@ -4,6 +4,7 @@ import warnings
 from pathlib import Path
 from datetime import datetime, time as dtime
 import time
+import json
 
 warnings.filterwarnings("ignore", category=UserWarning, module="jugaad_data")
 warnings.filterwarnings("ignore", message="no explicit representation of timezones available for np.datetime64")
@@ -38,6 +39,12 @@ from core.alerts import send_telegram_alert
 from core.journal import log_trade_signal, get_journal_summary, execute_broker_order
 from core.sentiment import get_news_sentiment_score
 from core.options_feed import get_options_pcr
+
+# Try importing Supabase for cloud persistence
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client, Client = None, None
 
 # --- TELEGRAM CREDENTIALS ---
 os.environ["TELEGRAM_BOT_TOKEN"] = "8980995011:AAGjPaG2DLoAIkXqAAPLrCXxREJYreLmuOk"
@@ -86,6 +93,22 @@ def check_password():
 
 if not check_password():
     st.stop()
+
+# --- SUPABASE CLOUD INITIALIZATION ---
+@st.cache_resource
+def get_supabase_client():
+    if create_client is None:
+        return None
+    url = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None
+    key = st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+supabase = get_supabase_client()
 
 # --- AUTONOMOUS DAILY PRE-SCAN AUDIT ---
 try:
@@ -284,6 +307,37 @@ def generate_daily_options_alpha() -> dict:
 
     return signal_dict
 
+# --- CLOUD SUPABASE PERSISTENCE HELPER ---
+def save_signal_to_cloud(sig: dict):
+    if not supabase:
+        return
+    try:
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        existing = supabase.table("predictions").select("id").eq("ticker", sig['Ticker']).eq("predicted_date", today_str).execute()
+        if not existing.data:
+            supabase.table("predictions").insert({
+                "predicted_date": today_str,
+                "ticker": sig['Ticker'],
+                "company_name": sig['Ticker'],
+                "entry_price": sig['Price (₹)'],
+                "target_price": sig['Target (₹)'],
+                "stop_loss": sig['Stop Loss (₹)'],
+                "position_gbp": 25000.0,
+                "shares_qty": int(sig['Recommended Shares'].split()[0]),
+                "profit_goal": float(sig['Expected Return'].replace("+", "").replace("%", "")),
+                "confidence": int(float(sig['AI Win Confidence'].replace("%", ""))),
+                "hold_days": 5,
+                "status": "Active",
+                "latest_price": sig['Price (₹)'],
+                "pnl_pct": 0.0,
+                "news_status": "Clean",
+                "rns_headline": "Active AI Quant Signal",
+                "features_json": {},
+                "last_checked": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }).execute()
+    except Exception:
+        pass
+
 # --- SIDEBAR CONTROLS ---
 st.sidebar.header("⚙️ Autonomous Scanner Settings")
 selected_universe = st.sidebar.selectbox(
@@ -314,14 +368,15 @@ st.sidebar.header("🔄 Autonomous Loop")
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=True)
 refresh_interval_sec = st.sidebar.selectbox("Refresh Interval (Seconds)", [30, 60, 120], index=0)
 
-# --- TOP STATUS BAR ---
+# --- TOP STATUS Bar ---
 macro = get_market_regime()
 audit_summary = get_audit_summary()
 market_status = "🟢 OPEN" if is_nse_market_open() else "🔴 CLOSED"
+db_status_text = "🟢 ONLINE (SUPABASE)" if supabase else "🔴 OFFLINE"
 
 st.title("⚡ Autonomous Self-Learning Quant Terminal")
 st.caption(
-    f"Status: **Active & High-Certainty Mode (FinBERT + Options AI Active)** • Market (IST): **{market_status}** • Regime: **{macro['regime']}** (Multiplier: `{macro['bias_multiplier']:.2f}`) • "
+    f"Status: **Active & High-Certainty Mode (FinBERT + Options AI Active)** • Database: **{db_status_text}** • Market (IST): **{market_status}** • Regime: **{macro['regime']}** • "
     f"Model Win Rate: **{audit_summary['win_rate']}%** ({audit_summary['wins']}W / {audit_summary['losses']}L)"
 )
 
@@ -531,6 +586,7 @@ def run_predictions():
         try:
             for _, sig in qualified_only.iterrows():
                 log_trade_signal(sig.to_dict())
+                save_signal_to_cloud(sig.to_dict())
             
             for _, sig in qualified_only.head(3).iterrows():
                 alert_text = (
@@ -555,7 +611,7 @@ st.session_state["scan_results"] = res_df
 st.session_state["has_cleared"] = has_cleared
 
 with tab_scanner:
-    if st.button("🔄 Re-Scan Universe Now", width="stretch"):
+    if st.button("🔄 Re-Scan Universe Now", use_container_width=True):
         res_df, has_cleared = run_predictions()
         st.session_state["scan_results"] = res_df
         st.session_state["has_cleared"] = has_cleared
@@ -578,12 +634,12 @@ with tab_scanner:
                     st.metric(label="Target Gain", value=row["Expected Return"], delta=f"Buy Price: ₹{row['Price (₹)']}")
                     
                     st.markdown(
-                        f"💵 <span title='Exact rupee price to execute your buy order.' style='cursor:help; border-bottom: 1px dotted #888;'>**Buy Price:**</span> `₹{row['Price (₹)']}`  \n"
-                        f"🎯 <span title='The projected profit-booking exit price.' style='cursor:help; border-bottom: 1px dotted #888;'>**Target Price:**</span> `₹{row['Target (₹)']}`  \n"
-                        f"🛑 <span title='The strict risk-containment exit threshold to protect capital.' style='cursor:help; border-bottom: 1px dotted #888;'>**Stop Loss:**</span> `₹{row['Stop Loss (₹)']}`  \n"
-                        f"⏱️ <span title='Estimated trading days required to reach target.' style='cursor:help; border-bottom: 1px dotted #888;'>**Horizon:**</span> `{row['Est. Time to Target']}`  \n"
-                        f"📦 <span title='Recommended share quantity based on Kelly sizing.' style='cursor:help; border-bottom: 1px dotted #888;'>**Quantity:**</span> `{row['Recommended Shares']}`  \n"
-                        f"🤖 <span title='Composite AI score (ML + FinBERT + PCR).' style='cursor:help; border-bottom: 1px dotted #888;'>**AI Score:**</span> `{row['Adjusted Score']}`",
+                        f"💵 **Buy Price:** `₹{row['Price (₹)']}`  \n"
+                        f"🎯 **Target Price:** `₹{row['Target (₹)']}`  \n"
+                        f"🛑 **Stop Loss:** `₹{row['Stop Loss (₹)']}`  \n"
+                        f"⏱️ **Horizon:** `{row['Est. Time to Target']}`  \n"
+                        f"📦 **Quantity:** `{row['Recommended Shares']}`  \n"
+                        f"🤖 **AI Score:** `{row['Adjusted Score']}`",
                         unsafe_allow_html=True
                     )
 
@@ -605,7 +661,7 @@ with tab_scanner:
             "Est. Time to Target": "Horizon (Days)",
             "Recommended Shares": "Quantity"
         }).copy()
-        st.dataframe(display_df, width="stretch", hide_index=True)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
 
         st.markdown("---")
         st.subheader("📈 Trajectory Cone & Price Verification Inspector")
@@ -649,7 +705,7 @@ with tab_scanner:
                     margin=dict(l=10, r=10, t=10, b=10),
                     xaxis_rangeslider_visible=False
                 )
-                st.plotly_chart(fig, width="stretch", key="traj_inspector_chart")
+                st.plotly_chart(fig, use_container_width=True, key="traj_inspector_chart")
     else:
         st.warning(
             "🛡️ **Capital Protection Mode Active:** No absolute high-conviction buy setups cleared all strict institutional filters right now. "
@@ -721,7 +777,7 @@ with tab_journal:
     
     journal_df = get_journal_summary()
     if not journal_df.empty:
-        st.dataframe(journal_df, width="stretch", hide_index=True)
+        st.dataframe(journal_df, use_container_width=True, hide_index=True)
     else:
         st.info("No trades logged in the journal yet. Triggered signals will appear here automatically.")
 
