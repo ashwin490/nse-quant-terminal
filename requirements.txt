@@ -13,3 +13,6 @@ torch
 optuna
 requests
 jugaad-data
+feedparser
+catboost
+streamlit-autorefresh
