@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+joblib
+plotly
+yfinance
+pytz
+duckdb
+lightgbm
+xgboost
+transformers
+torch
+optuna
+requests
