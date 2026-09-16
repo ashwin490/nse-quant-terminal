@@ -7,12 +7,14 @@ yfinance
 pytz
 duckdb
 lightgbm
+catboost
 xgboost
+scikit-learn
+scipy
 transformers
 torch
 optuna
 requests
 jugaad-data
 feedparser
-catboost
 streamlit-autorefresh
