@@ -514,7 +514,11 @@ broker_mode = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=False)
-refresh_interval_sec = st.sidebar.selectbox("Refresh Interval (Seconds)", [60, 120, 300], index=1)
+
+# Map readable text to the exact seconds (300s = 5m, 600s = 10m, 3600s = 1hr)
+refresh_options = {"5 Minutes": 300, "10 Minutes": 600, "1 Hour": 3600}
+selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=0)
+refresh_interval_sec = refresh_options[selected_interval]
 
 macro = get_market_regime()
 audit_summary = get_audit_summary()
