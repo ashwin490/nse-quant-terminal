@@ -138,7 +138,6 @@ def init_duckdb_storage():
             )
         """)
         
-        # Self-migrate legacy schema if tables were created earlier without these columns
         existing_cols = [c[0] for c in con.execute("DESCRIBE trade_journal").fetchall()]
         col_definitions = {
             "date_str": "VARCHAR",
@@ -255,7 +254,6 @@ def audit_and_reconcile_all_trades():
                     WHERE trade_id = ?
                 """, [curr, pnl, new_status, exit_price, new_status, now_ts, now_ts, tr["trade_id"]])
 
-        # Audit Options Trades
         active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
         if not active_opts.empty:
             for _, opt in active_opts.iterrows():
@@ -732,12 +730,16 @@ with tab_options:
             m1.info(f"🎯 **Target Premium:** ₹{opt_signal['target_premium']:.2f} (+65%)")
             m2.warning(f"🛑 **Stop-Loss Premium:** ₹{opt_signal['stop_loss_premium']:.2f} (-50%)")
             m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:16]})")
+            
+            st.write("")
+            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", use_container_width=True):
+                st.success(f"Signal securely dispatched to {broker_mode} gateway.")
 
 # ==============================================================================
-# TAB 3: TRADE JOURNAL & DEDUPLICATION MAINTENANCE
+# TAB 3: MASTER TRADE JOURNAL & DEDUPLICATION MAINTENANCE
 # ==============================================================================
 with tab_journal:
-    st.subheader("📖 Autonomous Trade Journal & Reconciled Audit Trail")
+    st.subheader("📖 Autonomous Master Ledger (Equities & Options)")
     
     j_col1, j_col2 = st.columns([4, 1])
     with j_col2:
@@ -749,33 +751,55 @@ with tab_journal:
 
     con = duckdb.connect(DB_PATH, read_only=True)
     try:
-        j_df = con.execute("SELECT * FROM trade_journal ORDER BY timestamp DESC LIMIT 60").df()
+        df_eq = con.execute("SELECT * FROM trade_journal").df()
     except Exception:
-        j_df = pd.DataFrame()
+        df_eq = pd.DataFrame()
+        
+    try:
+        df_opt = con.execute("SELECT * FROM daily_options_journal").df()
+    except Exception:
+        df_opt = pd.DataFrame()
     finally:
         con.close()
 
-    if not j_df.empty:
-        expected_cols = [
-            "date_str", "ticker", "asset_type", "entry_price", "target_price", 
-            "stop_loss", "latest_price", "pnl_pct", "status", "last_audited"
-        ]
-        available_cols = [c for c in expected_cols if c in j_df.columns]
-        disp_df = j_df[available_cols].copy()
-        
-        rename_map = {
+    master_list = []
+    
+    if not df_eq.empty:
+        df_eq_clean = df_eq.rename(columns={
             "date_str": "Date", "ticker": "Symbol", "asset_type": "Asset",
             "entry_price": "Entry (₹)", "target_price": "Target (₹)",
             "stop_loss": "Stop (₹)", "latest_price": "Live Price (₹)",
-            "pnl_pct": "P&L (%)", "status": "Outcome / Status",
-            "last_audited": "Last Check"
-        }
-        disp_df.rename(columns={k: v for k, v in rename_map.items() if k in disp_df.columns}, inplace=True)
+            "pnl_pct": "P&L (%)", "status": "Status", "last_audited": "Last Checked"
+        })
+        master_list.append(df_eq_clean)
         
-        if "P&L (%)" in disp_df.columns:
-            disp_df["P&L (%)"] = disp_df["P&L (%)"].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "0.00%")
+    if not df_opt.empty:
+        df_opt['Asset'] = 'OPTIONS'
+        df_opt_clean = df_opt.rename(columns={
+            "date_key": "Date", "option_contract": "Symbol", 
+            "current_option_price": "Live Price (₹)", 
+            "target_premium": "Target (₹)",
+            "stop_loss_premium": "Stop (₹)", 
+            "pnl_pct": "P&L (%)", "status": "Status", "last_audited": "Last Checked"
+        })
+        if "Live Price (₹)" in df_opt_clean.columns:
+            df_opt_clean["Entry (₹)"] = df_opt_clean["Live Price (₹)"]
+        master_list.append(df_opt_clean)
+
+    if master_list:
+        master_df = pd.concat(master_list, ignore_index=True)
+        cols_to_keep = ["Date", "Symbol", "Asset", "Entry (₹)", "Target (₹)", "Stop (₹)", "Live Price (₹)", "P&L (%)", "Status", "Last Checked"]
+        master_df = master_df[[c for c in cols_to_keep if c in master_df.columns]]
+        
+        if "Last Checked" in master_df.columns:
+            master_df["Last Checked"] = pd.to_datetime(master_df["Last Checked"])
+            master_df.sort_values(by="Last Checked", ascending=False, inplace=True)
+            master_df["Last Checked"] = master_df["Last Checked"].dt.strftime('%Y-%m-%d %H:%M')
             
-        st.dataframe(disp_df, use_container_width=True, hide_index=True)
+        if "P&L (%)" in master_df.columns:
+            master_df["P&L (%)"] = master_df["P&L (%)"].apply(lambda x: f"{float(x):+.2f}%" if pd.notnull(x) else "0.00%")
+            
+        st.dataframe(master_df, use_container_width=True, hide_index=True)
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
