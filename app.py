@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import warnings
+import calendar
 from pathlib import Path
 from datetime import datetime, time as dtime
 import time
@@ -191,7 +192,7 @@ def is_nse_market_open() -> bool:
     return dtime(9, 15) <= now_ist.time() <= dtime(15, 30)
 
 # ==============================================================================
-# BLACK-SCHOLES OPTIONS ENGINE
+# OPTIONS ENGINE: BLACK-SCHOLES & EXPIRY ROLLOVER CALCS
 # ==============================================================================
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -205,6 +206,27 @@ def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float,
     d2 = d1 - sigma * math.sqrt(T)
     call_price = spot * norm_cdf(d1) - strike * math.exp(-r * T) * norm_cdf(d2)
     return max(round(call_price, 2), 0.05)
+
+def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
+    year = current_date.year
+    month = current_date.month
+    
+    def last_thursday_of(y, m):
+        cal = calendar.monthcalendar(y, m)
+        thursdays = [week[3] for week in cal if week[3] != 0]
+        return datetime(y, m, thursdays[-1], 15, 30)
+
+    expiry_dt = last_thursday_of(year, month)
+    days_left = (expiry_dt.date() - current_date.date()).days
+
+    # Institutional rollover rule: Roll to next month if <= 3 days left
+    if days_left < 4:
+        next_month = month + 1 if month < 12 else 1
+        next_year = year if month < 12 else year + 1
+        expiry_dt = last_thursday_of(next_year, next_month)
+        days_left = (expiry_dt.date() - current_date.date()).days
+
+    return expiry_dt, max(1, days_left)
 
 # ==============================================================================
 # AUDITING & RECONCILIATION ENGINE
@@ -266,14 +288,20 @@ def audit_and_reconcile_all_trades():
                     returns = np.log(h["Close"] / h["Close"].shift(1)).dropna()
                     sigma = float(returns.std() * np.sqrt(252))
                     sigma = max(0.15, min(0.60, sigma))
+                    
+                    # Estimate remaining days dynamically from original record date
+                    orig_date = datetime.strptime(str(opt['timestamp'])[:10], '%Y-%m-%d')
+                    days_elapsed = (now_ts.date() - orig_date.date()).days
+                    days_left = max(1, int(opt['expiry_days']) - days_elapsed)
 
                     live_prem = calculate_black_scholes_call(
                         spot=current_spot,
                         strike=float(opt["strike_price"]),
-                        days_to_exp=int(opt["expiry_days"]),
+                        days_to_exp=days_left,
                         r=0.0675,
                         sigma=sigma
                     )
+                    
                     entry_prem = float(opt["current_option_price"])
                     target_prem = float(opt["target_premium"])
                     stop_prem = float(opt["stop_loss_premium"])
@@ -319,11 +347,12 @@ def deduplicate_journal_ledger():
         con.close()
 
 # ==============================================================================
-# DAILY OPTIONS ALPHA GENERATOR (REAL SPOT + BLACK-SCHOLES)
+# DAILY OPTIONS ALPHA GENERATOR (DYNAMIC ROLLOVER)
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
-    today_str = datetime.now(ist_zone).strftime('%Y-%m-%d')
+    now_ist = datetime.now(ist_zone)
+    today_str = now_ist.strftime('%Y-%m-%d')
     
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
@@ -337,8 +366,8 @@ def generate_daily_options_alpha() -> dict:
 
     selected_stock = "SBIN"
     lot_size = 750
-    spot = 820.0
-    sigma = 0.24
+    spot = 996.0
+    sigma = 0.22
 
     try:
         h = yf.Ticker(f"{selected_stock}.NS").history(period="30d")
@@ -346,22 +375,35 @@ def generate_daily_options_alpha() -> dict:
             spot = float(h["Close"].iloc[-1])
             returns = np.log(h["Close"] / h["Close"].shift(1)).dropna()
             sigma = float(returns.std() * np.sqrt(252))
-            sigma = max(0.18, min(0.55, sigma))
+            sigma = max(0.16, min(0.45, sigma))
     except Exception:
         pass
 
-    strike = math.ceil((spot * 1.04) / 10.0) * 10.0
-    days_to_expiry = 28
-    theoretical_prem = calculate_black_scholes_call(spot, strike, days_to_expiry, 0.0675, sigma)
+    # 1. Compute dynamic DTE (Days to Expiry)
+    expiry_dt, days_to_expiry = get_nse_monthly_expiry(now_ist)
+    expiry_month_str = expiry_dt.strftime('%b').upper()
+
+    # 2. Select realistic strike based on DTE
+    otm_pct = 1.015 if days_to_expiry <= 7 else 1.035
+    strike = math.ceil((spot * otm_pct) / 10.0) * 10.0
+
+    # 3. Dynamic Black-Scholes pricing
+    theoretical_prem = calculate_black_scholes_call(
+        spot=spot, 
+        strike=strike, 
+        days_to_exp=days_to_expiry, 
+        r=0.0675, 
+        sigma=sigma
+    )
     
     target_prem = round(theoretical_prem * 1.65, 2)
     stop_prem = round(theoretical_prem * 0.50, 2)
     total_cap = round(theoretical_prem * lot_size, 2)
-    contract_label = f"{selected_stock} {datetime.now(ist_zone).strftime('%b').upper()} {int(strike)} CE"
+    contract_label = f"{selected_stock} {expiry_month_str} {int(strike)} CE"
 
     signal_dict = {
         "date_key": today_str,
-        "timestamp": datetime.now(ist_zone),
+        "timestamp": now_ist,
         "share_name": selected_stock,
         "option_contract": contract_label,
         "strike_price": float(strike),
@@ -376,7 +418,7 @@ def generate_daily_options_alpha() -> dict:
         "implied_vol": round(sigma * 100.0, 1),
         "status": "ACTIVE",
         "pnl_pct": 0.0,
-        "last_audited": datetime.now(ist_zone)
+        "last_audited": now_ist
     }
 
     con = duckdb.connect(DB_PATH, read_only=False)
