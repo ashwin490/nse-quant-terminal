@@ -40,13 +40,11 @@ from core.journal import log_trade_signal, get_journal_summary, execute_broker_o
 from core.sentiment import get_news_sentiment_score
 from core.options_feed import get_options_pcr
 
-# Try importing Supabase for cloud persistence
 try:
     from supabase import create_client, Client
 except ImportError:
     create_client, Client = None, None
 
-# --- TELEGRAM CREDENTIALS ---
 os.environ["TELEGRAM_BOT_TOKEN"] = "8980995011:AAGjPaG2DLoAIkXqAAPLrCXxREJYreLmuOk"
 os.environ["TELEGRAM_CHAT_ID"] = "8101792723"
 
@@ -64,9 +62,7 @@ FEATURE_COLS = [
 
 st.set_page_config(page_title="Autonomous AI Quant Terminal (NSE)", layout="wide")
 
-# --- SECURE LOGIN GATEWAY FOR MOBILE & CLOUD ACCESS ---
 def check_password():
-    """Returns True if the user entered the correct credentials."""
     def password_entered():
         if st.session_state.get("username") == "admin" and st.session_state.get("password") == "QuantTerminal2026!":
             st.session_state["password_correct"] = True
@@ -94,7 +90,6 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- SUPABASE CLOUD INITIALIZATION ---
 @st.cache_resource
 def get_supabase_client():
     if create_client is None:
@@ -110,42 +105,24 @@ def get_supabase_client():
 
 supabase = get_supabase_client()
 
-# --- AUTONOMOUS DAILY PRE-SCAN AUDIT ---
 try:
     evaluate_pending_trades()
 except Exception:
     pass
 
 def is_nse_market_open() -> bool:
-    """
-    Returns True if current time in India (IST) is Monday-Friday between 9:15 AM and 3:30 PM.
-    """
     ist_zone = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist_zone)
-    
     if now_ist.weekday() > 4:
         return False
-    
-    current_time = now_ist.time()
-    market_open = dtime(9, 15)
-    market_close = dtime(15, 30)
-    
-    return market_open <= current_time <= market_close
+    return dtime(9, 15) <= now_ist.time() <= dtime(15, 30)
 
-# --- PRICE-GATE VALIDATION & EXECUTION ENGINE ---
 def validate_and_execute_trade(symbol: str, target_entry: float, qty: int, broker_mode: str, is_option: bool = False):
     try:
         clean_sym = symbol.split()[0].replace(".NS", "")
-        lookup = f"{clean_sym}.NS"
-        ticker = yf.Ticker(lookup)
+        ticker = yf.Ticker(f"{clean_sym}.NS")
         hist = ticker.history(period="1d")
-        
-        if hist.empty:
-            live_price = target_entry
-        else:
-            live_price = float(hist["Close"].iloc[-1])
-            if is_option:
-                live_price = target_entry 
+        live_price = target_entry if hist.empty or is_option else float(hist["Close"].iloc[-1])
     except Exception:
         live_price = target_entry
 
@@ -155,14 +132,13 @@ def validate_and_execute_trade(symbol: str, target_entry: float, qty: int, broke
     if lower_bound <= live_price <= upper_bound:
         success, msg = execute_broker_order(symbol, qty, live_price, broker_mode)
         if success:
-            return True, f"✅ Executed successfully at current live price of **₹{live_price:.2f}**! ({msg})"
+            return True, f"✅ Executed at live price **₹{live_price:.2f}**! ({msg})"
         return False, msg
     elif live_price < lower_bound:
-        return False, f"⚠️ **Execution Paused:** Current price is **₹{live_price:.2f}**, which is lower than the predicted entry range (₹{target_entry:.2f}). It is better to wait until it reaches **₹{target_entry:.2f}** before executing."
+        return False, f"⚠️ Price is **₹{live_price:.2f}** (Waiting for entry pullback to ₹{target_entry:.2f})."
     else:
-        return False, f"⚠️ **Execution Paused:** Current price is **₹{live_price:.2f}**, which has exceeded the target entry point (₹{target_entry:.2f}). Waiting for a pullback is recommended."
+        return False, f"⚠️ Price is **₹{live_price:.2f}** (Exceeded target entry point)."
 
-# --- OPTIONS < ₹30K BUDGET & SAFE DUCKDB MIGRATION ---
 def init_options_journal():
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
@@ -192,46 +168,6 @@ def init_options_journal():
         con.close()
 
 init_options_journal()
-
-def evaluate_pending_options():
-    con = duckdb.connect(DB_PATH, read_only=False)
-    try:
-        active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
-        if active_opts.empty:
-            return
-
-        for _, opt in active_opts.iterrows():
-            sym = f"{opt['share_name']}.NS"
-            ticker = yf.Ticker(sym)
-            hist = ticker.history(period="3d")
-            if hist.empty:
-                continue
-                
-            current_spot = float(hist["Close"].iloc[-1])
-            prev_spot = float(hist["Close"].iloc[0])
-            pnl_pct = ((current_spot - prev_spot) / prev_spot) * 100.0 * 2.5
-
-            new_status = 'ACTIVE'
-            if pnl_pct >= 25.0:
-                new_status = 'WIN'
-            elif pnl_pct <= -20.0:
-                new_status = 'LOSS'
-
-            if new_status != 'ACTIVE':
-                con.execute("""
-                    UPDATE daily_options_journal 
-                    SET status = ?, outcome_pnl_pct = ? 
-                    WHERE date_key = ?
-                """, [new_status, round(pnl_pct, 2), opt['date_key']])
-    except Exception:
-        pass
-    finally:
-        con.close()
-
-try:
-    evaluate_pending_options()
-except Exception:
-    pass
 
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -269,7 +205,6 @@ def generate_daily_options_alpha() -> dict:
         pass
 
     total_cap = round(lot_size * target_entry_prem, 2)
-
     signal_dict = {
         "date_key": today_str,
         "timestamp": datetime.now(ist_zone),
@@ -307,12 +242,11 @@ def generate_daily_options_alpha() -> dict:
 
     return signal_dict
 
-# --- CLOUD SUPABASE PERSISTENCE HELPER ---
 def save_signal_to_cloud(sig: dict):
     if not supabase:
         return
+    today_str = datetime.now().strftime('%Y-%m-%d')
     try:
-        today_str = datetime.now().strftime('%Y-%m-%d')
         existing = supabase.table("predictions").select("id").eq("ticker", sig['Ticker']).eq("predicted_date", today_str).execute()
         if not existing.data:
             supabase.table("predictions").insert({
@@ -338,7 +272,6 @@ def save_signal_to_cloud(sig: dict):
     except Exception:
         pass
 
-# --- SIDEBAR CONTROLS ---
 st.sidebar.header("⚙️ Autonomous Scanner Settings")
 selected_universe = st.sidebar.selectbox(
     "Stock Universe",
@@ -357,18 +290,10 @@ broker_mode = st.sidebar.selectbox(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.header("🧬 Advanced Model Tuning")
-if st.sidebar.button("⚡ Run Optuna + Walk-Forward Retrain"):
-    with st.spinner("Running Optuna hyperparameter optimization across rolling folds..."):
-        time.sleep(2)
-        st.sidebar.success("✅ Model retrained with optimized hyperparameters!")
-
-st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=True)
 refresh_interval_sec = st.sidebar.selectbox("Refresh Interval (Seconds)", [30, 60, 120], index=0)
 
-# --- TOP STATUS Bar ---
 macro = get_market_regime()
 audit_summary = get_audit_summary()
 market_status = "🟢 OPEN" if is_nse_market_open() else "🔴 CLOSED"
@@ -376,11 +301,10 @@ db_status_text = "🟢 ONLINE (SUPABASE)" if supabase else "🔴 OFFLINE"
 
 st.title("⚡ Autonomous Self-Learning Quant Terminal")
 st.caption(
-    f"Status: **Active & High-Certainty Mode (FinBERT + Options AI Active)** • Database: **{db_status_text}** • Market (IST): **{market_status}** • Regime: **{macro['regime']}** • "
+    f"Status: **Active & High-Certainty Mode** • Database: **{db_status_text}** • Market (IST): **{market_status}** • Regime: **{macro['regime']}** • "
     f"Model Win Rate: **{audit_summary['win_rate']}%** ({audit_summary['wins']}W / {audit_summary['losses']}L)"
 )
 
-# --- NAVIGATION TABS ---
 tab_scanner, tab_options, tab_journal = st.tabs([
     "🎯 Equity High-Certainty Signals", 
     "📊 Daily Options Alpha (1 Signal/Day, < ₹30k Cap)", 
@@ -402,11 +326,9 @@ def clean_sym_name(sym: str) -> str:
 
 def run_predictions():
     if ml_model is None:
-        st.error("ML Model artifact missing. Please train the 10-year ensemble model first.")
         return pd.DataFrame(), False
 
     results = []
-    
     if "All Market Shares < ₹1,000" in selected_universe:
         target_basket = get_sub_1000_universe()
         if not target_basket:
@@ -417,8 +339,7 @@ def run_predictions():
         target_basket = NIFTY_BASKET
 
     total_stocks = len(target_basket)
-    prog = st.progress(0, text=f"Scanning {total_stocks} equities with FinBERT sentiment & Options PCR analysis...")
-
+    prog = st.progress(0, text=f"Scanning {total_stocks} equities...")
     macro_risk_mult = get_macro_risk_adjuster()
 
     for i, raw_sym in enumerate(target_basket):
@@ -513,11 +434,8 @@ def run_predictions():
 
         try:
             sizing = calculate_position_size(
-                entry_price=close,
-                stop_loss_price=stop,
-                target_price=target,
-                daily_atr=atr,
-                max_position_capital=25000.0
+                entry_price=close, stop_loss_price=stop, target_price=target,
+                daily_atr=atr, max_position_capital=25000.0
             )
         except Exception:
             sizing = {
@@ -533,19 +451,6 @@ def run_predictions():
         except Exception:
             pass
 
-        if not is_above_trend:
-            filter_reason = "Pullback Setup (Below 50-EMA)"
-        elif is_exhausted:
-            filter_reason = "Overbought Exhaustion Risk"
-        elif not has_volume:
-            filter_reason = "Low RVOL (< 0.95)"
-        elif mistake_penalty < 1.0:
-            filter_reason = "Autopsy Penalized Pattern"
-        elif final_score < 51.5:
-            filter_reason = "Developing Setup (< 51.5%)"
-        else:
-            filter_reason = "✅ Active Conviction Signal"
-
         is_qualified = (is_above_trend and not is_exhausted and has_volume and final_score >= 51.5)
 
         results.append({
@@ -560,7 +465,6 @@ def run_predictions():
             "Stop Loss (₹)": stop,
             "AI Win Confidence": f"{round(raw_prob, 1)}%",
             "Adjusted Score": round(final_score, 1),
-            "Status / Filter": filter_reason,
             "Qualified": is_qualified,
             "FullSymbol": full_sym
         })
@@ -587,25 +491,11 @@ def run_predictions():
             for _, sig in qualified_only.iterrows():
                 log_trade_signal(sig.to_dict())
                 save_signal_to_cloud(sig.to_dict())
-            
-            for _, sig in qualified_only.head(3).iterrows():
-                alert_text = (
-                    f"🚨 *ABSOLUTE CONVICTION BUY SIGNAL* 🚨\n\n"
-                    f"📌 *Ticker:* `{sig['Ticker']}`\n"
-                    f"💰 *Buy Price:* `₹{sig['Price (₹)']}`\n"
-                    f"🎯 *Target:* `₹{sig['Target (₹)']}` (`+{sig['Expected Return']}`)\n"
-                    f"🛑 *Stop Loss:* `₹{sig['Stop Loss (₹)']}`\n"
-                    f"📦 *Quantity:* `{sig['Recommended Shares']}`\n"
-                    f"⏱️ *Horizon:* `{sig['Est. Time to Target']}`\n"
-                    f"🤖 *Score:* `{sig['Adjusted Score']}`"
-                )
-                send_telegram_alert(alert_text)
         except Exception:
             pass
 
     return qualified_only, has_cleared
 
-# --- ALWAYS FORCE FRESH SCAN WHEN OPENING OR REFRESHING ---
 res_df, has_cleared = run_predictions()
 st.session_state["scan_results"] = res_df
 st.session_state["has_cleared"] = has_cleared
@@ -620,130 +510,46 @@ with tab_scanner:
     has_cleared_signals = st.session_state.get("has_cleared", False)
 
     if has_cleared_signals and not df_res.empty:
-        st.success(f"🟢 **{len(df_res)} Absolute High-Conviction Buy Setup(s) Found:** Cleared ML, FinBERT sentiment, Options PCR, and macro filters.")
+        st.success(f"🟢 **{len(df_res)} High-Conviction Buy Setup(s) Found:** Cleared all institutional filters.")
         
         cols = st.columns(min(len(df_res), 3))
-
         for idx, row in df_res.head(3).iterrows():
             col_idx = idx % 3
             with cols[col_idx]:
                 with st.container(border=True):
-                    st.success(f"🔥 DEFINITELY BUY #{idx + 1}")
+                    st.success(f"🔥 BUY SETUP #{idx + 1}")
                     st.markdown(f"### **{row['Ticker']}**")
-                    
-                    st.metric(label="Target Gain", value=row["Expected Return"], delta=f"Buy Price: ₹{row['Price (₹)']}")
-                    
+                    st.metric(label="Target Gain", value=row["Expected Return"], delta=f"Price: ₹{row['Price (₹)']}")
                     st.markdown(
                         f"💵 **Buy Price:** `₹{row['Price (₹)']}`  \n"
-                        f"🎯 **Target Price:** `₹{row['Target (₹)']}`  \n"
+                        f"🎯 **Target:** `₹{row['Target (₹)']}`  \n"
                         f"🛑 **Stop Loss:** `₹{row['Stop Loss (₹)']}`  \n"
-                        f"⏱️ **Horizon:** `{row['Est. Time to Target']}`  \n"
-                        f"📦 **Quantity:** `{row['Recommended Shares']}`  \n"
-                        f"🤖 **AI Score:** `{row['Adjusted Score']}`",
+                        f"📦 **Quantity:** `{row['Recommended Shares']}`",
                         unsafe_allow_html=True
                     )
-
                     qty_num = int(row['Recommended Shares'].split()[0])
-                    if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_{row['Ticker']}"):
-                        success, msg = validate_and_execute_trade(row['Ticker'], row['Price (₹)'], qty_num, broker_mode, is_option=False)
+                    if st.button(f"🚀 Execute Buy", key=f"exec_{row['Ticker']}"):
+                        success, msg = validate_and_execute_trade(row['Ticker'], row['Price (₹)'], qty_num, broker_mode)
                         if success:
                             st.success(msg)
                         else:
                             st.warning(msg)
-
-        st.markdown("---")
-        st.subheader("📊 High-Certainty Execution Telemetry")
-        display_df = df_res[[
-            "Ticker", "Price (₹)", "Target (₹)", "Stop Loss (₹)", 
-            "Est. Time to Target", "Recommended Shares", "Expected Return", "Adjusted Score"
-        ]].rename(columns={
-            "Price (₹)": "Buy Price (₹)",
-            "Est. Time to Target": "Horizon (Days)",
-            "Recommended Shares": "Quantity"
-        }).copy()
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.subheader("📈 Trajectory Cone & Price Verification Inspector")
-        sel_sym = st.selectbox("Select stock to inspect trajectory:", df_res["FullSymbol"].tolist())
-        if sel_sym:
-            clean_lookup = clean_sym_name(sel_sym) + ".NS"
-            df_chart = yf.download(clean_lookup, period="60d", interval="1d", progress=False)
-            if isinstance(df_chart.columns, pd.MultiIndex):
-                df_chart.columns = [c[0] for c in df_chart.columns]
-
-            if not df_chart.empty:
-                cone = generate_forecast_cone(df_chart, days_ahead=5)
-
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(
-                    x=df_chart.index, open=df_chart['Open'], high=df_chart['High'],
-                    low=df_chart['Low'], close=df_chart['Close'], name="Candles"
-                ))
-
-                if not cone.empty:
-                    anchor_date = [df_chart.index[-1]]
-                    anchor_close = [float(df_chart["Close"].iloc[-1])]
-                    cone_x = anchor_date + list(cone.index)
-                    upper_y = anchor_close + list(cone["Upper_Target"])
-                    lower_y = anchor_close + list(cone["Lower_Stop"])
-
-                    fig.add_trace(go.Scatter(
-                        x=cone_x, y=upper_y, mode='lines',
-                        line=dict(color='#00E676', width=2, dash='dash'),
-                        name="Target Goal"
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=cone_x, y=lower_y, mode='lines',
-                        line=dict(color='#FF5252', width=2, dash='dash'),
-                        name="Stop Loss Line"
-                    ))
-
-                fig.update_layout(
-                    template="plotly_dark",
-                    height=420,
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    xaxis_rangeslider_visible=False
-                )
-                st.plotly_chart(fig, use_container_width=True, key="traj_inspector_chart")
     else:
-        st.warning(
-            "🛡️ **Capital Protection Mode Active:** No absolute high-conviction buy setups cleared all strict institutional filters right now. "
-            "The terminal is holding back to protect your capital."
-        )
+        st.warning("🛡️ **Capital Protection Mode Active:** No setups cleared all strict filters right now.")
 
-# --- TAB 2: DAILY OPTIONS ALPHA (< ₹30K BUDGET & LIVE PREMIUM TRACKER) ---
 with tab_options:
-    st.subheader("📊 Institutional Daily Options Alpha (Strictly 1 Prediction / Day)")
-    st.caption("Budget-Locked & Live Price Tracking: Displays target entry premium alongside live market option premium updated every 30 seconds.")
-    
+    st.subheader("📊 Institutional Daily Options Alpha")
     opt_signal = generate_daily_options_alpha()
-
     if opt_signal:
-        live_option_price = opt_signal["current_option_price"]
-        try:
-            live_ticker = yf.Ticker(f"{opt_signal['share_name']}.NS")
-            live_hist = live_ticker.history(period="1d")
-            if not live_hist.empty:
-                live_option_price = round(opt_signal["current_option_price"] * (1.0 + np.random.uniform(-0.008, 0.008)), 2)
-        except Exception:
-            pass
-
         with st.container(border=True):
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Option Contract", opt_signal["option_contract"])
-                st.markdown(f"**Action:** `{opt_signal['action']}`")
             with col2:
-                st.metric("Target Entry Premium", f"₹{opt_signal['current_option_price']:.2f}", delta=f"Live Market: ₹{live_option_price:.2f}")
-                st.markdown(f"**Lot Size:** `{opt_signal['lot_size']}` units")
+                st.metric("Target Entry Premium", f"₹{opt_signal['current_option_price']:.2f}")
             with col3:
-                st.metric("AI Confidence", f"{opt_signal['ai_confidence']}%", delta=f"Total Cap: ₹{opt_signal['total_capital']:,.2f}")
-                st.markdown(f"**Target Premium:** `₹{opt_signal['target_premium']}` | **Stop Loss:** `₹{opt_signal['stop_loss_premium']}`")
-
-            st.info(f"💡 **Live Market Tracker:** Target entry is **₹{opt_signal['current_option_price']:.2f}** while current live premium is **₹{live_option_price:.2f}**. The terminal refreshes every 30s to monitor market alignment.")
-
-            if st.button(f"🚀 Execute Options Trade ({broker_mode})", key="exec_options_order"):
+                st.metric("AI Confidence", f"{opt_signal['ai_confidence']}%")
+            if st.button("🚀 Execute Options Trade", key="exec_opt_order"):
                 success, msg = validate_and_execute_trade(
                     symbol=opt_signal['option_contract'],
                     target_entry=opt_signal['current_option_price'],
@@ -751,44 +557,19 @@ with tab_options:
                     broker_mode=broker_mode,
                     is_option=True
                 )
-                
                 if success:
-                    opt_journal_payload = {
-                        "Ticker": opt_signal["option_contract"],
-                        "Price (₹)": opt_signal["current_option_price"],
-                        "Target (₹)": opt_signal["target_premium"],
-                        "Stop Loss (₹)": opt_signal["stop_loss_premium"],
-                        "Est. Time to Target": "Expiry",
-                        "Recommended Shares": f"{opt_signal['lot_size']} units (1 Lot)",
-                        "Expected Return": "+80.0%",
-                        "Adjusted Score": opt_signal["ai_confidence"]
-                    }
-                    log_trade_signal(opt_journal_payload)
-                    st.success(f"✅ Options order executed & logged to Audit Trail! {msg}")
+                    st.success(f"✅ Executed! {msg}")
                 else:
                     st.warning(msg)
-    else:
-        st.warning("Options engine is awaiting synchronization. Please try again shortly.")
 
-# --- TAB 3: AUTOMATED TRADE JOURNAL & P&L ---
 with tab_journal:
     st.subheader("📖 Autonomous Trade Journal & Signal Audit Log")
-    st.caption("Every high-conviction signal and executed trade generated by the terminal is permanently recorded here for performance attribution.")
-    
     journal_df = get_journal_summary()
     if not journal_df.empty:
         st.dataframe(journal_df, use_container_width=True, hide_index=True)
     else:
-        st.info("No trades logged in the journal yet. Triggered signals will appear here automatically.")
+        st.info("No trades logged in the journal yet.")
 
-# --- STRICT IST MARKET-HOURS REFRESH LOOP ---
-if auto_mode:
-    if is_nse_market_open():
-        if not st.session_state.get("has_cleared", False):
-            time.sleep(30)
-            st.rerun()
-        else:
-            time.sleep(refresh_interval_sec)
-            st.rerun()
-    else:
-        pass
+if auto_mode and is_nse_market_open():
+    time.sleep(refresh_interval_sec)
+    st.rerun()
