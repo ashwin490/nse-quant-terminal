@@ -97,7 +97,7 @@ if not check_password():
     st.stop()
 
 # ==============================================================================
-# DATABASE ENGINE (SUPABASE + DUCKDB INITIALIZATION)
+# DATABASE ENGINE (SUPABASE + SELF-MIGRATING DUCKDB)
 # ==============================================================================
 @st.cache_resource
 def get_supabase_client():
@@ -137,6 +137,25 @@ def init_duckdb_storage():
                 last_audited TIMESTAMP
             )
         """)
+        
+        # Self-migrate legacy schema if tables were created earlier without these columns
+        existing_cols = [c[0] for c in con.execute("DESCRIBE trade_journal").fetchall()]
+        col_definitions = {
+            "date_str": "VARCHAR",
+            "asset_type": "VARCHAR DEFAULT 'EQUITY'",
+            "latest_price": "DOUBLE",
+            "pnl_pct": "DOUBLE DEFAULT 0.0",
+            "exit_price": "DOUBLE DEFAULT 0.0",
+            "exit_timestamp": "TIMESTAMP",
+            "last_audited": "TIMESTAMP"
+        }
+        for col_name, col_type in col_definitions.items():
+            if col_name not in existing_cols:
+                try:
+                    con.execute(f"ALTER TABLE trade_journal ADD COLUMN {col_name} {col_type}")
+                except Exception:
+                    pass
+
         con.execute("""
             CREATE TABLE IF NOT EXISTS daily_options_journal (
                 date_key VARCHAR PRIMARY KEY,
@@ -158,6 +177,8 @@ def init_duckdb_storage():
                 last_audited TIMESTAMP
             )
         """)
+    except Exception:
+        pass
     finally:
         con.close()
 
@@ -171,14 +192,12 @@ def is_nse_market_open() -> bool:
     return dtime(9, 15) <= now_ist.time() <= dtime(15, 30)
 
 # ==============================================================================
-# BLACK-SCHOLES PRICING ENGINE (NO MOCKED RANDOM NUMBERS)
+# BLACK-SCHOLES OPTIONS ENGINE
 # ==============================================================================
 def norm_cdf(x: float) -> float:
-    """Standard normal cumulative distribution function."""
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float, r: float, sigma: float) -> float:
-    """Computes exact Black-Scholes call option price."""
     T = max(days_to_exp, 1.0) / 365.0
     if spot <= 0 or strike <= 0 or sigma <= 0:
         return max(0.0, spot - strike)
@@ -189,10 +208,9 @@ def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float,
     return max(round(call_price, 2), 0.05)
 
 # ==============================================================================
-# AUDITING & RECONCILIATION ENGINE (RESOLVES "STUCK ACTIVE" TRADES)
+# AUDITING & RECONCILIATION ENGINE
 # ==============================================================================
 def audit_and_reconcile_all_trades():
-    """Checks live prices for all open trades and marks WIN/LOSS upon reaching targets."""
     con = duckdb.connect(DB_PATH, read_only=False)
     now_ts = datetime.now()
     try:
@@ -283,19 +301,18 @@ def audit_and_reconcile_all_trades():
 
 audit_and_reconcile_all_trades()
 
-# Deduplication Routine: Cleans duplicate journal spam from rapid refreshes
 def deduplicate_journal_ledger():
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
         con.execute("""
             CREATE TEMP TABLE temp_unique_journal AS 
             SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER(PARTITION BY ticker, date_str ORDER BY timestamp ASC) as rn
+                SELECT *, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY timestamp ASC) as rn
                 FROM trade_journal
             ) WHERE rn = 1;
             
             DELETE FROM trade_journal;
-            INSERT INTO trade_journal SELECT trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price, stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price, exit_timestamp, last_audited FROM temp_unique_journal;
+            INSERT INTO trade_journal SELECT * EXCLUDE (rn) FROM temp_unique_journal;
             DROP TABLE temp_unique_journal;
         """)
     except Exception:
@@ -304,7 +321,7 @@ def deduplicate_journal_ledger():
         con.close()
 
 # ==============================================================================
-# REAL OPTIONS ALPHA GENERATOR (STRICTLY 1 / DAY WITH REAL SPOT)
+# DAILY OPTIONS ALPHA GENERATOR (REAL SPOT + BLACK-SCHOLES)
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -384,7 +401,7 @@ def generate_daily_options_alpha() -> dict:
     return signal_dict
 
 # ==============================================================================
-# AUDITED LOGGING & CLOUD SYNCHRONIZATION
+# AUDITED LOGGING & PERSISTENCE
 # ==============================================================================
 def log_equity_signal_safely(sig: dict):
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -394,7 +411,6 @@ def log_equity_signal_safely(sig: dict):
     ticker = sig['Ticker']
 
     try:
-        # Check if already logged today
         existing = con.execute("SELECT trade_id FROM trade_journal WHERE ticker = ? AND date_str = ?", [ticker, today_str]).df()
         if existing.empty:
             trade_id = f"{ticker}_{now.strftime('%Y%m%d_%H%M%S')}"
@@ -412,7 +428,6 @@ def log_equity_signal_safely(sig: dict):
     finally:
         con.close()
 
-    # Sync to Supabase
     if supabase:
         try:
             cloud_exist = supabase.table("predictions").select("id").eq("ticker", ticker).eq("predicted_date", today_str).execute()
@@ -741,20 +756,25 @@ with tab_journal:
         con.close()
 
     if not j_df.empty:
-        disp_df = j_df[[
+        expected_cols = [
             "date_str", "ticker", "asset_type", "entry_price", "target_price", 
             "stop_loss", "latest_price", "pnl_pct", "status", "last_audited"
-        ]].copy()
+        ]
+        available_cols = [c for c in expected_cols if c in j_df.columns]
+        disp_df = j_df[available_cols].copy()
         
-        disp_df.rename(columns={
+        rename_map = {
             "date_str": "Date", "ticker": "Symbol", "asset_type": "Asset",
             "entry_price": "Entry (₹)", "target_price": "Target (₹)",
             "stop_loss": "Stop (₹)", "latest_price": "Live Price (₹)",
             "pnl_pct": "P&L (%)", "status": "Outcome / Status",
             "last_audited": "Last Check"
-        }, inplace=True)
+        }
+        disp_df.rename(columns={k: v for k, v in rename_map.items() if k in disp_df.columns}, inplace=True)
         
-        disp_df["P&L (%)"] = disp_df["P&L (%)"].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "0.00%")
+        if "P&L (%)" in disp_df.columns:
+            disp_df["P&L (%)"] = disp_df["P&L (%)"].apply(lambda x: f"{x:+.2f}%" if pd.notnull(x) else "0.00%")
+            
         st.dataframe(disp_df, use_container_width=True, hide_index=True)
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
