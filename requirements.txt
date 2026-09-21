@@ -20,3 +20,4 @@ feedparser
 beautifulsoup4
 streamlit-autorefresh
 supabase
+torchvision

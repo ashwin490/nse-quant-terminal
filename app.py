@@ -83,13 +83,13 @@ def check_password():
         st.subheader("🔐 Autonomous Quant Terminal - Secure Login")
         st.text_input("Username", key="username")
         st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, use_container_width=True)
+        st.button("Log In", on_click=password_entered, width="stretch")
         return False
     elif not st.session_state["password_correct"]:
         st.subheader("🔐 Autonomous Quant Terminal - Secure Login")
         st.text_input("Username", key="username")
         st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, use_container_width=True)
+        st.button("Log In", on_click=password_entered, width="stretch")
         st.error("😕 Invalid username or password")
         return False
     return True
@@ -175,6 +175,16 @@ def init_duckdb_storage():
                 status VARCHAR DEFAULT 'ACTIVE',
                 pnl_pct DOUBLE DEFAULT 0.0,
                 last_audited TIMESTAMP
+            )
+        """)
+        
+        # Initialize a default daily_candles table to prevent SQL catalog errors during Deep Scans
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS daily_candles (
+                ticker VARCHAR,
+                close DOUBLE,
+                volume DOUBLE,
+                date_str VARCHAR
             )
         """)
     except Exception:
@@ -515,7 +525,7 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=False)
 
-# Map readable text to the exact seconds (300s = 5m, 600s = 10m, 3600s = 1hr)
+# Map readable text to the exact seconds to prevent API rate limits
 refresh_options = {"5 Minutes": 300, "10 Minutes": 600, "1 Hour": 3600}
 selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=0)
 refresh_interval_sec = refresh_options[selected_interval]
@@ -556,8 +566,15 @@ def run_predictions():
         return pd.DataFrame(), False
 
     results = []
+    
+    # Graceful fallback if the user's custom deep scan script fails or database table is empty
     if "All Market Shares < ₹1,000" in selected_universe:
-        target_basket = get_sub_1000_universe() or NIFTY_BASKET
+        try:
+            target_basket = get_sub_1000_universe()
+            if not target_basket:
+                target_basket = NIFTY_BASKET
+        except Exception:
+            target_basket = NIFTY_BASKET
     elif "Nifty 200" in selected_universe:
         target_basket = NIFTY_200_UNIVERSE
     else:
@@ -719,7 +736,7 @@ with tab_scanner:
     with col1:
         st.write("Equities screened via 10-year machine learning, Amihud illiquidity, and delivery surge checks:")
     with col2:
-        re_scan = st.button("🔄 Run Live Scan Now", use_container_width=True, type="primary")
+        re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
     if re_scan or "scan_results" not in st.session_state:
         with st.spinner("Executing quant screen across market universe..."):
@@ -745,7 +762,7 @@ with tab_scanner:
                         f"⏱️ **Horizon:** `{row['Est. Time to Target']}`  \n"
                         f"📦 **Size:** `{row['Recommended Shares']}` (`{row['Total Cost (₹)']}`)"
                     )
-                    if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_btn_{row['Ticker']}", use_container_width=True):
+                    if st.button(f"🚀 Execute Buy ({broker_mode})", key=f"exec_btn_{row['Ticker']}", width="stretch"):
                         st.info(f"Signal sent to {broker_mode}. Logged to journal.")
     else:
         st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
@@ -778,7 +795,7 @@ with tab_options:
             m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:16]})")
             
             st.write("")
-            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", use_container_width=True):
+            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", width="stretch"):
                 st.success(f"Signal securely dispatched to {broker_mode} gateway.")
 
 # ==============================================================================
@@ -789,7 +806,7 @@ with tab_journal:
     
     j_col1, j_col2 = st.columns([4, 1])
     with j_col2:
-        if st.button("🧹 Clean Duplicate Ghost Trades", use_container_width=True):
+        if st.button("🧹 Clean Duplicate Ghost Trades", width="stretch"):
             deduplicate_journal_ledger()
             audit_and_reconcile_all_trades()
             st.success("Ledger deduplicated and reconciled against live market!")
@@ -845,7 +862,7 @@ with tab_journal:
         if "P&L (%)" in master_df.columns:
             master_df["P&L (%)"] = master_df["P&L (%)"].apply(lambda x: f"{float(x):+.2f}%" if pd.notnull(x) else "0.00%")
             
-        st.dataframe(master_df, use_container_width=True, hide_index=True)
+        st.dataframe(master_df, width="stretch", hide_index=True)
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
