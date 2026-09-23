@@ -68,12 +68,18 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# SECURE MOBILE LOGIN GATEWAY
+# SECURE MOBILE LOGIN GATEWAY (WITH SESSION-PRESERVING TOKENS)
 # ==============================================================================
 def check_password():
+    # Retain active login across browser refreshes and scheduled reruns
+    if st.query_params.get("auth") == "QuantTerminal2026":
+        st.session_state["password_correct"] = True
+        return True
+
     def password_entered():
         if st.session_state.get("username") == "admin" and st.session_state.get("password") == "QuantTerminal2026!":
             st.session_state["password_correct"] = True
+            st.query_params["auth"] = "QuantTerminal2026"
             del st.session_state["password"]
             del st.session_state["username"]
         else:
@@ -178,7 +184,6 @@ def init_duckdb_storage():
             )
         """)
         
-        # Initialize a default daily_candles table to prevent SQL catalog errors during Deep Scans
         con.execute("""
             CREATE TABLE IF NOT EXISTS daily_candles (
                 ticker VARCHAR,
@@ -193,6 +198,52 @@ def init_duckdb_storage():
         con.close()
 
 init_duckdb_storage()
+
+def hydrate_duckdb_from_supabase():
+    """Restores trade records from Supabase if ephemeral cloud storage was cleared."""
+    if not supabase:
+        return
+    con = duckdb.connect(DB_PATH, read_only=False)
+    try:
+        eq_count = con.execute("SELECT COUNT(*) FROM trade_journal").fetchone()[0]
+        if eq_count == 0:
+            res = supabase.table("predictions").select("*").execute()
+            if res.data:
+                for r in res.data:
+                    trade_id = f"{r.get('ticker')}_{r.get('predicted_date')}"
+                    con.execute("""
+                        INSERT OR IGNORE INTO trade_journal 
+                        VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?)
+                    """, [
+                        trade_id, r.get('last_checked') or datetime.now(), r.get('predicted_date'),
+                        r.get('ticker'), float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
+                        float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
+                        r.get('status', 'ACTIVE').upper(), float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
+                        datetime.now()
+                    ])
+        
+        opt_count = con.execute("SELECT COUNT(*) FROM daily_options_journal").fetchone()[0]
+        if opt_count == 0:
+            res_opt = supabase.table("options_journal").select("*").execute()
+            if res_opt.data:
+                for o in res_opt.data:
+                    con.execute("""
+                        INSERT OR IGNORE INTO daily_options_journal 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        o.get('date_key'), o.get('timestamp') or datetime.now(), o.get('share_name'),
+                        o.get('option_contract'), float(o.get('strike_price', 0.0)), int(o.get('expiry_days', 28)),
+                        float(o.get('underlying_spot', 0.0)), int(o.get('lot_size', 750)), float(o.get('current_option_price', 0.0)),
+                        float(o.get('target_premium', 0.0)), float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
+                        float(o.get('ai_confidence', 84.5)), float(o.get('implied_vol', 20.0)), o.get('status', 'ACTIVE'),
+                        float(o.get('pnl_pct', 0.0)), o.get('last_audited') or datetime.now()
+                    ])
+    except Exception:
+        pass
+    finally:
+        con.close()
+
+hydrate_duckdb_from_supabase()
 
 def is_nse_market_open() -> bool:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -229,7 +280,6 @@ def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
     expiry_dt = last_thursday_of(year, month)
     days_left = (expiry_dt.date() - current_date.date()).days
 
-    # Institutional rollover rule: Roll to next month if <= 3 days left
     if days_left < 4:
         next_month = month + 1 if month < 12 else 1
         next_year = year if month < 12 else year + 1
@@ -299,7 +349,6 @@ def audit_and_reconcile_all_trades():
                     sigma = float(returns.std() * np.sqrt(252))
                     sigma = max(0.15, min(0.60, sigma))
                     
-                    # Estimate remaining days dynamically from original record date
                     orig_date = datetime.strptime(str(opt['timestamp'])[:10], '%Y-%m-%d')
                     days_elapsed = (now_ts.date() - orig_date.date()).days
                     days_left = max(1, int(opt['expiry_days']) - days_elapsed)
@@ -328,6 +377,19 @@ def audit_and_reconcile_all_trades():
                         SET current_option_price = ?, underlying_spot = ?, pnl_pct = ?, status = ?, last_audited = ?
                         WHERE date_key = ?
                     """, [live_prem, current_spot, pnl_pct, opt_status, now_ts, opt["date_key"]])
+                    
+                    # Keep Supabase updated with reconciliation audits
+                    if supabase:
+                        try:
+                            supabase.table("options_journal").update({
+                                "current_option_price": live_prem,
+                                "underlying_spot": current_spot,
+                                "pnl_pct": pnl_pct,
+                                "status": opt_status,
+                                "last_audited": str(now_ts)
+                            }).eq("date_key", opt["date_key"]).execute()
+                        except Exception:
+                            pass
                 except Exception:
                     continue
     except Exception:
@@ -357,13 +419,14 @@ def deduplicate_journal_ledger():
         con.close()
 
 # ==============================================================================
-# DAILY OPTIONS ALPHA GENERATOR (DYNAMIC ROLLOVER)
+# DAILY OPTIONS ALPHA GENERATOR (WITH SUPABASE PERSISTENCE)
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist_zone)
     today_str = now_ist.strftime('%Y-%m-%d')
     
+    # 1. Check local cache
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
         df = con.execute("SELECT * FROM daily_options_journal WHERE date_key = ?", [today_str]).df()
@@ -374,6 +437,34 @@ def generate_daily_options_alpha() -> dict:
     finally:
         con.close()
 
+    # 2. Check cloud cache to prevent recalculation after a reboot
+    if supabase:
+        try:
+            cloud_opt = supabase.table("options_journal").select("*").eq("date_key", today_str).execute()
+            if cloud_opt.data:
+                record = cloud_opt.data[0]
+                con = duckdb.connect(DB_PATH, read_only=False)
+                try:
+                    con.execute("""
+                        INSERT OR REPLACE INTO daily_options_journal 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        record['date_key'], record['timestamp'], record['share_name'],
+                        record['option_contract'], float(record['strike_price']), int(record['expiry_days']),
+                        float(record['underlying_spot']), int(record['lot_size']), float(record['current_option_price']),
+                        float(record['target_premium']), float(record['stop_loss_premium']), float(record['total_capital']),
+                        float(record['ai_confidence']), float(record['implied_vol']), record['status'],
+                        float(record['pnl_pct']), record['last_audited']
+                    ])
+                except Exception:
+                    pass
+                finally:
+                    con.close()
+                return record
+        except Exception:
+            pass
+
+    # 3. Compute baseline setup if no record exists for today
     selected_stock = "SBIN"
     lot_size = 750
     spot = 996.0
@@ -389,15 +480,12 @@ def generate_daily_options_alpha() -> dict:
     except Exception:
         pass
 
-    # 1. Compute dynamic DTE (Days to Expiry)
     expiry_dt, days_to_expiry = get_nse_monthly_expiry(now_ist)
     expiry_month_str = expiry_dt.strftime('%b').upper()
 
-    # 2. Select realistic strike based on DTE
     otm_pct = 1.015 if days_to_expiry <= 7 else 1.035
     strike = math.ceil((spot * otm_pct) / 10.0) * 10.0
 
-    # 3. Dynamic Black-Scholes pricing
     theoretical_prem = calculate_black_scholes_call(
         spot=spot, 
         strike=strike, 
@@ -447,6 +535,19 @@ def generate_daily_options_alpha() -> dict:
         pass
     finally:
         con.close()
+
+    # Sync to Supabase cloud
+    if supabase:
+        try:
+            cloud_payload = signal_dict.copy()
+            cloud_payload["timestamp"] = str(cloud_payload["timestamp"])
+            cloud_payload["last_audited"] = str(cloud_payload["last_audited"])
+            
+            c_check = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
+            if not c_check.data:
+                supabase.table("options_journal").insert(cloud_payload).execute()
+        except Exception:
+            pass
 
     return signal_dict
 
@@ -523,16 +624,23 @@ broker_mode = st.sidebar.selectbox(
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
-auto_mode = st.sidebar.toggle("Continuous Background Mode", value=False)
 
-# Map readable text to the exact seconds to prevent API rate limits
+# Defaults to True automatically if the market is open
+market_is_open = is_nse_market_open()
+auto_mode = st.sidebar.toggle("Continuous Background Mode", value=market_is_open)
+
 refresh_options = {"5 Minutes": 300, "10 Minutes": 600, "1 Hour": 3600}
 selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=0)
 refresh_interval_sec = refresh_options[selected_interval]
 
+if st.sidebar.button("🚪 Log Out", width="stretch"):
+    st.query_params.clear()
+    st.session_state["password_correct"] = False
+    st.rerun()
+
 macro = get_market_regime()
 audit_summary = get_audit_summary()
-market_status = "🟢 OPEN" if is_nse_market_open() else "🔴 CLOSED"
+market_status = "🟢 OPEN" if market_is_open else "🔴 CLOSED"
 db_status_text = "🟢 ONLINE (SUPABASE)" if supabase else "🔴 OFFLINE"
 
 st.title("⚡ Autonomous Self-Learning Quant Terminal")
@@ -566,8 +674,6 @@ def run_predictions():
         return pd.DataFrame(), False
 
     results = []
-    
-    # Graceful fallback if the user's custom deep scan script fails or database table is empty
     if "All Market Shares < ₹1,000" in selected_universe:
         try:
             target_basket = get_sub_1000_universe()
