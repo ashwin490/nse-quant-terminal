@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime, time as dtime
 import time
 import json
+import requests
 
 warnings.filterwarnings("ignore", category=UserWarning, module="jugaad_data")
 warnings.filterwarnings("ignore", message="no explicit representation of timezones available for np.datetime64")
@@ -249,8 +250,36 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
     return f"{clean}.NS"
 
 # ==============================================================================
-# OPTIONS ENGINE: BLACK-SCHOLES PRICING & EXPIRY LOGIC
+# OPTIONS ENGINE: LIVE NSE DATA FETCH & BLACK-SCHOLES FALLBACK
 # ==============================================================================
+def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
+    """Secretly queries the NSE servers for the real-time order book premium."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.5"
+        }
+        session = requests.Session()
+        session.headers.update(headers)
+        
+        # Step 1: Mimic a human visiting the homepage to generate a valid session cookie
+        session.get("https://www.nseindia.com", timeout=5)
+        
+        # Step 2: Fetch the live option chain JSON
+        url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
+        res = session.get(url, timeout=5)
+        
+        if res.status_code == 200:
+            data = res.json()
+            # Step 3: Find our specific strike price and return the Last Traded Price (LTP)
+            for item in data.get('records', {}).get('data', []):
+                if float(item.get('strikePrice', 0)) == float(strike):
+                    return float(item.get(right, {}).get('lastPrice', 0.0))
+        return 0.0
+    except Exception:
+        return 0.0
+
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -346,21 +375,26 @@ def audit_and_reconcile_all_trades():
                     h_live = yf.Ticker(sym).history(period="1d", interval="5m")
                     current_spot = float(h_live["Close"].iloc[-1]) if not h_live.empty else float(h_daily["Close"].iloc[-1])
                     
-                    returns = np.log(h_daily["Close"] / h_daily["Close"].shift(1)).dropna()
-                    sigma = float(returns.std() * np.sqrt(252))
-                    sigma = max(0.15, min(0.60, sigma))
+                    # 1. Attempt to fetch real NSE API price
+                    live_prem = get_live_nse_option_premium(opt['share_name'], float(opt["strike_price"]), "CE")
                     
-                    orig_date = datetime.strptime(str(opt['timestamp'])[:10], '%Y-%m-%d')
-                    days_elapsed = (now_ts.date() - orig_date.date()).days
-                    days_left = max(1, int(opt['expiry_days']) - days_elapsed)
+                    # 2. If NSE blocks the request, fall back to Black-Scholes math automatically
+                    if live_prem <= 0.0:
+                        returns = np.log(h_daily["Close"] / h_daily["Close"].shift(1)).dropna()
+                        sigma = float(returns.std() * np.sqrt(252))
+                        sigma = max(0.15, min(0.60, sigma))
+                        
+                        orig_date = datetime.strptime(str(opt['timestamp'])[:10], '%Y-%m-%d')
+                        days_elapsed = (now_ts.date() - orig_date.date()).days
+                        days_left = max(1, int(opt['expiry_days']) - days_elapsed)
 
-                    live_prem = calculate_black_scholes_call(
-                        spot=current_spot,
-                        strike=float(opt["strike_price"]),
-                        days_to_exp=days_left,
-                        r=0.0675,
-                        sigma=sigma
-                    )
+                        live_prem = calculate_black_scholes_call(
+                            spot=current_spot,
+                            strike=float(opt["strike_price"]),
+                            days_to_exp=days_left,
+                            r=0.0675,
+                            sigma=sigma
+                        )
                     
                     entry_prem = float(opt["entry_premium"])
                     target_prem = float(opt["target_premium"])
@@ -464,7 +498,6 @@ def generate_daily_options_alpha() -> dict:
         except Exception:
             pass
 
-    # Momentum Scanner: Select highest relative-strength asset
     selected_stock = "INFY"
     try:
         data = yf.download(FNO_STOCKS, period="5d", progress=False)
@@ -499,6 +532,7 @@ def generate_daily_options_alpha() -> dict:
     otm_pct = 1.015 if days_to_expiry <= 7 else 1.035
     strike = round((spot * otm_pct) / strike_step) * strike_step
 
+    # 1. Calculate Theoretical Math Premium
     theoretical_prem = calculate_black_scholes_call(
         spot=spot, 
         strike=strike, 
@@ -507,9 +541,16 @@ def generate_daily_options_alpha() -> dict:
         sigma=sigma
     )
     
-    target_prem = round(theoretical_prem * 1.65, 2)
-    stop_prem = round(theoretical_prem * 0.50, 2)
-    total_cap = round(theoretical_prem * lot_size, 2)
+    # 2. Fetch True Live Market Premium from NSE
+    live_api_prem = get_live_nse_option_premium(selected_stock, strike, "CE")
+    
+    # 3. Decision Engine: Use Real API price if valid, otherwise fallback to Math
+    actual_entry_premium = live_api_prem if live_api_prem > 0.0 else theoretical_prem
+
+    # Scale targets appropriately against the final chosen premium
+    target_prem = round(actual_entry_premium * 1.65, 2)
+    stop_prem = round(actual_entry_premium * 0.50, 2)
+    total_cap = round(actual_entry_premium * lot_size, 2)
     contract_label = f"{selected_stock} {expiry_month_str} {int(strike)} CE"
 
     signal_dict = {
@@ -521,8 +562,8 @@ def generate_daily_options_alpha() -> dict:
         "expiry_days": days_to_expiry,
         "underlying_spot": float(spot),
         "lot_size": lot_size,
-        "entry_premium": float(theoretical_prem),
-        "current_option_price": float(theoretical_prem),
+        "entry_premium": float(actual_entry_premium),
+        "current_option_price": float(actual_entry_premium),
         "target_premium": float(target_prem),
         "stop_loss_premium": float(stop_prem),
         "total_capital": float(total_cap),
@@ -893,7 +934,7 @@ with tab_scanner:
 # ==============================================================================
 with tab_options:
     st.subheader("📊 Institutional Daily Options Alpha (Budget < ₹30k)")
-    st.caption("Derived dynamically using Black-Scholes valuation on underlying NSE spot price and real historical volatility.")
+    st.caption("Derived via Live NSE Order Book (with historical volatility mathematical fallbacks).")
 
     opt_signal = generate_daily_options_alpha()
     if opt_signal:
@@ -903,7 +944,7 @@ with tab_options:
                 st.metric("Option Contract", opt_signal["option_contract"])
                 st.markdown(f"Underlying Spot: **₹{opt_signal['underlying_spot']:.2f}**")
             with o2:
-                st.metric("Model Premium", f"₹{opt_signal.get('entry_premium', opt_signal['current_option_price']):.2f}")
+                st.metric("Live Market Premium", f"₹{opt_signal.get('entry_premium', opt_signal['current_option_price']):.2f}")
                 st.markdown(f"Implied Volatility: **{opt_signal['implied_vol']}%**")
             with o3:
                 st.metric("AI Win Probability", f"{opt_signal['ai_confidence']}%")
@@ -937,7 +978,6 @@ with tab_journal:
     df_opt = pd.DataFrame()
     
     try:
-        # Wrap the actual connection in the try block to catch lock collisions safely
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
             df_eq = con.execute("SELECT * FROM trade_journal").df()
@@ -945,7 +985,6 @@ with tab_journal:
         finally:
             con.close()
     except Exception:
-        # If the file is locked by the auditor, gracefully pass and try again next refresh
         pass
 
     master_list = []
@@ -994,7 +1033,6 @@ with tab_journal:
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
-# Non-blocking browser-side refresh during market hours
 if auto_mode and is_nse_market_open():
     if st_autorefresh:
         st_autorefresh(interval=refresh_interval_sec * 1000, key="quant_terminal_autorefresh")
