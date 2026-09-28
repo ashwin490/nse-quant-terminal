@@ -24,6 +24,11 @@ import yfinance as yf
 import pytz
 import duckdb
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 from core.universe_sync import get_sub_1000_universe, NIFTY_200_UNIVERSE
 from core.data_engine import NIFTY_BASKET
 from core.features import extract_features
@@ -60,6 +65,11 @@ FEATURE_COLS = [
     "deliv_shock"
 ]
 
+# Official NSE F&O lot sizes & strike increments
+FNO_STOCKS = ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS"]
+LOT_SIZES = {"RELIANCE": 250, "HDFCBANK": 400, "ICICIBANK": 700, "INFY": 400, "TCS": 175, "SBIN": 750, "BHARTIARTL": 950, "ITC": 1600, "LT": 300}
+STRIKE_STEPS = {"RELIANCE": 20, "HDFCBANK": 10, "ICICIBANK": 10, "INFY": 20, "TCS": 50, "SBIN": 10, "BHARTIARTL": 20, "ITC": 10, "LT": 50}
+
 st.set_page_config(
     page_title="Autonomous AI Quant Terminal (NSE)", 
     page_icon="⚡", 
@@ -68,7 +78,7 @@ st.set_page_config(
 )
 
 # ==============================================================================
-# SECURE MOBILE LOGIN GATEWAY (WITH SESSION-PRESERVING TOKENS)
+# SECURE MOBILE LOGIN GATEWAY
 # ==============================================================================
 def check_password():
     if st.query_params.get("auth") == "QuantTerminal2026":
@@ -103,7 +113,7 @@ if not check_password():
     st.stop()
 
 # ==============================================================================
-# DATABASE ENGINE (SUPABASE + SELF-MIGRATING DUCKDB)
+# DATABASE ENGINE (SUPABASE + DUCKDB REPOSITORY)
 # ==============================================================================
 @st.cache_resource
 def get_supabase_client():
@@ -166,12 +176,6 @@ def init_duckdb_storage():
                 last_audited TIMESTAMP
             )
         """)
-        
-        # Schema Migration for older databases that lack entry_premium
-        existing_opt_cols = [c[0] for c in con.execute("DESCRIBE daily_options_journal").fetchall()]
-        if "entry_premium" not in existing_opt_cols:
-            con.execute("ALTER TABLE daily_options_journal ADD COLUMN entry_premium DOUBLE")
-            con.execute("UPDATE daily_options_journal SET entry_premium = current_option_price WHERE entry_premium IS NULL")
 
         con.execute("""
             CREATE TABLE IF NOT EXISTS daily_candles (
@@ -193,41 +197,37 @@ def hydrate_duckdb_from_supabase():
         return
     con = duckdb.connect(DB_PATH, read_only=False)
     try:
-        eq_count = con.execute("SELECT COUNT(*) FROM trade_journal").fetchone()[0]
-        if eq_count == 0:
-            res = supabase.table("predictions").select("*").execute()
-            if res.data:
-                for r in res.data:
-                    trade_id = f"{r.get('ticker')}_{r.get('predicted_date')}"
-                    con.execute("""
-                        INSERT OR IGNORE INTO trade_journal 
-                        VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?)
-                    """, [
-                        trade_id, r.get('last_checked') or datetime.now(), r.get('predicted_date'),
-                        r.get('ticker'), float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
-                        float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
-                        r.get('status', 'ACTIVE').upper(), float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                        datetime.now()
-                    ])
+        res = supabase.table("predictions").select("*").execute()
+        if res.data:
+            for r in res.data:
+                trade_id = f"{r.get('ticker')}_{r.get('predicted_date')}"
+                con.execute("""
+                    INSERT OR IGNORE INTO trade_journal 
+                    VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?)
+                """, [
+                    trade_id, r.get('last_checked') or datetime.now(), r.get('predicted_date'),
+                    r.get('ticker'), float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
+                    float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
+                    r.get('status', 'ACTIVE').upper(), float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
+                    datetime.now()
+                ])
         
-        opt_count = con.execute("SELECT COUNT(*) FROM daily_options_journal").fetchone()[0]
-        if opt_count == 0:
-            res_opt = supabase.table("options_journal").select("*").execute()
-            if res_opt.data:
-                for o in res_opt.data:
-                    con.execute("""
-                        INSERT OR IGNORE INTO daily_options_journal 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        o.get('date_key'), o.get('timestamp') or datetime.now(), o.get('share_name'),
-                        o.get('option_contract'), float(o.get('strike_price', 0.0)), int(o.get('expiry_days', 28)),
-                        float(o.get('underlying_spot', 0.0)), int(o.get('lot_size', 750)), 
-                        float(o.get('entry_premium', o.get('current_option_price', 0.0))),
-                        float(o.get('current_option_price', 0.0)),
-                        float(o.get('target_premium', 0.0)), float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
-                        float(o.get('ai_confidence', 84.5)), float(o.get('implied_vol', 20.0)), o.get('status', 'ACTIVE'),
-                        float(o.get('pnl_pct', 0.0)), o.get('last_audited') or datetime.now()
-                    ])
+        res_opt = supabase.table("options_journal").select("*").execute()
+        if res_opt.data:
+            for o in res_opt.data:
+                con.execute("""
+                    INSERT OR IGNORE INTO daily_options_journal 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    o.get('date_key'), o.get('timestamp') or datetime.now(), o.get('share_name'),
+                    o.get('option_contract'), float(o.get('strike_price', 0.0)), int(o.get('expiry_days', 28)),
+                    float(o.get('underlying_spot', 0.0)), int(o.get('lot_size', 750)), 
+                    float(o.get('entry_premium', o.get('current_option_price', 0.0))),
+                    float(o.get('current_option_price', 0.0)),
+                    float(o.get('target_premium', 0.0)), float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
+                    float(o.get('ai_confidence', 84.5)), float(o.get('implied_vol', 20.0)), o.get('status', 'ACTIVE'),
+                    float(o.get('pnl_pct', 0.0)), o.get('last_audited') or datetime.now()
+                ])
     except Exception:
         pass
     finally:
@@ -242,8 +242,14 @@ def is_nse_market_open() -> bool:
         return False
     return dtime(9, 15) <= now_ist.time() <= dtime(15, 30)
 
+def normalize_ticker_for_yf(ticker_str: str) -> str:
+    clean = str(ticker_str).split()[0].strip()
+    if clean.endswith(".NS") or clean.endswith(".BO") or clean.endswith(".L"):
+        return clean
+    return f"{clean}.NS"
+
 # ==============================================================================
-# OPTIONS ENGINE: BLACK-SCHOLES & EXPIRY ROLLOVER CALCS
+# OPTIONS ENGINE: BLACK-SCHOLES PRICING & EXPIRY LOGIC
 # ==============================================================================
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -279,7 +285,7 @@ def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
     return expiry_dt, max(1, days_left)
 
 # ==============================================================================
-# AUDITING & RECONCILIATION ENGINE (UPGRADED FOR INTRADAY LIVE PULLS)
+# REAL-TIME AUDITING & RECONCILIATION ENGINE
 # ==============================================================================
 def audit_and_reconcile_all_trades():
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -291,9 +297,10 @@ def audit_and_reconcile_all_trades():
             live_quotes = {}
             for tkr in unique_tickers:
                 try:
-                    clean = tkr.split()[0].replace(".NS", "")
-                    # FIXED: Fetch true live intraday data (5-minute snapshot) instead of daily EOD
-                    h = yf.Ticker(f"{clean}.NS").history(period="1d", interval="5m")
+                    yf_sym = normalize_ticker_for_yf(tkr)
+                    h = yf.Ticker(yf_sym).history(period="1d", interval="5m")
+                    if h.empty:
+                        h = yf.Ticker(yf_sym).history(period="5d")
                     if not h.empty:
                         live_quotes[tkr] = float(h["Close"].iloc[-1])
                 except Exception:
@@ -307,7 +314,7 @@ def audit_and_reconcile_all_trades():
                 entry = float(tr["entry_price"])
                 target = float(tr["target_price"])
                 stop = float(tr["stop_loss"])
-                pnl = round(((curr - entry) / entry) * 100.0, 2)
+                pnl = round(((curr - entry) / entry) * 100.0, 2) if entry > 0 else 0.0
 
                 new_status = "ACTIVE"
                 exit_price = 0.0
@@ -333,11 +340,12 @@ def audit_and_reconcile_all_trades():
                 try:
                     sym = f"{opt['share_name']}.NS"
                     h_daily = yf.Ticker(sym).history(period="30d")
-                    h_live = yf.Ticker(sym).history(period="1d", interval="5m")
-                    if h_daily.empty or h_live.empty:
+                    if h_daily.empty:
                         continue
                         
-                    current_spot = float(h_live["Close"].iloc[-1])
+                    h_live = yf.Ticker(sym).history(period="1d", interval="5m")
+                    current_spot = float(h_live["Close"].iloc[-1]) if not h_live.empty else float(h_daily["Close"].iloc[-1])
+                    
                     returns = np.log(h_daily["Close"] / h_daily["Close"].shift(1)).dropna()
                     sigma = float(returns.std() * np.sqrt(252))
                     sigma = max(0.15, min(0.60, sigma))
@@ -354,11 +362,10 @@ def audit_and_reconcile_all_trades():
                         sigma=sigma
                     )
                     
-                    # FIXED: Calculate P&L accurately against the locked entry_premium
                     entry_prem = float(opt["entry_premium"])
                     target_prem = float(opt["target_premium"])
                     stop_prem = float(opt["stop_loss_premium"])
-                    pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2)
+                    pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 0.0
 
                     opt_status = "ACTIVE"
                     if live_prem >= target_prem:
@@ -398,7 +405,7 @@ def deduplicate_journal_ledger():
         con.execute("""
             CREATE TEMP TABLE temp_unique_journal AS 
             SELECT * FROM (
-                SELECT *, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY timestamp ASC) as rn
+                SELECT *, ROW_NUMBER() OVER(PARTITION BY ticker, date_str ORDER BY timestamp ASC) as rn
                 FROM trade_journal
             ) WHERE rn = 1;
             
@@ -412,7 +419,7 @@ def deduplicate_journal_ledger():
         con.close()
 
 # ==============================================================================
-# DAILY OPTIONS ALPHA GENERATOR (WITH DYNAMIC F&O SCANNER)
+# DAILY OPTIONS ALPHA GENERATOR (DYNAMIC F&O RELATIVE STRENGTH)
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -457,25 +464,21 @@ def generate_daily_options_alpha() -> dict:
         except Exception:
             pass
 
-    # FIXED: Replaced hardcoded "SBIN" with a dynamic F&O Momentum Scanner
-    FNO_STOCKS = ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS"]
+    # Momentum Scanner: Select highest relative-strength asset
+    selected_stock = "INFY"
     try:
-        data = yf.download(FNO_STOCKS, period="5d", progress=False)["Close"]
-        if not data.empty:
-            rets = (data.iloc[-1] / data.iloc[-2]) - 1
-            best_ticker = rets.dropna().idxmax()
-            selected_stock = best_ticker.replace(".NS", "") if isinstance(best_ticker, str) else "HDFCBANK"
-        else:
-            selected_stock = "HDFCBANK"
+        data = yf.download(FNO_STOCKS, period="5d", progress=False)
+        if "Close" in data and not data["Close"].empty:
+            close_df = data["Close"]
+            if isinstance(close_df, pd.DataFrame):
+                rets = (close_df.iloc[-1] / close_df.iloc[-2]) - 1
+                best_ticker = str(rets.dropna().idxmax())
+                selected_stock = best_ticker.replace(".NS", "")
     except Exception:
-        selected_stock = "HDFCBANK"
+        selected_stock = "INFY"
 
-    # Strict official NSE lot size mapping to protect capital calculations
-    lot_sizes = {
-        "RELIANCE": 250, "HDFCBANK": 400, "ICICIBANK": 700, "INFY": 400, "TCS": 175, 
-        "SBIN": 750, "BHARTIARTL": 950, "ITC": 1600, "LT": 300
-    }
-    lot_size = lot_sizes.get(selected_stock, 500)
+    lot_size = LOT_SIZES.get(selected_stock, 500)
+    strike_step = STRIKE_STEPS.get(selected_stock, 10)
     
     spot = 1000.0
     sigma = 0.22
@@ -494,7 +497,7 @@ def generate_daily_options_alpha() -> dict:
     expiry_month_str = expiry_dt.strftime('%b').upper()
 
     otm_pct = 1.015 if days_to_expiry <= 7 else 1.035
-    strike = math.ceil((spot * otm_pct) / 10.0) * 10.0
+    strike = round((spot * otm_pct) / strike_step) * strike_step
 
     theoretical_prem = calculate_black_scholes_call(
         spot=spot, 
@@ -653,10 +656,13 @@ audit_summary = get_audit_summary()
 market_status = "🟢 OPEN" if market_is_open else "🔴 CLOSED"
 db_status_text = "🟢 ONLINE (SUPABASE)" if supabase else "🔴 OFFLINE"
 
+win_rate_val = audit_summary.get('win_rate', 0.0)
+win_rate_str = f"{win_rate_val}%" if win_rate_val > 0 else "Observation Mode"
+
 st.title("⚡ Autonomous Self-Learning Quant Terminal")
 st.caption(
     f"Status: **High-Certainty AI Active** • Database: **{db_status_text}** • Market (IST): **{market_status}** • "
-    f"Regime: **{macro['regime']}** • Model Historical Win Rate: **{audit_summary['win_rate']}%**"
+    f"Regime: **{macro['regime']}** • Model Historical Win Rate: **{win_rate_str}**"
 )
 
 tab_scanner, tab_options, tab_journal = st.tabs([
@@ -677,7 +683,7 @@ def load_ml_model():
 ml_model = load_ml_model()
 
 def clean_sym_name(sym: str) -> str:
-    return sym.strip().lstrip("$").replace(".NS", "")
+    return str(sym).strip().lstrip("$").replace(".NS", "")
 
 def run_predictions():
     if ml_model is None:
@@ -746,7 +752,6 @@ def run_predictions():
         ema50 = float(latest.get("ema50", close))
         atr = float(latest.get("atr_14", close * 0.02))
 
-        # FIXED: Relaxed technical filters so scanner doesn't starve in a choppy/bearish market
         is_above_trend = (close >= ema50) 
         feat_dict = {
             "dist_ema20_pct": float(latest.get("dist_ema20_pct", 0.0)),
@@ -802,7 +807,6 @@ def run_predictions():
                 "time_estimate": "3-7 Days"
             }
 
-        # FIXED: Qualify trades based on pure ML confidence rather than post-penalty multiplier scores
         is_qualified = (is_above_trend and not is_exhausted and has_volume and raw_prob >= 51.5)
 
         results.append({
@@ -899,7 +903,6 @@ with tab_options:
                 st.metric("Option Contract", opt_signal["option_contract"])
                 st.markdown(f"Underlying Spot: **₹{opt_signal['underlying_spot']:.2f}**")
             with o2:
-                # Use the new entry_premium to accurately reflect what the model called
                 st.metric("Model Premium", f"₹{opt_signal.get('entry_premium', opt_signal['current_option_price']):.2f}")
                 st.markdown(f"Implied Volatility: **{opt_signal['implied_vol']}%**")
             with o3:
@@ -917,7 +920,7 @@ with tab_options:
                 st.success(f"Signal securely dispatched to {broker_mode} gateway.")
 
 # ==============================================================================
-# TAB 3: MASTER TRADE JOURNAL & DEDUPLICATION MAINTENANCE
+# TAB 3: MASTER TRADE JOURNAL & RECONCILIATION
 # ==============================================================================
 with tab_journal:
     st.subheader("📖 Autonomous Master Ledger (Equities & Options)")
@@ -956,7 +959,6 @@ with tab_journal:
         
     if not df_opt.empty:
         df_opt['Asset'] = 'OPTIONS'
-        # FIXED: Mapped correctly using the new entry_premium database column
         df_opt_clean = df_opt.rename(columns={
             "date_key": "Date", "option_contract": "Symbol", 
             "entry_premium": "Entry (₹)",
@@ -965,6 +967,8 @@ with tab_journal:
             "stop_loss_premium": "Stop (₹)", 
             "pnl_pct": "P&L (%)", "status": "Status", "last_audited": "Last Checked"
         })
+        if "Entry (₹)" in df_opt_clean.columns and "Live Price (₹)" in df_opt_clean.columns:
+            df_opt_clean["Entry (₹)"] = df_opt_clean["Entry (₹)"].fillna(df_opt_clean["Live Price (₹)"])
         master_list.append(df_opt_clean)
 
     if master_list:
@@ -977,6 +981,10 @@ with tab_journal:
             master_df.sort_values(by="Last Checked", ascending=False, inplace=True)
             master_df["Last Checked"] = master_df["Last Checked"].dt.strftime('%Y-%m-%d %H:%M')
             
+        for num_col in ["Entry (₹)", "Target (₹)", "Stop (₹)", "Live Price (₹)"]:
+            if num_col in master_df.columns:
+                master_df[num_col] = master_df[num_col].apply(lambda x: f"₹{float(x):,.2f}" if pd.notnull(x) else "-")
+
         if "P&L (%)" in master_df.columns:
             master_df["P&L (%)"] = master_df["P&L (%)"].apply(lambda x: f"{float(x):+.2f}%" if pd.notnull(x) else "0.00%")
             
@@ -984,7 +992,10 @@ with tab_journal:
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
-# Scheduled Refresh Loop during Live Market
+# Non-blocking browser-side refresh during market hours
 if auto_mode and is_nse_market_open():
-    time.sleep(refresh_interval_sec)
-    st.rerun()
+    if st_autorefresh:
+        st_autorefresh(interval=refresh_interval_sec * 1000, key="quant_terminal_autorefresh")
+    else:
+        time.sleep(refresh_interval_sec)
+        st.rerun()
