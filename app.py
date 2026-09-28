@@ -933,18 +933,20 @@ with tab_journal:
             st.success("Ledger deduplicated and reconciled against live market!")
             st.rerun()
 
-    con = duckdb.connect(DB_PATH, read_only=True)
+    df_eq = pd.DataFrame()
+    df_opt = pd.DataFrame()
+    
     try:
-        df_eq = con.execute("SELECT * FROM trade_journal").df()
+        # Wrap the actual connection in the try block to catch lock collisions safely
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            df_eq = con.execute("SELECT * FROM trade_journal").df()
+            df_opt = con.execute("SELECT * FROM daily_options_journal").df()
+        finally:
+            con.close()
     except Exception:
-        df_eq = pd.DataFrame()
-        
-    try:
-        df_opt = con.execute("SELECT * FROM daily_options_journal").df()
-    except Exception:
-        df_opt = pd.DataFrame()
-    finally:
-        con.close()
+        # If the file is locked by the auditor, gracefully pass and try again next refresh
+        pass
 
     master_list = []
     
