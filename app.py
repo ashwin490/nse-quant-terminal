@@ -49,7 +49,7 @@ except ImportError:
     create_client, Client = None, None
 
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker.pkl")
-DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
+DB_PATH = os.path.join(ROOT_DIR, "market_data_v2.duckdb")
 
 FEATURE_COLS = [
     "dist_ema20_pct",
