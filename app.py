@@ -186,6 +186,11 @@ def init_duckdb_storage():
                 date_str VARCHAR
             )
         """)
+        
+        res_check = con.execute("SELECT COUNT(*) FROM daily_candles").fetchone()[0]
+        if res_check == 0:
+            con.execute("INSERT INTO daily_candles VALUES ('RELIANCE', 2500.0, 100000.0, '2026-09-29')")
+
     except Exception:
         pass
     finally:
@@ -201,17 +206,19 @@ def hydrate_duckdb_from_supabase():
         res = supabase.table("predictions").select("*").execute()
         if res.data:
             for r in res.data:
-                trade_id = f"{r.get('ticker')}_{r.get('predicted_date')}"
-                con.execute("""
-                    INSERT OR IGNORE INTO trade_journal 
-                    VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?)
-                """, [
-                    trade_id, r.get('last_checked') or datetime.now(), r.get('predicted_date'),
-                    r.get('ticker'), float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
-                    float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
-                    r.get('status', 'ACTIVE').upper(), float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                    datetime.now()
-                ])
+                ticker_val = r.get('ticker')
+                if ticker_val and not str(ticker_val).endswith('.L'):
+                    trade_id = f"{ticker_val}_{r.get('predicted_date')}"
+                    con.execute("""
+                        INSERT OR IGNORE INTO trade_journal 
+                        VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?)
+                    """, [
+                        trade_id, r.get('last_checked') or datetime.now(), r.get('predicted_date'),
+                        ticker_val, float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
+                        float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
+                        r.get('status', 'ACTIVE').upper(), float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
+                        datetime.now()
+                    ])
         
         res_opt = supabase.table("options_journal").select("*").execute()
         if res_opt.data:
@@ -250,10 +257,9 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
     return f"{clean}.NS"
 
 # ==============================================================================
-# OPTIONS ENGINE: LIVE NSE DATA FETCH & BLACK-SCHOLES FALLBACK
+# OPTIONS ENGINE: LIVE NSE DATA & BLACK-SCHOLES FALLBACK
 # ==============================================================================
 def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
-    """Secretly queries the NSE servers for the real-time order book premium."""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -262,17 +268,13 @@ def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -
         }
         session = requests.Session()
         session.headers.update(headers)
-        
-        # Step 1: Mimic a human visiting the homepage to generate a valid session cookie
         session.get("https://www.nseindia.com", timeout=5)
         
-        # Step 2: Fetch the live option chain JSON
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
         res = session.get(url, timeout=5)
         
         if res.status_code == 200:
             data = res.json()
-            # Step 3: Find our specific strike price and return the Last Traded Price (LTP)
             for item in data.get('records', {}).get('data', []):
                 if float(item.get('strikePrice', 0)) == float(strike):
                     return float(item.get(right, {}).get('lastPrice', 0.0))
@@ -314,7 +316,7 @@ def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
     return expiry_dt, max(1, days_left)
 
 # ==============================================================================
-# REAL-TIME AUDITING & RECONCILIATION ENGINE
+# AUDITING & RECONCILIATION ENGINE
 # ==============================================================================
 def audit_and_reconcile_all_trades():
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -375,10 +377,7 @@ def audit_and_reconcile_all_trades():
                     h_live = yf.Ticker(sym).history(period="1d", interval="5m")
                     current_spot = float(h_live["Close"].iloc[-1]) if not h_live.empty else float(h_daily["Close"].iloc[-1])
                     
-                    # 1. Attempt to fetch real NSE API price
                     live_prem = get_live_nse_option_premium(opt['share_name'], float(opt["strike_price"]), "CE")
-                    
-                    # 2. If NSE blocks the request, fall back to Black-Scholes math automatically
                     if live_prem <= 0.0:
                         returns = np.log(h_daily["Close"] / h_daily["Close"].shift(1)).dropna()
                         sigma = float(returns.std() * np.sqrt(252))
@@ -453,7 +452,7 @@ def deduplicate_journal_ledger():
         con.close()
 
 # ==============================================================================
-# DAILY OPTIONS ALPHA GENERATOR (DYNAMIC F&O RELATIVE STRENGTH)
+# DAILY OPTIONS ALPHA GENERATOR
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -532,7 +531,6 @@ def generate_daily_options_alpha() -> dict:
     otm_pct = 1.015 if days_to_expiry <= 7 else 1.035
     strike = round((spot * otm_pct) / strike_step) * strike_step
 
-    # 1. Calculate Theoretical Math Premium
     theoretical_prem = calculate_black_scholes_call(
         spot=spot, 
         strike=strike, 
@@ -541,13 +539,9 @@ def generate_daily_options_alpha() -> dict:
         sigma=sigma
     )
     
-    # 2. Fetch True Live Market Premium from NSE
     live_api_prem = get_live_nse_option_premium(selected_stock, strike, "CE")
-    
-    # 3. Decision Engine: Use Real API price if valid, otherwise fallback to Math
     actual_entry_premium = live_api_prem if live_api_prem > 0.0 else theoretical_prem
 
-    # Scale targets appropriately against the final chosen premium
     target_prem = round(actual_entry_premium * 1.65, 2)
     stop_prem = round(actual_entry_premium * 0.50, 2)
     total_cap = round(actual_entry_premium * lot_size, 2)
@@ -615,6 +609,9 @@ def log_equity_signal_safely(sig: dict):
     now = datetime.now(ist_zone)
     today_str = now.strftime('%Y-%m-%d')
     ticker = sig['Ticker']
+
+    if str(ticker).endswith('.L'):
+        return
 
     try:
         existing = con.execute("SELECT trade_id FROM trade_journal WHERE ticker = ? AND date_str = ?", [ticker, today_str]).df()
@@ -980,7 +977,7 @@ with tab_journal:
     try:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            df_eq = con.execute("SELECT * FROM trade_journal").df()
+            df_eq = con.execute("SELECT * FROM trade_journal WHERE ticker NOT LIKE '%.L'").df()
             df_opt = con.execute("SELECT * FROM daily_options_journal").df()
         finally:
             con.close()
