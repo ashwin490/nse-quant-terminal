@@ -82,10 +82,8 @@ def init_duckdb_storage():
             )
         """)
 
-        # Drop the old table that caused schema mismatch errors
         con.execute("DROP TABLE IF EXISTS daily_candles")
         
-        # Recreate with EVERY requested column to satisfy all core modules
         con.execute("""
             CREATE TABLE daily_candles (
                 symbol VARCHAR,
@@ -97,10 +95,7 @@ def init_duckdb_storage():
             )
         """)
         
-        # Insert baseline dummy row with both Date types
         con.execute("INSERT INTO daily_candles VALUES ('RELIANCE', 'RELIANCE', 2500.0, 100000.0, TIMESTAMP '2026-09-29 00:00:00', '2026-09-29')")
-
-        # INSTANT CLEANUP: Force-delete any lingering UK (.L) stocks from the old cache
         con.execute("DELETE FROM trade_journal WHERE ticker LIKE '%.L'")
 
     except Exception:
@@ -108,7 +103,6 @@ def init_duckdb_storage():
     finally:
         con.close()
 
-# Build the DB immediately so it exists when the core modules wake up
 init_duckdb_storage()
 
 # ==============================================================================
@@ -132,7 +126,6 @@ from core.journal import execute_broker_order
 from core.sentiment import get_news_sentiment_score
 from core.options_feed import get_options_pcr
 
-# Cloud Database Provider
 try:
     from supabase import create_client, Client
 except ImportError:
@@ -1085,14 +1078,34 @@ with tab_reasoning:
         
         try:
             con = duckdb.connect(DB_PATH, read_only=True)
-            # Fetch recent stop-losses
-            losses_df = con.execute("SELECT ticker, entry_price, stop_loss, exit_price, exit_timestamp FROM trade_journal WHERE status LIKE '%LOSS%' ORDER BY exit_timestamp DESC LIMIT 3").df()
+            
+            # Fetch Equity Losses
+            eq_losses = con.execute("""
+                SELECT ticker as symbol, entry_price as entry, exit_price as exit_val, exit_timestamp as exit_time 
+                FROM trade_journal 
+                WHERE status LIKE '%LOSS%'
+            """).df()
+            
+            # Fetch Options Losses (Bridging the gap)
+            opt_losses = con.execute("""
+                SELECT option_contract as symbol, entry_premium as entry, current_option_price as exit_val, last_audited as exit_time 
+                FROM daily_options_journal 
+                WHERE status LIKE '%LOSS%'
+            """).df()
             con.close()
             
-            if not losses_df.empty:
-                for _, row in losses_df.iterrows():
-                    with st.expander(f"Autopsy: {row['ticker']} (Stopped out on {str(row['exit_timestamp'])[:10]})", expanded=True):
-                        st.error(f"**Loss Realized:** Entry at ₹{row['entry_price']} | Exited at ₹{row['exit_price']}")
+            # Combine both dataframes
+            all_losses = pd.concat([eq_losses, opt_losses], ignore_index=True)
+            
+            if not all_losses.empty:
+                # Convert to datetime for proper sorting, and take the 3 most recent
+                all_losses['exit_time'] = pd.to_datetime(all_losses['exit_time'])
+                all_losses = all_losses.sort_values(by='exit_time', ascending=False).head(3)
+                
+                for _, row in all_losses.iterrows():
+                    exit_str = str(row['exit_time'])[:16] if pd.notnull(row['exit_time']) else "Unknown"
+                    with st.expander(f"Autopsy: {row['symbol']} (Stopped out on {exit_str})", expanded=True):
+                        st.error(f"**Loss Realized:** Entry at ₹{row['entry']:.2f} | Exited at ₹{row['exit_val']:.2f}")
                         st.markdown("""
                         **🤖 Self-Correction Protocol Triggered:**
                         1. **Snapshot Logged:** The exact RSI, Volume, and Trend features at the time of entry were successfully logged to `core.self_learner`.
@@ -1101,8 +1114,8 @@ with tab_reasoning:
                         """)
             else:
                 st.success("🏆 **Zero Stop-Losses Triggered Yet.**\n\nWhen a trade hits its stop-loss, the system will automatically isolate the feature vector, run a post-trade autopsy, and display what the AI learned here.")
-        except Exception:
-            st.warning("Database connection error while retrieving autopsies.")
+        except Exception as e:
+            st.warning(f"Database connection error while retrieving autopsies: {e}")
 
 # ==============================================================================
 # 15. AUTO-REFRESH LOOP
