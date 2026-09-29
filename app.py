@@ -33,7 +33,6 @@ if str(ROOT_DIR) not in sys.path:
 # ==============================================================================
 # 1. INITIALIZE DATABASE FIRST (SYNCED TO ORIGINAL FILENAME)
 # ==============================================================================
-# CHANGED BACK to the original name so your 'core' files can read it properly!
 DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
 
 def init_duckdb_storage():
@@ -83,8 +82,13 @@ def init_duckdb_storage():
             )
         """)
 
+        # Drop the old table that caused schema mismatch errors
+        con.execute("DROP TABLE IF EXISTS daily_candles")
+        
+        # Recreate with BOTH symbol and ticker to satisfy all core modules
         con.execute("""
-            CREATE TABLE IF NOT EXISTS daily_candles (
+            CREATE TABLE daily_candles (
+                symbol VARCHAR,
                 ticker VARCHAR,
                 close DOUBLE,
                 volume DOUBLE,
@@ -92,9 +96,8 @@ def init_duckdb_storage():
             )
         """)
         
-        res_check = con.execute("SELECT COUNT(*) FROM daily_candles").fetchone()[0]
-        if res_check == 0:
-            con.execute("INSERT INTO daily_candles VALUES ('RELIANCE', 2500.0, 100000.0, '2026-09-29')")
+        # Insert baseline dummy row
+        con.execute("INSERT INTO daily_candles VALUES ('RELIANCE', 'RELIANCE', 2500.0, 100000.0, '2026-09-29')")
 
         # INSTANT CLEANUP: Force-delete any lingering UK (.L) stocks from the old cache
         con.execute("DELETE FROM trade_journal WHERE ticker LIKE '%.L'")
