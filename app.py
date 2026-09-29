@@ -31,9 +31,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 # ==============================================================================
-# 1. INITIALIZE DATABASE FIRST (BEFORE IMPORTING CORE MODULES)
+# 1. INITIALIZE DATABASE FIRST (SYNCED TO ORIGINAL FILENAME)
 # ==============================================================================
-DB_PATH = os.path.join(ROOT_DIR, "market_data_v3.duckdb")
+# CHANGED BACK to the original name so your 'core' files can read it properly!
+DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
 
 def init_duckdb_storage():
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -94,6 +95,9 @@ def init_duckdb_storage():
         res_check = con.execute("SELECT COUNT(*) FROM daily_candles").fetchone()[0]
         if res_check == 0:
             con.execute("INSERT INTO daily_candles VALUES ('RELIANCE', 2500.0, 100000.0, '2026-09-29')")
+
+        # INSTANT CLEANUP: Force-delete any lingering UK (.L) stocks from the old cache
+        con.execute("DELETE FROM trade_journal WHERE ticker LIKE '%.L'")
 
     except Exception:
         pass
