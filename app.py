@@ -330,11 +330,12 @@ def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
     return expiry_dt, max(1, days_left)
 
 # ==============================================================================
-# 6. AUDITING & RECONCILIATION ENGINE
+# 6. AUDITING & RECONCILIATION ENGINE (IST TIMEZONE FIXED)
 # ==============================================================================
 def audit_and_reconcile_all_trades():
     con = duckdb.connect(DB_PATH, read_only=False)
-    now_ts = datetime.now()
+    ist_zone = pytz.timezone('Asia/Kolkata')
+    now_ts = datetime.now(ist_zone).replace(tzinfo=None) # Ensures DuckDB logs exact IST wall-clock time
     try:
         active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
         if not active_trades.empty:
@@ -636,9 +637,9 @@ def log_equity_signal_safely(sig: dict):
                 INSERT INTO trade_journal 
                 VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, 'ACTIVE', ?, 0.0, 0.0, NULL, ?)
             """, [
-                trade_id, now, today_str, ticker, float(sig['Price (₹)']),
+                trade_id, now.replace(tzinfo=None), today_str, ticker, float(sig['Price (₹)']),
                 float(sig['Target (₹)']), float(sig['Stop Loss (₹)']),
-                shares_num, float(sig['RawCapital']), float(sig['Price (₹)']), now
+                shares_num, float(sig['RawCapital']), float(sig['Price (₹)']), now.replace(tzinfo=None)
             ])
     except Exception:
         pass
@@ -667,7 +668,7 @@ def log_equity_signal_safely(sig: dict):
                     "news_status": "Clean",
                     "rns_headline": "Active AI Quant Signal",
                     "features_json": {},
-                    "last_checked": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    "last_checked": datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
                 }).execute()
         except Exception:
             pass
@@ -1031,7 +1032,7 @@ with tab_journal:
         if "Last Checked" in master_df.columns:
             master_df["Last Checked"] = pd.to_datetime(master_df["Last Checked"])
             master_df.sort_values(by="Last Checked", ascending=False, inplace=True)
-            master_df["Last Checked"] = master_df["Last Checked"].dt.strftime('%Y-%m-%d %H:%M')
+            master_df["Last Checked"] = master_df["Last Checked"].dt.strftime('%Y-%m-%d %H:%M IST')
             
         for num_col in ["Entry (₹)", "Target (₹)", "Stop (₹)", "Live Price (₹)"]:
             if num_col in master_df.columns:
