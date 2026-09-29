@@ -9,13 +9,6 @@ import time
 import json
 import requests
 
-warnings.filterwarnings("ignore", category=UserWarning, module="jugaad_data")
-warnings.filterwarnings("ignore", message="no explicit representation of timezones available for np.datetime64")
-
-ROOT_DIR = Path(__file__).resolve().parent
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -30,106 +23,17 @@ try:
 except ImportError:
     st_autorefresh = None
 
-from core.universe_sync import get_sub_1000_universe, NIFTY_200_UNIVERSE
-from core.data_engine import NIFTY_BASKET
-from core.features import extract_features
-from core.regime import get_market_regime
-from core.macro_feed import get_macro_risk_adjuster
-from core.intraday_momentum import check_vwap_momentum
-from core.auditor import get_audit_summary
-from core.delivery import fetch_delivery_metrics
-from core.forecaster import generate_forecast_cone
-from core.announcements import check_corporate_announcements
-from core.risk_engine import calculate_position_size
-from core.sector_map import apply_sector_concentration_cap
-from core.self_learner import log_feature_vector_snapshot, get_mistake_penalty
-from core.alerts import send_telegram_alert
-from core.journal import execute_broker_order
-from core.sentiment import get_news_sentiment_score
-from core.options_feed import get_options_pcr
+warnings.filterwarnings("ignore", category=UserWarning, module="jugaad_data")
+warnings.filterwarnings("ignore", message="no explicit representation of timezones available for np.datetime64")
 
-# Cloud Database Provider
-try:
-    from supabase import create_client, Client
-except ImportError:
-    create_client, Client = None, None
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
-MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker.pkl")
+# ==============================================================================
+# 1. INITIALIZE DATABASE FIRST (BEFORE IMPORTING CORE MODULES)
+# ==============================================================================
 DB_PATH = os.path.join(ROOT_DIR, "market_data_v3.duckdb")
-
-FEATURE_COLS = [
-    "dist_ema20_pct",
-    "trend_spread_pct",
-    "atr_pct",
-    "rvol",
-    "rsi_14",
-    "deliv_shock"
-]
-
-# Official NSE F&O lot sizes & strike increments
-FNO_STOCKS = ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS"]
-LOT_SIZES = {"RELIANCE": 250, "HDFCBANK": 400, "ICICIBANK": 700, "INFY": 400, "TCS": 175, "SBIN": 750, "BHARTIARTL": 950, "ITC": 1600, "LT": 300}
-STRIKE_STEPS = {"RELIANCE": 20, "HDFCBANK": 10, "ICICIBANK": 10, "INFY": 20, "TCS": 50, "SBIN": 10, "BHARTIARTL": 20, "ITC": 10, "LT": 50}
-
-st.set_page_config(
-    page_title="Autonomous AI Quant Terminal (NSE)", 
-    page_icon="⚡", 
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# ==============================================================================
-# SECURE MOBILE LOGIN GATEWAY
-# ==============================================================================
-def check_password():
-    if st.query_params.get("auth") == "QuantTerminal2026":
-        st.session_state["password_correct"] = True
-        return True
-
-    def password_entered():
-        if st.session_state.get("username") == "admin" and st.session_state.get("password") == "QuantTerminal2026!":
-            st.session_state["password_correct"] = True
-            st.query_params["auth"] = "QuantTerminal2026"
-            del st.session_state["password"]
-            del st.session_state["username"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if "password_correct" not in st.session_state:
-        st.subheader("🔐 Autonomous Quant Terminal - Secure Login")
-        st.text_input("Username", key="username")
-        st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, width="stretch")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.subheader("🔐 Autonomous Quant Terminal - Secure Login")
-        st.text_input("Username", key="username")
-        st.text_input("Password", type="password", key="password")
-        st.button("Log In", on_click=password_entered, width="stretch")
-        st.error("😕 Invalid username or password")
-        return False
-    return True
-
-if not check_password():
-    st.stop()
-
-# ==============================================================================
-# DATABASE ENGINE (SUPABASE + DUCKDB REPOSITORY)
-# ==============================================================================
-@st.cache_resource
-def get_supabase_client():
-    if create_client is None:
-        return None
-    url = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None
-    key = st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None
-    if not url or not key:
-        return None
-    try:
-        return create_client(url, key)
-    except Exception:
-        return None
-
-supabase = get_supabase_client()
 
 def init_duckdb_storage():
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -196,7 +100,109 @@ def init_duckdb_storage():
     finally:
         con.close()
 
+# Build the DB immediately so it exists when the core modules wake up
 init_duckdb_storage()
+
+# ==============================================================================
+# 2. NOW IMPORT CORE MODULES SAFELY
+# ==============================================================================
+from core.universe_sync import get_sub_1000_universe, NIFTY_200_UNIVERSE
+from core.data_engine import NIFTY_BASKET
+from core.features import extract_features
+from core.regime import get_market_regime
+from core.macro_feed import get_macro_risk_adjuster
+from core.intraday_momentum import check_vwap_momentum
+from core.auditor import get_audit_summary
+from core.delivery import fetch_delivery_metrics
+from core.forecaster import generate_forecast_cone
+from core.announcements import check_corporate_announcements
+from core.risk_engine import calculate_position_size
+from core.sector_map import apply_sector_concentration_cap
+from core.self_learner import log_feature_vector_snapshot, get_mistake_penalty
+from core.alerts import send_telegram_alert
+from core.journal import execute_broker_order
+from core.sentiment import get_news_sentiment_score
+from core.options_feed import get_options_pcr
+
+# Cloud Database Provider
+try:
+    from supabase import create_client, Client
+except ImportError:
+    create_client, Client = None, None
+
+MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker.pkl")
+FEATURE_COLS = [
+    "dist_ema20_pct",
+    "trend_spread_pct",
+    "atr_pct",
+    "rvol",
+    "rsi_14",
+    "deliv_shock"
+]
+
+FNO_STOCKS = ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS"]
+LOT_SIZES = {"RELIANCE": 250, "HDFCBANK": 400, "ICICIBANK": 700, "INFY": 400, "TCS": 175, "SBIN": 750, "BHARTIARTL": 950, "ITC": 1600, "LT": 300}
+STRIKE_STEPS = {"RELIANCE": 20, "HDFCBANK": 10, "ICICIBANK": 10, "INFY": 20, "TCS": 50, "SBIN": 10, "BHARTIARTL": 20, "ITC": 10, "LT": 50}
+
+st.set_page_config(
+    page_title="Autonomous AI Quant Terminal (NSE)", 
+    page_icon="⚡", 
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+# ==============================================================================
+# 3. SECURE MOBILE LOGIN GATEWAY
+# ==============================================================================
+def check_password():
+    if st.query_params.get("auth") == "QuantTerminal2026":
+        st.session_state["password_correct"] = True
+        return True
+
+    def password_entered():
+        if st.session_state.get("username") == "admin" and st.session_state.get("password") == "QuantTerminal2026!":
+            st.session_state["password_correct"] = True
+            st.query_params["auth"] = "QuantTerminal2026"
+            del st.session_state["password"]
+            del st.session_state["username"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.subheader("🔐 Autonomous Quant Terminal - Secure Login")
+        st.text_input("Username", key="username")
+        st.text_input("Password", type="password", key="password")
+        st.button("Log In", on_click=password_entered, width="stretch")
+        return False
+    elif not st.session_state["password_correct"]:
+        st.subheader("🔐 Autonomous Quant Terminal - Secure Login")
+        st.text_input("Username", key="username")
+        st.text_input("Password", type="password", key="password")
+        st.button("Log In", on_click=password_entered, width="stretch")
+        st.error("😕 Invalid username or password")
+        return False
+    return True
+
+if not check_password():
+    st.stop()
+
+# ==============================================================================
+# 4. CLOUD HYDRATION
+# ==============================================================================
+@st.cache_resource
+def get_supabase_client():
+    if create_client is None:
+        return None
+    url = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None
+    key = st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None
+    if not url or not key:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+supabase = get_supabase_client()
 
 def hydrate_duckdb_from_supabase():
     if not supabase:
@@ -257,7 +263,7 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
     return f"{clean}.NS"
 
 # ==============================================================================
-# OPTIONS ENGINE: LIVE NSE DATA & BLACK-SCHOLES FALLBACK
+# 5. OPTIONS ENGINE: LIVE NSE DATA & BLACK-SCHOLES FALLBACK
 # ==============================================================================
 def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
     try:
@@ -316,7 +322,7 @@ def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
     return expiry_dt, max(1, days_left)
 
 # ==============================================================================
-# AUDITING & RECONCILIATION ENGINE
+# 6. AUDITING & RECONCILIATION ENGINE
 # ==============================================================================
 def audit_and_reconcile_all_trades():
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -452,7 +458,7 @@ def deduplicate_journal_ledger():
         con.close()
 
 # ==============================================================================
-# DAILY OPTIONS ALPHA GENERATOR
+# 7. DAILY OPTIONS ALPHA GENERATOR
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -601,7 +607,7 @@ def generate_daily_options_alpha() -> dict:
     return signal_dict
 
 # ==============================================================================
-# AUDITED LOGGING & PERSISTENCE
+# 8. AUDITED LOGGING & PERSISTENCE
 # ==============================================================================
 def log_equity_signal_safely(sig: dict):
     con = duckdb.connect(DB_PATH, read_only=False)
@@ -659,7 +665,7 @@ def log_equity_signal_safely(sig: dict):
             pass
 
 # ==============================================================================
-# UI HEADER & CONTROL BAR
+# 9. UI HEADER & CONTROL BAR
 # ==============================================================================
 st.sidebar.header("⚙️ Autonomous Scanner Settings")
 selected_universe = st.sidebar.selectbox(
@@ -710,7 +716,7 @@ tab_scanner, tab_options, tab_journal = st.tabs([
 ])
 
 # ==============================================================================
-# MACHINE LEARNING PREDICTION PIPELINE
+# 10. MACHINE LEARNING PREDICTION PIPELINE
 # ==============================================================================
 @st.cache_resource
 def load_ml_model():
@@ -888,7 +894,7 @@ def run_predictions():
     return qualified_only, has_cleared
 
 # ==============================================================================
-# TAB 1: EQUITY SCANNER
+# 11. TAB 1: EQUITY SCANNER
 # ==============================================================================
 with tab_scanner:
     col1, col2 = st.columns([4, 1])
@@ -927,7 +933,7 @@ with tab_scanner:
         st.warning("🛡️ **Capital Protection Active:** No equities currently pass all combined volume, trend, and ML filters.")
 
 # ==============================================================================
-# TAB 2: OPTIONS ALPHA
+# 12. TAB 2: OPTIONS ALPHA
 # ==============================================================================
 with tab_options:
     st.subheader("📊 Institutional Daily Options Alpha (Budget < ₹30k)")
@@ -958,7 +964,7 @@ with tab_options:
                 st.success(f"Signal securely dispatched to {broker_mode} gateway.")
 
 # ==============================================================================
-# TAB 3: MASTER TRADE JOURNAL & RECONCILIATION
+# 13. TAB 3: MASTER TRADE JOURNAL & RECONCILIATION
 # ==============================================================================
 with tab_journal:
     st.subheader("📖 Autonomous Master Ledger (Equities & Options)")
