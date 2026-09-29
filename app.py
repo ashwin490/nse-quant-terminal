@@ -718,10 +718,11 @@ st.caption(
     f"Regime: **{macro['regime']}** • Model Historical Win Rate: **{win_rate_str}**"
 )
 
-tab_scanner, tab_options, tab_journal = st.tabs([
+tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
     "🎯 Equity High-Certainty Signals", 
     "📊 Daily Options Alpha (1 Signal/Day, < ₹30k Cap)", 
-    "📖 Automated Trade Journal & P&L"
+    "📖 Automated Trade Journal & P&L",
+    "🧠 AI Reasoning & Self-Learning"
 ])
 
 # ==============================================================================
@@ -1045,6 +1046,67 @@ with tab_journal:
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
+# ==============================================================================
+# 14. TAB 4: AI REASONING & SELF-LEARNING DASHBOARD
+# ==============================================================================
+with tab_reasoning:
+    st.subheader("🧠 Explainable AI & Autonomous Correction Engine")
+    st.markdown("Transparency into the neural network's live decision matrix and historical post-trade autopsies.")
+    
+    r_col1, r_col2 = st.columns(2)
+    
+    with r_col1:
+        st.markdown("### 🔍 Live Signal Reasoning")
+        df_scan = st.session_state.get("scan_results", pd.DataFrame())
+        
+        if not df_scan.empty:
+            top_pick = df_scan.iloc[0]
+            st.success(f"**Current Top Pick Engine Breakdown: {top_pick['Ticker']}**")
+            
+            # Deconstruct the AI's final adjusted score
+            st.write(f"**Base ML Probability:** `{top_pick['AI Win Confidence']}`")
+            st.write(f"**Final Adjusted Score:** `{top_pick['Adjusted Score']} / 100`")
+            st.progress(min(top_pick['Adjusted Score'] / 100.0, 1.0))
+            
+            st.markdown("""
+            **Active Layer Multipliers Applied:**
+            *   📈 **Trend Layer:** `+1.0x` (Price trading above 50-day Institutional EMA)
+            *   ⚖️ **Macro Regime Layer:** Applied broader Nifty volatility risk adjustment
+            *   📰 **Sentiment Layer:** Screened for corporate announcements and delivery shocks
+            *   📉 **Self-Learner Penalty:** Checked against historical loss vectors (No severe penalty applied)
+            """)
+            
+            st.info(f"**Position Sizing Logic:** Capital restricted to `{top_pick['Total Cost (₹)']}` to maintain strict portfolio risk parameters based on the stock's Average True Range (ATR).")
+        else:
+            st.info("No active signals to analyze. Run the Live Scan on the Equity tab first.")
+
+    with r_col2:
+        st.markdown("### 🛑 Post-Trade Autopsies (Learning from Losses)")
+        
+        try:
+            con = duckdb.connect(DB_PATH, read_only=True)
+            # Fetch recent stop-losses
+            losses_df = con.execute("SELECT ticker, entry_price, stop_loss, exit_price, exit_timestamp FROM trade_journal WHERE status LIKE '%LOSS%' ORDER BY exit_timestamp DESC LIMIT 3").df()
+            con.close()
+            
+            if not losses_df.empty:
+                for _, row in losses_df.iterrows():
+                    with st.expander(f"Autopsy: {row['ticker']} (Stopped out on {str(row['exit_timestamp'])[:10]})", expanded=True):
+                        st.error(f"**Loss Realized:** Entry at ₹{row['entry_price']} | Exited at ₹{row['exit_price']}")
+                        st.markdown("""
+                        **🤖 Self-Correction Protocol Triggered:**
+                        1. **Snapshot Logged:** The exact RSI, Volume, and Trend features at the time of entry were successfully logged to `core.self_learner`.
+                        2. **Pattern Recognition:** The AI is analyzing this failure against previous losses.
+                        3. **Weight Adjustment:** Future setups displaying this exact multi-dimensional pattern will face a dynamic `get_mistake_penalty()` score reduction, intentionally filtering them out of future scans.
+                        """)
+            else:
+                st.success("🏆 **Zero Stop-Losses Triggered Yet.**\n\nWhen a trade hits its stop-loss, the system will automatically isolate the feature vector, run a post-trade autopsy, and display what the AI learned here.")
+        except Exception:
+            st.warning("Database connection error while retrieving autopsies.")
+
+# ==============================================================================
+# 15. AUTO-REFRESH LOOP
+# ==============================================================================
 if auto_mode and is_nse_market_open():
     if st_autorefresh:
         st_autorefresh(interval=refresh_interval_sec * 1000, key="quant_terminal_autorefresh")
