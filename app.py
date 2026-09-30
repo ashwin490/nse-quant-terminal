@@ -31,7 +31,17 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 # ==============================================================================
-# 1. INITIALIZE DATABASE FIRST (SYNCED TO ORIGINAL FILENAME)
+# 0. GLOBAL STEALTH SESSION FOR YFINANCE (BYPASS HTTP 429)
+# ==============================================================================
+yf_session = requests.Session()
+yf_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.5"
+})
+
+# ==============================================================================
+# 1. INITIALIZE DATABASE FIRST
 # ==============================================================================
 DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
 
@@ -268,17 +278,8 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
 # ==============================================================================
 def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.5"
-        }
-        session = requests.Session()
-        session.headers.update(headers)
-        session.get("https://www.nseindia.com", timeout=5)
-        
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-        res = session.get(url, timeout=5)
+        res = yf_session.get(url, timeout=5)
         
         if res.status_code == 200:
             data = res.json()
@@ -336,10 +337,11 @@ def audit_and_reconcile_all_trades():
             live_quotes = {}
             for tkr in unique_tickers:
                 try:
+                    time.sleep(0.1) # Pacing
                     yf_sym = normalize_ticker_for_yf(tkr)
-                    h = yf.Ticker(yf_sym).history(period="1d", interval="5m")
+                    h = yf.Ticker(yf_sym, session=yf_session).history(period="1d", interval="5m")
                     if h.empty:
-                        h = yf.Ticker(yf_sym).history(period="5d")
+                        h = yf.Ticker(yf_sym, session=yf_session).history(period="5d")
                     if not h.empty:
                         live_quotes[tkr] = float(h["Close"].iloc[-1])
                 except Exception:
@@ -377,12 +379,13 @@ def audit_and_reconcile_all_trades():
         if not active_opts.empty:
             for _, opt in active_opts.iterrows():
                 try:
+                    time.sleep(0.1) # Pacing
                     sym = f"{opt['share_name']}.NS"
-                    h_daily = yf.Ticker(sym).history(period="30d")
+                    h_daily = yf.Ticker(sym, session=yf_session).history(period="30d")
                     if h_daily.empty:
                         continue
                         
-                    h_live = yf.Ticker(sym).history(period="1d", interval="5m")
+                    h_live = yf.Ticker(sym, session=yf_session).history(period="1d", interval="5m")
                     current_spot = float(h_live["Close"].iloc[-1]) if not h_live.empty else float(h_daily["Close"].iloc[-1])
                     
                     live_prem = get_live_nse_option_premium(opt['share_name'], float(opt["strike_price"]), "CE")
@@ -507,7 +510,7 @@ def generate_daily_options_alpha() -> dict:
 
     selected_stock = "INFY"
     try:
-        data = yf.download(FNO_STOCKS, period="5d", progress=False)
+        data = yf.download(FNO_STOCKS, period="5d", progress=False, session=yf_session)
         if "Close" in data and not data["Close"].empty:
             close_df = data["Close"]
             if isinstance(close_df, pd.DataFrame):
@@ -524,7 +527,7 @@ def generate_daily_options_alpha() -> dict:
     sigma = 0.22
 
     try:
-        h = yf.Ticker(f"{selected_stock}.NS").history(period="30d")
+        h = yf.Ticker(f"{selected_stock}.NS", session=yf_session).history(period="30d")
         if not h.empty:
             spot = float(h["Close"].iloc[-1])
             returns = np.log(h["Close"] / h["Close"].shift(1)).dropna()
@@ -669,7 +672,7 @@ def log_equity_signal_safely(sig: dict):
 # ==============================================================================
 # 9. UI HEADER & CONTROL BAR
 # ==============================================================================
-st.sidebar.header("⚙️️ Autonomous Scanner Settings")
+st.sidebar.header("⚙ Autonomous Scanner Settings")
 selected_universe = st.sidebar.selectbox(
     "Stock Universe",
     ["All Market Shares < ₹1,000 (Deep Scan)", "Nifty 50 (Core Basket)", "Nifty 200 (Broad Basket)"]
@@ -754,6 +757,9 @@ def run_predictions():
     macro_risk_mult = get_macro_risk_adjuster()
 
     for i, raw_sym in enumerate(target_basket):
+        # PACING DELAY: Prevents HTTP 429 Rate Limit from Yahoo Finance
+        time.sleep(0.3)
+        
         clean_sym = clean_sym_name(raw_sym)
         full_sym = f"{clean_sym}.NS"
 
