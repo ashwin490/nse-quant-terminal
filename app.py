@@ -328,7 +328,7 @@ def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
 def audit_and_reconcile_all_trades():
     con = duckdb.connect(DB_PATH, read_only=False)
     ist_zone = pytz.timezone('Asia/Kolkata')
-    now_ts = datetime.now(ist_zone).replace(tzinfo=None) # Ensures DuckDB logs exact IST wall-clock time
+    now_ts = datetime.now(ist_zone).replace(tzinfo=None)
     try:
         active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
         if not active_trades.empty:
@@ -1051,27 +1051,42 @@ with tab_reasoning:
     with r_col1:
         st.markdown("### 🔍 Live Signal Reasoning")
         df_scan = st.session_state.get("scan_results", pd.DataFrame())
+        has_cleared = st.session_state.get("has_cleared", False)
         
-        if not df_scan.empty:
+        if has_cleared and not df_scan.empty:
             top_pick = df_scan.iloc[0]
-            st.success(f"**Current Top Pick Engine Breakdown: {top_pick['Ticker']}**")
-            
-            # Deconstruct the AI's final adjusted score
+            st.success(f"**Top Equity Pick Breakdown: {top_pick['Ticker']}**")
             st.write(f"**Base ML Probability:** `{top_pick['AI Win Confidence']}`")
             st.write(f"**Final Adjusted Score:** `{top_pick['Adjusted Score']} / 100`")
             st.progress(min(top_pick['Adjusted Score'] / 100.0, 1.0))
             
             st.markdown("""
             **Active Layer Multipliers Applied:**
-            *   📈 **Trend Layer:** `+1.0x` (Price trading above 50-day Institutional EMA)
-            *   ⚖️ **Macro Regime Layer:** Applied broader Nifty volatility risk adjustment
-            *   📰 **Sentiment Layer:** Screened for corporate announcements and delivery shocks
-            *   📉 **Self-Learner Penalty:** Checked against historical loss vectors (No severe penalty applied)
+            * 📈 **Trend Layer:** `+1.0x` (Price trading above 50-day Institutional EMA)
+            * ⚖️ **Macro Regime Layer:** Applied broader Nifty volatility risk adjustment
+            * 📰 **Sentiment Layer:** Screened for corporate announcements and delivery shocks
+            * 📉 **Self-Learner Penalty:** Checked against historical loss vectors
             """)
-            
-            st.info(f"**Position Sizing Logic:** Capital restricted to `{top_pick['Total Cost (₹)']}` to maintain strict portfolio risk parameters based on the stock's Average True Range (ATR).")
+            st.info(f"**Position Sizing Logic:** Capital restricted to `{top_pick['Total Cost (₹)']}` to maintain portfolio risk parameters based on stock ATR.")
         else:
-            st.info("No active signals to analyze. Run the Live Scan on the Equity tab first.")
+            opt_data = generate_daily_options_alpha()
+            if opt_data:
+                st.warning("🛡️️ **Equities in Capital Protection Mode** — No stocks passed all 4 gates (Trend, Vol, RSI, ML ≥ 51.5%).")
+                st.markdown(f"#### 📊 Active Option Alpha Breakdown: `{opt_data['option_contract']}`")
+                
+                strike_diff = opt_data['strike_price'] - opt_data['underlying_spot']
+                otm_pct = (strike_diff / opt_data['underlying_spot']) * 100.0
+                
+                st.markdown(f"""
+                * 🎯 **Underlying Spot:** `₹{opt_data['underlying_spot']:.2f}` | **Target Strike:** `₹{opt_data['strike_price']:.2f}` (`+{otm_pct:.2f}% OTM`)
+                * 📈 **Implied Volatility (IV):** `{opt_data['implied_vol']}%` (Historical 30-day annualized standard deviation)
+                * 🧠 **AI Win Confidence:** `{opt_data['ai_confidence']}%` (Selected as strongest relative return in F&O basket)
+                * ⏱️ **Days to Monthly Expiry:** `{opt_data['expiry_days']} days`
+                * 💰 **Lot Sizing & Budget:** `{opt_data['lot_size']} units` at `₹{opt_data['entry_premium']:.2f}` premium = **₹{opt_data['total_capital']:,}** (Capped under ₹30,000)
+                * 📊 **Risk/Reward Envelope:** Profit Target `+65%` (`₹{opt_data['target_premium']:.2f}`) vs Stop-Loss `-50%` (`₹{opt_data['stop_loss_premium']:.2f}`)
+                """)
+            else:
+                st.info("No active signals currently detected.")
 
     with r_col2:
         st.markdown("### 🛑 Post-Trade Autopsies (Learning from Losses)")
@@ -1079,14 +1094,12 @@ with tab_reasoning:
         try:
             con = duckdb.connect(DB_PATH, read_only=True)
             
-            # Fetch Equity Losses
             eq_losses = con.execute("""
                 SELECT ticker as symbol, entry_price as entry, exit_price as exit_val, exit_timestamp as exit_time 
                 FROM trade_journal 
                 WHERE status LIKE '%LOSS%'
             """).df()
             
-            # Fetch Options Losses (Bridging the gap)
             opt_losses = con.execute("""
                 SELECT option_contract as symbol, entry_premium as entry, current_option_price as exit_val, last_audited as exit_time 
                 FROM daily_options_journal 
@@ -1094,11 +1107,9 @@ with tab_reasoning:
             """).df()
             con.close()
             
-            # Combine both dataframes
             all_losses = pd.concat([eq_losses, opt_losses], ignore_index=True)
             
             if not all_losses.empty:
-                # Convert to datetime for proper sorting, and take the 3 most recent
                 all_losses['exit_time'] = pd.to_datetime(all_losses['exit_time'])
                 all_losses = all_losses.sort_values(by='exit_time', ascending=False).head(3)
                 
