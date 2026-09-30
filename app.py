@@ -120,7 +120,6 @@ init_duckdb_storage()
 # ==============================================================================
 from core.universe_sync import get_sub_1000_universe, NIFTY_200_UNIVERSE
 from core.data_engine import NIFTY_BASKET
-from core.features import extract_features
 from core.regime import get_market_regime
 from core.macro_feed import get_macro_risk_adjuster
 from core.intraday_momentum import check_vwap_momentum
@@ -135,6 +134,12 @@ from core.alerts import send_telegram_alert
 from core.journal import execute_broker_order
 from core.sentiment import get_news_sentiment_score
 from core.options_feed import get_options_pcr
+
+# Note: We safely bypass core.features.extract_features below using Bulk Download
+try:
+    from core.features import extract_features
+except ImportError:
+    pass
 
 try:
     from supabase import create_client, Client
@@ -337,7 +342,7 @@ def audit_and_reconcile_all_trades():
             live_quotes = {}
             for tkr in unique_tickers:
                 try:
-                    time.sleep(0.1) # Pacing
+                    time.sleep(0.1) # Safe Pacing
                     yf_sym = normalize_ticker_for_yf(tkr)
                     h = yf.Ticker(yf_sym, session=yf_session).history(period="1d", interval="5m")
                     if h.empty:
@@ -379,7 +384,7 @@ def audit_and_reconcile_all_trades():
         if not active_opts.empty:
             for _, opt in active_opts.iterrows():
                 try:
-                    time.sleep(0.1) # Pacing
+                    time.sleep(0.1) # Safe Pacing
                     sym = f"{opt['share_name']}.NS"
                     h_daily = yf.Ticker(sym, session=yf_session).history(period="30d")
                     if h_daily.empty:
@@ -722,7 +727,7 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 ])
 
 # ==============================================================================
-# 10. MACHINE LEARNING PREDICTION PIPELINE
+# 10. MACHINE LEARNING PREDICTION PIPELINE (BULK DOWNLOAD ENABLED)
 # ==============================================================================
 @st.cache_resource
 def load_ml_model():
@@ -734,6 +739,43 @@ ml_model = load_ml_model()
 
 def clean_sym_name(sym: str) -> str:
     return str(sym).strip().lstrip("$").replace(".NS", "")
+
+def calculate_technical_features(df_hist, deliv_shock=1.0):
+    if df_hist.empty or len(df_hist) < 20:
+        return pd.DataFrame()
+        
+    df = pd.DataFrame()
+    df['close'] = df_hist['Close'].astype(float)
+    df['volume'] = df_hist['Volume'].astype(float)
+    
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    
+    high = df_hist['High'].astype(float)
+    low = df_hist['Low'].astype(float)
+    prev_close = df['close'].shift()
+    
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df['atr_14'] = tr.rolling(14).mean()
+    
+    df['dist_ema20_pct'] = ((df['close'] - df['ema20']) / df['ema20']) * 100.0
+    df['trend_spread_pct'] = ((df['ema20'] - df['ema50']) / df['ema50']) * 100.0
+    df['atr_pct'] = (df['atr_14'] / df['close']) * 100.0
+    
+    vol_20 = df['volume'].rolling(20).mean()
+    df['rvol'] = (df['volume'] / vol_20).fillna(1.0)
+    
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0.0).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
+    rs = gain / loss.replace(0.0, np.nan)
+    df['rsi_14'] = 100.0 - (100.0 / (1.0 + rs.fillna(0.0)))
+    
+    df['deliv_shock'] = float(deliv_shock)
+    return df.dropna()
 
 def run_predictions():
     if ml_model is None:
@@ -753,13 +795,17 @@ def run_predictions():
         target_basket = NIFTY_BASKET
 
     total_stocks = len(target_basket)
-    prog = st.progress(0, text=f"Scanning {total_stocks} equities...")
     macro_risk_mult = get_macro_risk_adjuster()
+    target_yf_syms = [f"{clean_sym_name(sym)}.NS" for sym in target_basket]
+
+    # --- BULK INSTITUTIONAL DOWNLOAD TO BYPASS HTTP 429 ---
+    with st.spinner(f"Downloading F&O Institutional Bulk Data for {total_stocks} F&O pairs (Bypassing Rate Limits)..."):
+        bulk_data = yf.download(target_yf_syms, period="6mo", progress=False, session=yf_session)
+
+    prog = st.progress(0, text=f"Analyzing {total_stocks} F&O components...")
 
     for i, raw_sym in enumerate(target_basket):
-        # PACING DELAY: Prevents HTTP 429 Rate Limit from Yahoo Finance
-        time.sleep(0.3)
-        
+        time.sleep(0.05) # Safe pacing for internal NSE modules
         clean_sym = clean_sym_name(raw_sym)
         full_sym = f"{clean_sym}.NS"
 
@@ -786,8 +832,23 @@ def run_predictions():
         except Exception:
             pcr_mult = 1.0
 
+        # Extract individual ticker data from the bulk F&O payload safely
+        df_hist = pd.DataFrame()
         try:
-            df_feat = extract_features(clean_sym, deliv_shock=deliv_shock)
+            if isinstance(bulk_data.columns, pd.MultiIndex):
+                if full_sym in bulk_data.columns.levels[1]:
+                    df_hist['Close'] = bulk_data['Close'][full_sym]
+                    df_hist['Volume'] = bulk_data['Volume'][full_sym]
+                    df_hist['High'] = bulk_data['High'][full_sym]
+                    df_hist['Low'] = bulk_data['Low'][full_sym]
+            else:
+                df_hist = bulk_data.copy()
+            df_hist = df_hist.dropna(subset=['Close'])
+        except Exception:
+            pass
+
+        try:
+            df_feat = calculate_technical_features(df_hist, deliv_shock=deliv_shock)
         except Exception:
             df_feat = pd.DataFrame()
 
@@ -900,7 +961,6 @@ def run_predictions():
     diversified = apply_sector_concentration_cap(df_raw.to_dict(orient="records"), max_per_sector=2)
     df_out = pd.DataFrame(diversified)
 
-    # Return the full sorted dataframe so Tab 4 can analyze the failures
     df_sorted = df_out.sort_values(
         by=["Qualified", "Adjusted Score", "ReturnNum"], 
         ascending=[False, False, False]
@@ -913,7 +973,6 @@ def run_predictions():
         for _, sig in qualified_only.iterrows():
             log_equity_signal_safely(sig.to_dict())
 
-    # Return df_sorted (full list) to pass rejection data to the UI
     return df_sorted, has_cleared
 
 # ==============================================================================
@@ -1101,7 +1160,7 @@ with tab_reasoning:
             else:
                 st.warning("🛡 **Equities in Capital Protection Mode** — The engine actively blocked trades today to protect capital.")
                 st.markdown("#### 🚫 System-Wide Equity Rejection")
-                st.error("**Blocked By:** Data Integrity Filter — The AI requires 20 days of historical volume/volatility data. Currently waiting for the background engine to hydrate the historical candles database.")
+                st.error("**Blocked By:** Data Integrity Filter — The F&O bulk data download returned empty. Yahoo Finance is currently refusing connections (HTTP 429). The AI will retry automatically.")
                 st.divider()
                 
             opt_data = generate_daily_options_alpha()
