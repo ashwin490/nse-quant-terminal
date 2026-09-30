@@ -669,7 +669,7 @@ def log_equity_signal_safely(sig: dict):
 # ==============================================================================
 # 9. UI HEADER & CONTROL BAR
 # ==============================================================================
-st.sidebar.header("⚙️ Autonomous Scanner Settings")
+st.sidebar.header("⚙️️ Autonomous Scanner Settings")
 selected_universe = st.sidebar.selectbox(
     "Stock Universe",
     ["All Market Shares < ₹1,000 (Deep Scan)", "Nifty 50 (Core Basket)", "Nifty 200 (Broad Basket)"]
@@ -855,6 +855,17 @@ def run_predictions():
             }
 
         is_qualified = (is_above_trend and not is_exhausted and has_volume and raw_prob >= 51.5)
+        
+        # Explainable AI: Document exactly why a stock was blocked
+        rejection_reason = "Passed All Institutional Gates"
+        if not is_above_trend:
+            rejection_reason = "Trend Filter: Price trading below 50-day EMA"
+        elif is_exhausted:
+            rejection_reason = "Momentum Filter: Overbought (RSI > 75 or Over-extended)"
+        elif not has_volume:
+            rejection_reason = "Liquidity Filter: Relative Volume too low (< 0.75x)"
+        elif raw_prob < 51.5:
+            rejection_reason = f"ML Conviction Filter: AI probability too low ({round(raw_prob, 1)}% vs 51.5% required)"
 
         results.append({
             "Ticker": clean_sym,
@@ -870,6 +881,7 @@ def run_predictions():
             "AI Win Confidence": f"{round(raw_prob, 1)}%",
             "Adjusted Score": round(final_score, 1),
             "Qualified": is_qualified,
+            "Rejection Reason": rejection_reason,
             "FullSymbol": full_sym
         })
         prog.progress((i + 1) / total_stocks)
@@ -882,6 +894,7 @@ def run_predictions():
     diversified = apply_sector_concentration_cap(df_raw.to_dict(orient="records"), max_per_sector=2)
     df_out = pd.DataFrame(diversified)
 
+    # Return the full sorted dataframe so Tab 4 can analyze the failures
     df_sorted = df_out.sort_values(
         by=["Qualified", "Adjusted Score", "ReturnNum"], 
         ascending=[False, False, False]
@@ -894,7 +907,8 @@ def run_predictions():
         for _, sig in qualified_only.iterrows():
             log_equity_signal_safely(sig.to_dict())
 
-    return qualified_only, has_cleared
+    # Return df_sorted (full list) to pass rejection data to the UI
+    return df_sorted, has_cleared
 
 # ==============================================================================
 # 11. TAB 1: EQUITY SCANNER
@@ -914,11 +928,13 @@ with tab_scanner:
 
     df_res = st.session_state.get("scan_results", pd.DataFrame())
     has_cleared_signals = st.session_state.get("has_cleared", False)
+    
+    qualified_df = df_res[df_res["Qualified"] == True] if not df_res.empty else pd.DataFrame()
 
-    if has_cleared_signals and not df_res.empty:
-        st.success(f"🟢 **{len(df_res)} High-Conviction Buy Setup(s) Cleared All Strict Institutional Gates**")
-        cols = st.columns(min(len(df_res), 3))
-        for idx, row in df_res.head(3).iterrows():
+    if has_cleared_signals and not qualified_df.empty:
+        st.success(f"🟢 **{len(qualified_df)} High-Conviction Buy Setup(s) Cleared All Strict Institutional Gates**")
+        cols = st.columns(min(len(qualified_df), 3))
+        for idx, row in qualified_df.head(3).iterrows():
             with cols[idx % 3]:
                 with st.container(border=True):
                     st.success(f"🔥 CONVICTION PICK #{idx + 1}")
@@ -1054,7 +1070,7 @@ with tab_reasoning:
         has_cleared = st.session_state.get("has_cleared", False)
         
         if has_cleared and not df_scan.empty:
-            top_pick = df_scan.iloc[0]
+            top_pick = df_scan[df_scan['Qualified'] == True].iloc[0]
             st.success(f"**Top Equity Pick Breakdown: {top_pick['Ticker']}**")
             st.write(f"**Base ML Probability:** `{top_pick['AI Win Confidence']}`")
             st.write(f"**Final Adjusted Score:** `{top_pick['Adjusted Score']} / 100`")
@@ -1063,15 +1079,22 @@ with tab_reasoning:
             st.markdown("""
             **Active Layer Multipliers Applied:**
             * 📈 **Trend Layer:** `+1.0x` (Price trading above 50-day Institutional EMA)
-            * ⚖️ **Macro Regime Layer:** Applied broader Nifty volatility risk adjustment
+            * ⚖️️ **Macro Regime Layer:** Applied broader Nifty volatility risk adjustment
             * 📰 **Sentiment Layer:** Screened for corporate announcements and delivery shocks
             * 📉 **Self-Learner Penalty:** Checked against historical loss vectors
             """)
             st.info(f"**Position Sizing Logic:** Capital restricted to `{top_pick['Total Cost (₹)']}` to maintain portfolio risk parameters based on stock ATR.")
         else:
+            if not df_scan.empty:
+                top_reject = df_scan.iloc[0]
+                st.warning("🛡 **Equities in Capital Protection Mode** — The engine actively blocked trades today to protect capital.")
+                st.markdown(f"#### 🚫 Top Rejected Equity: `{top_reject['Ticker']}`")
+                st.error(f"**Blocked By:** {top_reject['Rejection Reason']}")
+                st.write(f"**Base ML Probability:** `{top_reject['AI Win Confidence']}` | **Adjusted Score:** `{top_reject['Adjusted Score']} / 100`")
+                st.divider()
+                
             opt_data = generate_daily_options_alpha()
             if opt_data:
-                st.warning("🛡️️ **Equities in Capital Protection Mode** — No stocks passed all 4 gates (Trend, Vol, RSI, ML ≥ 51.5%).")
                 st.markdown(f"#### 📊 Active Option Alpha Breakdown: `{opt_data['option_contract']}`")
                 
                 strike_diff = opt_data['strike_price'] - opt_data['underlying_spot']
