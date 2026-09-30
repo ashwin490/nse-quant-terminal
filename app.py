@@ -1079,7 +1079,7 @@ with tab_reasoning:
             st.markdown("""
             **Active Layer Multipliers Applied:**
             * 📈 **Trend Layer:** `+1.0x` (Price trading above 50-day Institutional EMA)
-            * ⚖️️ **Macro Regime Layer:** Applied broader Nifty volatility risk adjustment
+            * ⚖ **Macro Regime Layer:** Applied broader Nifty volatility risk adjustment
             * 📰 **Sentiment Layer:** Screened for corporate announcements and delivery shocks
             * 📉 **Self-Learner Penalty:** Checked against historical loss vectors
             """)
@@ -1091,6 +1091,11 @@ with tab_reasoning:
                 st.markdown(f"#### 🚫 Top Rejected Equity: `{top_reject['Ticker']}`")
                 st.error(f"**Blocked By:** {top_reject['Rejection Reason']}")
                 st.write(f"**Base ML Probability:** `{top_reject['AI Win Confidence']}` | **Adjusted Score:** `{top_reject['Adjusted Score']} / 100`")
+                st.divider()
+            else:
+                st.warning("🛡 **Equities in Capital Protection Mode** — The engine actively blocked trades today to protect capital.")
+                st.markdown("#### 🚫 System-Wide Equity Rejection")
+                st.error("**Blocked By:** Data Integrity Filter — The AI requires 20 days of historical volume/volatility data. Currently waiting for the background engine to hydrate the historical candles database.")
                 st.divider()
                 
             opt_data = generate_daily_options_alpha()
