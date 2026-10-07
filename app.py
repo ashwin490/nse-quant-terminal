@@ -38,19 +38,12 @@ if str(ROOT_DIR) not in sys.path:
 # ==============================================================================
 # 0. GLOBAL STEALTH SESSION, THREAD LOCK, CONSTANTS & NLP LEXICON
 # ==============================================================================
-# HARDENED HEADERS: Bypasses Yahoo Finance 401/429 Cloud Datacenter Blocks
 yf_session = requests.Session()
 yf_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive"
 })
 
 @st.cache_resource
@@ -62,6 +55,7 @@ DB_LOCK = get_db_lock()
 DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker.pkl")
 
+# 10-YEAR LONGEVITY PARAMETERS
 MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7        
 BREAKEVEN_TRIGGER_RATIO = 0.65    
@@ -70,7 +64,7 @@ COOLDOWN_CALENDAR_DAYS = 3
 HALF_LIFE_DAYS = 30.0             
 MIN_SETTLED_TO_RETRAIN = 50       
 RETRAIN_STEP_INTERVAL = 25        
-MAX_SCAN_CHUNK_SIZE = 40          
+MAX_SCAN_CHUNK_SIZE = 35          
 
 NSE_EQUITY_FRICTION_PCT = 0.28
 
@@ -391,11 +385,12 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
         return clean
     return f"{clean}.NS"
 
-# FAST FAIL CACHE: Timeout set to 3s to prevent thread hangs on HTTP 401
+# 1. FIXED RATE LIMIT CACHE: Reduced TTL so loop reliably fetches fresh data
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_cached_history(yf_sym: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
+def fetch_cached_history(yf_sym: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
+    """Robust fetcher: Never uses bulk download. Staggers calls to evade YF 429."""
     try:
-        df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=3)
+        df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=4)
         if df is not None and not df.empty:
             return df
     except Exception:
@@ -661,7 +656,7 @@ def check_and_auto_retrain_model(feature_cols: list):
 def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
     try:
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-        res = yf_session.get(url, timeout=4)
+        res = yf_session.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
             for item in data.get('records', {}).get('data', []):
@@ -709,12 +704,9 @@ def audit_and_reconcile_all_trades():
     now_ts = now_ist.replace(tzinfo=None)
     today_date = now_ist.date()
 
-    # GUARANTEED HEARTBEAT: Always tick the last_audited time forward immediately
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
-            con.execute("UPDATE trade_journal SET last_audited = ? WHERE status = 'ACTIVE'", [now_ts])
-            con.execute("UPDATE daily_options_journal SET last_audited = ? WHERE status = 'ACTIVE'", [now_ts])
             active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
             active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
         except Exception:
@@ -727,12 +719,21 @@ def audit_and_reconcile_all_trades():
             tkr = str(tr["ticker"]).strip()
             yf_sym = normalize_ticker_for_yf(tkr)
             try:
+                # Use our robust fetcher - it will gracefully return empty DF if Yahoo blocks it
                 h = fetch_cached_history(yf_sym, period="1d", interval="5m")
                 if h.empty:
                     h = fetch_cached_history(yf_sym, period="5d", interval="1d")
                 
-                # If YF 401 blocks data, UI still shows updated timestamp from Heartbeat above
+                # CRITICAL: Always push the timestamp forward to prove the loop is running, even if YF drops
                 if h.empty:
+                    with DB_LOCK:
+                        con = duckdb.connect(DB_PATH, read_only=False)
+                        try:
+                            con.execute("UPDATE trade_journal SET last_audited = ? WHERE trade_id = ?", [now_ts, tr["trade_id"]])
+                        except Exception:
+                            pass
+                        finally:
+                            con.close()
                     continue
 
                 curr = float(h["Close"].iloc[-1])
@@ -784,9 +785,10 @@ def audit_and_reconcile_all_trades():
                         con.execute("""
                             UPDATE trade_journal
                             SET latest_price = ?, stop_loss = ?, pnl_pct = ?, status = ?, exit_price = ?, 
-                                exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END
+                                exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
+                                last_audited = ?
                             WHERE trade_id = ?
-                        """, [curr, stop, pnl, new_status, exit_price, new_status, now_ts, tr["trade_id"]])
+                        """, [curr, stop, pnl, new_status, exit_price, new_status, now_ts, now_ts, tr["trade_id"]])
                     finally:
                         con.close()
 
@@ -810,7 +812,16 @@ def audit_and_reconcile_all_trades():
                 sym = f"{opt['share_name']}.NS"
                 h_daily = fetch_cached_history(sym, period="30d", interval="1d")
                 
+                # CRITICAL: Always push the timestamp forward even if YF drops
                 if h_daily.empty:
+                    with DB_LOCK:
+                        con = duckdb.connect(DB_PATH, read_only=False)
+                        try:
+                            con.execute("UPDATE daily_options_journal SET last_audited = ? WHERE date_key = ?", [now_ts, opt["date_key"]])
+                        except Exception:
+                            pass
+                        finally:
+                            con.close()
                     continue
                     
                 h_live = fetch_cached_history(sym, period="1d", interval="5m")
@@ -848,9 +859,9 @@ def audit_and_reconcile_all_trades():
                     try:
                         con.execute("""
                             UPDATE daily_options_journal
-                            SET current_option_price = ?, underlying_spot = ?, pnl_pct = ?, status = ?
+                            SET current_option_price = ?, underlying_spot = ?, pnl_pct = ?, status = ?, last_audited = ?
                             WHERE date_key = ?
-                        """, [live_prem, current_spot, pnl_pct, opt_status, opt["date_key"]])
+                        """, [live_prem, current_spot, pnl_pct, opt_status, now_ts, opt["date_key"]])
                     finally:
                         con.close()
                 
@@ -936,20 +947,19 @@ def generate_daily_options_alpha() -> dict:
 
     selected_stock = "ICICIBANK"
     basket_perf = {}
-    try:
-        # Fast fail download to bypass 401s
-        data = yf.download(FNO_STOCKS, period="5d", progress=False, session=yf_session, timeout=4)
-        if "Close" in data and not data["Close"].empty:
-            close_df = data["Close"]
-            if isinstance(close_df, pd.DataFrame):
-                rets = (close_df.iloc[-1] / close_df.iloc[-2]) - 1
-                for sym, val in rets.dropna().items():
-                    clean_name = str(sym).replace(".NS", "")
-                    basket_perf[clean_name] = round(float(val) * 100.0, 2)
-                best_ticker = str(rets.dropna().idxmax())
-                selected_stock = best_ticker.replace(".NS", "")
-    except Exception:
-        selected_stock = "ICICIBANK"
+    best_score = -999.0
+    
+    # CRITICAL: Loop sequentially to bypass YF Bulk Download IP Ban
+    for sym in FNO_STOCKS:
+        time.sleep(0.2)
+        h = fetch_cached_history(sym, period="5d", interval="1d")
+        if not h.empty and len(h) >= 2:
+            ret = (h["Close"].iloc[-1] / h["Close"].iloc[-2]) - 1
+            clean_name = str(sym).replace(".NS", "")
+            basket_perf[clean_name] = round(float(ret) * 100.0, 2)
+            if ret > best_score:
+                best_score = ret
+                selected_stock = clean_name
 
     st.session_state["fno_basket_perf"] = basket_perf
     lot_size = LOT_SIZES.get(selected_stock, 500)
@@ -1206,10 +1216,16 @@ refresh_options = {"1 Minute (Test Mode)": 60, "5 Minutes": 300, "10 Minutes": 6
 selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=1)
 refresh_interval_sec = refresh_options[selected_interval]
 
-# CRITICAL FIX: Bulletproof Time-Based Loop Trigger
-current_time = time.time()
-last_audit_time = st.session_state.get("last_audit_time", 0.0)
-is_time_for_refresh = auto_mode and (current_time - last_audit_time >= refresh_interval_sec)
+loop_tick = 0
+if auto_mode and st_autorefresh:
+    loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="nse_unified_autorefresh")
+
+# CRITICAL FIX: Bulletproof Streamlit tick trigger
+is_new_loop_tick = False
+if "last_loop_tick" not in st.session_state or loop_tick != st.session_state["last_loop_tick"]:
+    is_new_loop_tick = True
+    st.session_state["last_loop_tick"] = loop_tick
+    st.session_state["force_refresh"] = True # Set a strict flag
 
 if "db_error" in st.session_state:
     st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
@@ -1240,7 +1256,7 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 ])
 
 # ==============================================================================
-# 11. MACHINE LEARNING PREDICTION PIPELINE (BULK + ROTATING CHUNKS + TCA)
+# 11. MACHINE LEARNING PREDICTION PIPELINE (NO BULK DOWNLOADS + TCA)
 # ==============================================================================
 @st.cache_resource
 def get_ml_model():
@@ -1330,34 +1346,23 @@ def run_predictions():
     if not full_universe:
         return pd.DataFrame(), False
 
-    # ROTATING SCANNER: Randomly select stocks to bypass Yahoo IP bans & Memory Leaks
+    # ROTATING SCANNER: Select chunk to bypass YF IP bans & Memory Leaks
     scan_chunk = random.sample(full_universe, min(MAX_SCAN_CHUNK_SIZE, len(full_universe)))
     total_stocks = len(scan_chunk)
-    target_yf_syms = [f"{clean_sym_name(sym)}.NS" for sym in scan_chunk]
 
-    with st.spinner(f"Downloading Institutional Bulk Data for {total_stocks} unheld NSE equities..."):
-        bulk_data = yf.download(target_yf_syms, period="6mo", progress=False, session=yf_session, timeout=5)
+    prog = st.progress(0, text=f"Analyzing {total_stocks} NSE components (Safe Mode to Evade YF Blocks)...")
 
-    prog = st.progress(0, text=f"Analyzing {total_stocks} NSE components with Filing NLP, TCA & Self-Learner...")
-
+    # CRITICAL FIX: Loop individually. No more yf.download() triggering 429 Errors.
     for i, raw_sym in enumerate(scan_chunk):
-        time.sleep(0.01)
         clean_sym = clean_sym_name(raw_sym)
         full_sym = f"{clean_sym}.NS"
 
-        df_hist = pd.DataFrame()
-        try:
-            if isinstance(bulk_data.columns, pd.MultiIndex):
-                if full_sym in bulk_data.columns.levels[1]:
-                    df_hist['Close'] = bulk_data['Close'][full_sym]
-                    df_hist['Volume'] = bulk_data['Volume'][full_sym]
-                    df_hist['High'] = bulk_data['High'][full_sym]
-                    df_hist['Low'] = bulk_data['Low'][full_sym]
-            else:
-                df_hist = bulk_data.copy()
-            df_hist = df_hist.dropna(subset=['Close'])
-        except Exception:
-            pass
+        # Hard pacing to trick Yahoo Finance firewalls
+        time.sleep(0.3)
+        df_hist = fetch_cached_history(full_sym, period="6mo", interval="1d")
+        if df_hist.empty:
+            prog.progress((i + 1) / total_stocks)
+            continue
 
         try:
             df_feat = calculate_technical_features(df_hist, deliv_shock=1.0)
@@ -1559,12 +1564,13 @@ with tab_scanner:
                         f"🕒 **Last Audited:** `{str(t_row['last_audited'])[:19]} IST`"
                     )
     else:
-        # CRITICAL FIX: Trigger scans successfully on timer loops
-        if re_scan or is_time_for_refresh or "scan_results" not in st.session_state:
+        # CRITICAL FIX: The Force Refresh Flag ensures st_autorefresh actually triggers a new scan
+        should_run_scan = re_scan or st.session_state.get("force_refresh", False) or "scan_results" not in st.session_state
+        
+        if should_run_scan:
+            st.session_state["force_refresh"] = False # Consume flag immediately
             with st.spinner("Executing quant screen across rotating market universe..."):
-                if re_scan or is_time_for_refresh:
-                    audit_and_reconcile_all_trades()
-                    st.session_state["last_audit_time"] = time.time()
+                audit_and_reconcile_all_trades()
                 res_df, has_cleared = run_predictions()
                 st.session_state["scan_results"] = res_df
                 st.session_state["has_cleared"] = has_cleared
