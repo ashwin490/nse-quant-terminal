@@ -18,6 +18,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import plotly.graph_objects as go
 import yfinance as yf
 import pytz
 import duckdb
@@ -314,6 +315,7 @@ def record_db_error(context: str, err: Exception):
     st.session_state["db_error"] = f"[{context}] {sanitized[:140]}"
 
 def fetch_all_supabase_rows(table_name: str) -> list:
+    """Paginated retrieval: seamlessly retrieves beyond the PostgREST 1,000-row ceiling for 10-year scale."""
     if not supabase:
         return []
     all_rows = []
@@ -400,6 +402,7 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_cached_history(yf_sym: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
+    """Fault-tolerant history fetcher with exponential retry and timeout guards."""
     for attempt in range(2):
         try:
             df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=6)
@@ -526,6 +529,7 @@ def compute_nse_macro_lead_lag(ticker: str, macro: dict) -> tuple:
 # 5. CONTINUOUS LEARNING: 30-DAY EXPONENTIAL DECAY & AUTONOMOUS RETRAINING
 # ==============================================================================
 def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
+    """Applies exponential half-life time decay (30 days) to historical stop-outs and wins."""
     delta = 0.0
     reasons = []
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -592,6 +596,7 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
     return {"delta": round(delta, 1), "reason": " | ".join(reasons) if reasons else "Clean Historical Memory"}
 
 def check_and_auto_retrain_model(feature_cols: list):
+    """Autonomous ML Engine: Retrains LightGBM & XGBoost when sufficient live trade vectors accumulate."""
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
@@ -1208,7 +1213,8 @@ selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_option
 refresh_interval_sec = refresh_options[selected_interval]
 
 loop_tick = 0
-if auto_mode and market_is_open and st_autorefresh:
+# Unblocked background refresh logic
+if auto_mode and st_autorefresh:
     loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="nse_unified_autorefresh")
 
 is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
@@ -1564,9 +1570,10 @@ with tab_scanner:
                         f"🕒 **Last Audited:** `{str(t_row['last_audited'])[:19]} IST`"
                     )
     else:
-        if re_scan or "scan_results" not in st.session_state:
+        # Loop Tick fixes applied here to trigger background re-scans correctly
+        if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
             with st.spinner("Executing quant screen across rotating market universe..."):
-                if re_scan:
+                if re_scan or is_new_loop_tick:
                     audit_and_reconcile_all_trades()
                 res_df, has_cleared = run_predictions()
                 st.session_state["scan_results"] = res_df
