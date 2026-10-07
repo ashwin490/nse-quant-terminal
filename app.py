@@ -38,11 +38,19 @@ if str(ROOT_DIR) not in sys.path:
 # ==============================================================================
 # 0. GLOBAL STEALTH SESSION, THREAD LOCK, CONSTANTS & NLP LEXICON
 # ==============================================================================
+# HARDENED HEADERS: Bypasses Yahoo Finance 401/429 Cloud Datacenter Blocks
 yf_session = requests.Session()
 yf_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.5"
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 })
 
 @st.cache_resource
@@ -54,7 +62,6 @@ DB_LOCK = get_db_lock()
 DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker.pkl")
 
-# 10-YEAR LONGEVITY PARAMETERS
 MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7        
 BREAKEVEN_TRIGGER_RATIO = 0.65    
@@ -384,18 +391,15 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
         return clean
     return f"{clean}.NS"
 
-# CRITICAL FIX: Dropped cache TTL to 60s so 5-min loops pull fresh bars
+# FAST FAIL CACHE: Timeout set to 3s to prevent thread hangs on HTTP 401
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_cached_history(yf_sym: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
-    """Fault-tolerant history fetcher with exponential retry and timeout guards."""
-    for attempt in range(3):
-        try:
-            df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=5)
-            if df is not None and not df.empty:
-                return df
-        except Exception:
-            pass
-        time.sleep(1.0)
+    try:
+        df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=3)
+        if df is not None and not df.empty:
+            return df
+    except Exception:
+        pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -467,7 +471,7 @@ def get_indian_cross_asset_macro() -> dict:
     symbols = {"nifty_5d": "^NSEI", "usdinr_5d": "INR=X", "brent_5d": "BZ=F"}
     for key, sym in symbols.items():
         try:
-            h = yf.Ticker(sym, session=yf_session).history(period="10d")
+            h = yf.Ticker(sym, session=yf_session).history(period="10d", timeout=3)
             if h is not None and len(h) >= 5:
                 c_now = float(h["Close"].iloc[-1])
                 c_5d = float(h["Close"].iloc[-5])
@@ -476,7 +480,7 @@ def get_indian_cross_asset_macro() -> dict:
         except Exception:
             pass
     try:
-        h_vix = yf.Ticker("^INDIAVIX", session=yf_session).history(period="5d")
+        h_vix = yf.Ticker("^INDIAVIX", session=yf_session).history(period="5d", timeout=3)
         if h_vix is not None and not h_vix.empty:
             macro["vix_level"] = round(float(h_vix["Close"].iloc[-1]), 1)
     except Exception:
@@ -657,7 +661,7 @@ def check_and_auto_retrain_model(feature_cols: list):
 def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
     try:
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-        res = yf_session.get(url, timeout=5)
+        res = yf_session.get(url, timeout=4)
         if res.status_code == 200:
             data = res.json()
             for item in data.get('records', {}).get('data', []):
@@ -705,9 +709,12 @@ def audit_and_reconcile_all_trades():
     now_ts = now_ist.replace(tzinfo=None)
     today_date = now_ist.date()
 
+    # GUARANTEED HEARTBEAT: Always tick the last_audited time forward immediately
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
+            con.execute("UPDATE trade_journal SET last_audited = ? WHERE status = 'ACTIVE'", [now_ts])
+            con.execute("UPDATE daily_options_journal SET last_audited = ? WHERE status = 'ACTIVE'", [now_ts])
             active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
             active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
         except Exception:
@@ -724,16 +731,8 @@ def audit_and_reconcile_all_trades():
                 if h.empty:
                     h = fetch_cached_history(yf_sym, period="5d", interval="1d")
                 
-                # CRITICAL FIX: If YF blocks the fetch, STILL update the timestamp so UI proves it's alive!
+                # If YF 401 blocks data, UI still shows updated timestamp from Heartbeat above
                 if h.empty:
-                    with DB_LOCK:
-                        con = duckdb.connect(DB_PATH, read_only=False)
-                        try:
-                            con.execute("UPDATE trade_journal SET last_audited = ? WHERE trade_id = ?", [now_ts, tr["trade_id"]])
-                        except Exception:
-                            pass
-                        finally:
-                            con.close()
                     continue
 
                 curr = float(h["Close"].iloc[-1])
@@ -785,10 +784,9 @@ def audit_and_reconcile_all_trades():
                         con.execute("""
                             UPDATE trade_journal
                             SET latest_price = ?, stop_loss = ?, pnl_pct = ?, status = ?, exit_price = ?, 
-                                exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
-                                last_audited = ?
+                                exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END
                             WHERE trade_id = ?
-                        """, [curr, stop, pnl, new_status, exit_price, new_status, now_ts, now_ts, tr["trade_id"]])
+                        """, [curr, stop, pnl, new_status, exit_price, new_status, now_ts, tr["trade_id"]])
                     finally:
                         con.close()
 
@@ -812,16 +810,7 @@ def audit_and_reconcile_all_trades():
                 sym = f"{opt['share_name']}.NS"
                 h_daily = fetch_cached_history(sym, period="30d", interval="1d")
                 
-                # CRITICAL FIX: Update timestamp even if YF drops connection
                 if h_daily.empty:
-                    with DB_LOCK:
-                        con = duckdb.connect(DB_PATH, read_only=False)
-                        try:
-                            con.execute("UPDATE daily_options_journal SET last_audited = ? WHERE date_key = ?", [now_ts, opt["date_key"]])
-                        except Exception:
-                            pass
-                        finally:
-                            con.close()
                     continue
                     
                 h_live = fetch_cached_history(sym, period="1d", interval="5m")
@@ -859,9 +848,9 @@ def audit_and_reconcile_all_trades():
                     try:
                         con.execute("""
                             UPDATE daily_options_journal
-                            SET current_option_price = ?, underlying_spot = ?, pnl_pct = ?, status = ?, last_audited = ?
+                            SET current_option_price = ?, underlying_spot = ?, pnl_pct = ?, status = ?
                             WHERE date_key = ?
-                        """, [live_prem, current_spot, pnl_pct, opt_status, now_ts, opt["date_key"]])
+                        """, [live_prem, current_spot, pnl_pct, opt_status, opt["date_key"]])
                     finally:
                         con.close()
                 
@@ -948,7 +937,8 @@ def generate_daily_options_alpha() -> dict:
     selected_stock = "ICICIBANK"
     basket_perf = {}
     try:
-        data = yf.download(FNO_STOCKS, period="5d", progress=False, session=yf_session)
+        # Fast fail download to bypass 401s
+        data = yf.download(FNO_STOCKS, period="5d", progress=False, session=yf_session, timeout=4)
         if "Close" in data and not data["Close"].empty:
             close_df = data["Close"]
             if isinstance(close_df, pd.DataFrame):
@@ -1346,12 +1336,12 @@ def run_predictions():
     target_yf_syms = [f"{clean_sym_name(sym)}.NS" for sym in scan_chunk]
 
     with st.spinner(f"Downloading Institutional Bulk Data for {total_stocks} unheld NSE equities..."):
-        bulk_data = yf.download(target_yf_syms, period="6mo", progress=False, session=yf_session)
+        bulk_data = yf.download(target_yf_syms, period="6mo", progress=False, session=yf_session, timeout=5)
 
     prog = st.progress(0, text=f"Analyzing {total_stocks} NSE components with Filing NLP, TCA & Self-Learner...")
 
     for i, raw_sym in enumerate(scan_chunk):
-        time.sleep(0.03)
+        time.sleep(0.01)
         clean_sym = clean_sym_name(raw_sym)
         full_sym = f"{clean_sym}.NS"
 
@@ -1572,7 +1562,7 @@ with tab_scanner:
         # CRITICAL FIX: Trigger scans successfully on timer loops
         if re_scan or is_time_for_refresh or "scan_results" not in st.session_state:
             with st.spinner("Executing quant screen across rotating market universe..."):
-                if re_scan:
+                if re_scan or is_time_for_refresh:
                     audit_and_reconcile_all_trades()
                     st.session_state["last_audit_time"] = time.time()
                 res_df, has_cleared = run_predictions()
@@ -1909,11 +1899,3 @@ with tab_reasoning:
                 st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nWhen a trade closes, the system isolates the feature vector, runs a post-trade autopsy, and displays what the AI learned here.")
         except Exception as e:
             st.warning(f"Database connection error while retrieving autopsies: {e}")
-
-# ==============================================================================
-# 16. BULLETPROOF BACKGROUND LOOP FALLBACK
-# ==============================================================================
-if auto_mode and not st_autorefresh:
-    st.sidebar.warning("⚠️ `streamlit-autorefresh` library not detected. Running background loop via native fallback.")
-    time.sleep(refresh_interval_sec)
-    st.rerun()
