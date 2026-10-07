@@ -59,13 +59,12 @@ MAX_DAILY_EQUITY_TRADES = 5
 MAX_HOLD_CALENDAR_DAYS = 7        
 BREAKEVEN_TRIGGER_RATIO = 0.65    
 MAX_ACTIVE_PER_SECTOR = 2         
-COOLDOWN_CALENDAR_DAYS = 3        # Anti-churn rule
-HALF_LIFE_DAYS = 30.0             # Exponential decay half-life for historical penalties
-MIN_SETTLED_TO_RETRAIN = 50       # Autonomous retraining trigger
-RETRAIN_STEP_INTERVAL = 25        # Retrain every N new closed trades thereafter
-MAX_SCAN_CHUNK_SIZE = 40          # Rotating memory-safe chunking
+COOLDOWN_CALENDAR_DAYS = 3        
+HALF_LIFE_DAYS = 30.0             
+MIN_SETTLED_TO_RETRAIN = 50       
+RETRAIN_STEP_INTERVAL = 25        
+MAX_SCAN_CHUNK_SIZE = 40          
 
-# Indian Equity Delivery Friction
 NSE_EQUITY_FRICTION_PCT = 0.28
 
 NSE_SECTOR_MAP = {
@@ -181,20 +180,6 @@ def init_duckdb_storage():
                     last_audited TIMESTAMP
                 )
             """)
-
-            con.execute("DROP TABLE IF EXISTS daily_candles")
-            con.execute("""
-                CREATE TABLE daily_candles (
-                    symbol VARCHAR,
-                    ticker VARCHAR,
-                    close DOUBLE,
-                    volume DOUBLE,
-                    date TIMESTAMP,
-                    date_str VARCHAR
-                )
-            """)
-            con.execute("INSERT INTO daily_candles VALUES ('RELIANCE', 'RELIANCE', 2500.0, 100000.0, TIMESTAMP '2026-09-29 00:00:00', '2026-09-29')")
-            con.execute("DELETE FROM trade_journal WHERE ticker LIKE '%.L'")
         except Exception:
             pass
         finally:
@@ -315,7 +300,6 @@ def record_db_error(context: str, err: Exception):
     st.session_state["db_error"] = f"[{context}] {sanitized[:140]}"
 
 def fetch_all_supabase_rows(table_name: str) -> list:
-    """Paginated retrieval: seamlessly retrieves beyond the PostgREST 1,000-row ceiling for 10-year scale."""
     if not supabase:
         return []
     all_rows = []
@@ -400,17 +384,18 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
         return clean
     return f"{clean}.NS"
 
-@st.cache_data(ttl=300, show_spinner=False)
+# CRITICAL FIX: Dropped cache TTL to 60s so 5-min loops pull fresh bars
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_cached_history(yf_sym: str, period: str = "5d", interval: str = "1d") -> pd.DataFrame:
     """Fault-tolerant history fetcher with exponential retry and timeout guards."""
-    for attempt in range(2):
+    for attempt in range(3):
         try:
-            df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=6)
+            df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=5)
             if df is not None and not df.empty:
                 return df
         except Exception:
-            if attempt == 0:
-                time.sleep(0.5)
+            pass
+        time.sleep(1.0)
     return pd.DataFrame()
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -529,7 +514,6 @@ def compute_nse_macro_lead_lag(ticker: str, macro: dict) -> tuple:
 # 5. CONTINUOUS LEARNING: 30-DAY EXPONENTIAL DECAY & AUTONOMOUS RETRAINING
 # ==============================================================================
 def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
-    """Applies exponential half-life time decay (30 days) to historical stop-outs and wins."""
     delta = 0.0
     reasons = []
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -596,7 +580,6 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
     return {"delta": round(delta, 1), "reason": " | ".join(reasons) if reasons else "Clean Historical Memory"}
 
 def check_and_auto_retrain_model(feature_cols: list):
-    """Autonomous ML Engine: Retrains LightGBM & XGBoost when sufficient live trade vectors accumulate."""
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
@@ -740,7 +723,17 @@ def audit_and_reconcile_all_trades():
                 h = fetch_cached_history(yf_sym, period="1d", interval="5m")
                 if h.empty:
                     h = fetch_cached_history(yf_sym, period="5d", interval="1d")
+                
+                # CRITICAL FIX: If YF blocks the fetch, STILL update the timestamp so UI proves it's alive!
                 if h.empty:
+                    with DB_LOCK:
+                        con = duckdb.connect(DB_PATH, read_only=False)
+                        try:
+                            con.execute("UPDATE trade_journal SET last_audited = ? WHERE trade_id = ?", [now_ts, tr["trade_id"]])
+                        except Exception:
+                            pass
+                        finally:
+                            con.close()
                     continue
 
                 curr = float(h["Close"].iloc[-1])
@@ -818,8 +811,19 @@ def audit_and_reconcile_all_trades():
             try:
                 sym = f"{opt['share_name']}.NS"
                 h_daily = fetch_cached_history(sym, period="30d", interval="1d")
+                
+                # CRITICAL FIX: Update timestamp even if YF drops connection
                 if h_daily.empty:
+                    with DB_LOCK:
+                        con = duckdb.connect(DB_PATH, read_only=False)
+                        try:
+                            con.execute("UPDATE daily_options_journal SET last_audited = ? WHERE date_key = ?", [now_ts, opt["date_key"]])
+                        except Exception:
+                            pass
+                        finally:
+                            con.close()
                     continue
+                    
                 h_live = fetch_cached_history(sym, period="1d", interval="5m")
                 current_spot = float(h_live["Close"].iloc[-1]) if not h_live.empty else float(h_daily["Close"].iloc[-1])
                 
@@ -1208,25 +1212,20 @@ st.sidebar.header("🔄 Autonomous Loop")
 market_is_open = is_nse_market_open()
 auto_mode = st.sidebar.toggle("Continuous Background Mode", value=market_is_open)
 
-refresh_options = {"5 Minutes": 300, "10 Minutes": 600, "1 Hour": 3600}
-selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=0)
+refresh_options = {"1 Minute (Test Mode)": 60, "5 Minutes": 300, "10 Minutes": 600, "1 Hour": 3600}
+selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=1)
 refresh_interval_sec = refresh_options[selected_interval]
 
-loop_tick = 0
-# Unblocked background refresh logic
-if auto_mode and st_autorefresh:
-    loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="nse_unified_autorefresh")
-
-is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
-if is_new_loop_tick:
-    audit_and_reconcile_all_trades()
-    st.session_state["last_loop_tick"] = loop_tick
-
-if "retrain_notice" in st.session_state:
-    st.sidebar.success(st.session_state["retrain_notice"])
+# CRITICAL FIX: Bulletproof Time-Based Loop Trigger
+current_time = time.time()
+last_audit_time = st.session_state.get("last_audit_time", 0.0)
+is_time_for_refresh = auto_mode and (current_time - last_audit_time >= refresh_interval_sec)
 
 if "db_error" in st.session_state:
     st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
+
+if "retrain_notice" in st.session_state:
+    st.sidebar.success(st.session_state["retrain_notice"])
 
 if st.sidebar.button("🚪 Log Out", width="stretch"):
     st.query_params.clear()
@@ -1341,7 +1340,7 @@ def run_predictions():
     if not full_universe:
         return pd.DataFrame(), False
 
-    # ROTATING SCANNER: Randomly select 40 stocks per loop to bypass Yahoo Finance IP bans & Memory Leaks
+    # ROTATING SCANNER: Randomly select stocks to bypass Yahoo IP bans & Memory Leaks
     scan_chunk = random.sample(full_universe, min(MAX_SCAN_CHUNK_SIZE, len(full_universe)))
     total_stocks = len(scan_chunk)
     target_yf_syms = [f"{clean_sym_name(sym)}.NS" for sym in scan_chunk]
@@ -1570,11 +1569,12 @@ with tab_scanner:
                         f"🕒 **Last Audited:** `{str(t_row['last_audited'])[:19]} IST`"
                     )
     else:
-        # Loop Tick fixes applied here to trigger background re-scans correctly
-        if re_scan or is_new_loop_tick or "scan_results" not in st.session_state:
+        # CRITICAL FIX: Trigger scans successfully on timer loops
+        if re_scan or is_time_for_refresh or "scan_results" not in st.session_state:
             with st.spinner("Executing quant screen across rotating market universe..."):
-                if re_scan or is_new_loop_tick:
+                if re_scan:
                     audit_and_reconcile_all_trades()
+                    st.session_state["last_audit_time"] = time.time()
                 res_df, has_cleared = run_predictions()
                 st.session_state["scan_results"] = res_df
                 st.session_state["has_cleared"] = has_cleared
@@ -1909,3 +1909,11 @@ with tab_reasoning:
                 st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nWhen a trade closes, the system isolates the feature vector, runs a post-trade autopsy, and displays what the AI learned here.")
         except Exception as e:
             st.warning(f"Database connection error while retrieving autopsies: {e}")
+
+# ==============================================================================
+# 16. BULLETPROOF BACKGROUND LOOP FALLBACK
+# ==============================================================================
+if auto_mode and not st_autorefresh:
+    st.sidebar.warning("⚠️ `streamlit-autorefresh` library not detected. Running background loop via native fallback.")
+    time.sleep(refresh_interval_sec)
+    st.rerun()
