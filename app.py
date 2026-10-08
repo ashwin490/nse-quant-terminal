@@ -145,7 +145,21 @@ NSE_BEARISH_LEXICON = {
 }
 
 def clean_sym_name(sym: str) -> str:
-    return str(sym).strip().lstrip("$").replace(".NS", "").replace(".BO", "")
+    """Extracts the base NSE symbol even if passed an option contract like 'BHARTIARTL OCT 1900 CE'."""
+    raw = str(sym).strip().lstrip("$")
+    base_token = raw.split()[0] if raw else ""
+    return base_token.replace(".NS", "").replace(".BO", "")
+
+def normalize_ts_str(val, fallback_str: str) -> str:
+    """Normalizes ISO or timestamp strings into clean 'YYYY-MM-DD HH:MM:SS' format for DuckDB & Pandas."""
+    if val is None or pd.isna(val):
+        return fallback_str
+    s = str(val).strip().replace("T", " ").replace(" IST", "")
+    if "+" in s:
+        s = s.split("+")[0].strip()
+    if "." in s:
+        s = s.split(".")[0].strip()
+    return s[:19] if len(s) >= 10 else fallback_str
 
 def get_ticker_sector(ticker: str) -> str:
     t = clean_sym_name(ticker).upper()
@@ -396,9 +410,9 @@ def hydrate_duckdb_from_supabase():
                 for r in eq_data:
                     ticker_val = str(r.get('ticker', '')).strip()
                     if ticker_val and not ticker_val.endswith('.L'):
-                        pred_date = str(r.get('predicted_date', ist_now_str[:10]))
+                        pred_date = str(r.get('predicted_date', ist_now_str[:10]))[:10]
                         trade_id = f"{ticker_val}_{pred_date}"
-                        last_check = str(r.get('last_checked') or ist_now_str)[:19]
+                        last_check = normalize_ts_str(r.get('last_checked'), f"{pred_date} 15:30:00")
                         f_json = json.dumps(r.get('features_json') or {})
                         status_val = str(r.get('status', 'ACTIVE')).upper()
                         con.execute("""
@@ -418,9 +432,10 @@ def hydrate_duckdb_from_supabase():
             opt_data = fetch_all_supabase_rows("options_journal")
             if opt_data:
                 for o in opt_data:
-                    date_k = str(o.get('date_key', ist_now_str[:10]))
-                    ts_str = str(o.get('timestamp') or ist_now_str)[:19]
-                    aud_str = str(o.get('last_audited') or ist_now_str)[:19]
+                    date_k = str(o.get('date_key', ist_now_str[:10]))[:10]
+                    fallback_opt_ts = f"{date_k} 15:30:00"
+                    ts_str = normalize_ts_str(o.get('timestamp'), fallback_opt_ts)
+                    aud_str = normalize_ts_str(o.get('last_audited') or o.get('timestamp'), ts_str)
                     con.execute("""
                         INSERT OR REPLACE INTO daily_options_journal 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -609,6 +624,7 @@ def compute_nse_macro_lead_lag(ticker: str, macro: dict) -> tuple:
 # 5. CONTINUOUS LEARNING: 30-DAY EXPONENTIAL DECAY & AUTONOMOUS RETRAINING
 # ==============================================================================
 def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
+    """Applies 30-day exponential decay across BOTH closed equity and closed option trades."""
     delta = 0.0
     reasons = []
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -617,7 +633,9 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            hist = con.execute("SELECT ticker, date_str, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
+            eq_hist = con.execute("SELECT ticker, date_str, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
+            opt_hist = con.execute("SELECT share_name AS ticker, date_key AS date_str, status, '{}' AS features_json FROM daily_options_journal WHERE status != 'ACTIVE'").df()
+            hist = pd.concat([eq_hist, opt_hist], ignore_index=True)
         except Exception:
             hist = pd.DataFrame()
         finally:
@@ -628,7 +646,7 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
 
     try:
         t_clean = clean_sym_name(ticker)
-        t_hist = hist[hist["ticker"] == t_clean]
+        t_hist = hist[hist["ticker"].apply(clean_sym_name) == t_clean]
         if not t_hist.empty:
             decayed_loss = 0.0
             decayed_win = 0.0
@@ -988,7 +1006,7 @@ def deduplicate_journal_ledger():
             con.close()
 
 # ==============================================================================
-# 8. DAILY OPTIONS ALPHA GENERATOR (WITH STRICT NLP REGULATORY GATE)
+# 8. DAILY OPTIONS ALPHA GENERATOR (WITH STRICT NLP & ANTI-CHURN COOLDOWN GATE)
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -1002,8 +1020,11 @@ def generate_daily_options_alpha() -> dict:
             df = con.execute("SELECT * FROM daily_options_journal WHERE date_key = ?", [today_str]).df()
             if not df.empty:
                 return df.iloc[0].to_dict()
+            active_opt_shares = set(
+                con.execute("SELECT DISTINCT share_name FROM daily_options_journal WHERE status = 'ACTIVE'").df()["share_name"].tolist()
+            )
         except Exception:
-            pass
+            active_opt_shares = set()
         finally:
             con.close()
 
@@ -1019,14 +1040,14 @@ def generate_daily_options_alpha() -> dict:
                             INSERT OR REPLACE INTO daily_options_journal 
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, [
-                            str(record['date_key']), str(record.get('timestamp') or now_str)[:19], str(record['share_name']),
+                            str(record['date_key'])[:10], normalize_ts_str(record.get('timestamp'), now_str), str(record['share_name']),
                             str(record['option_contract']), float(record['strike_price']), int(record['expiry_days']),
                             float(record['underlying_spot']), int(record['lot_size']), 
                             float(record.get('entry_premium', record['current_option_price'])),
                             float(record['current_option_price']),
                             float(record['target_premium']), float(record['stop_loss_premium']), float(record['total_capital']),
                             float(record['ai_confidence']), float(record['implied_vol']), str(record['status']).upper(),
-                            float(record['pnl_pct']), str(record.get('last_audited') or now_str)[:19]
+                            float(record['pnl_pct']), normalize_ts_str(record.get('last_audited') or record.get('timestamp'), now_str)
                         ])
                     finally:
                         con.close()
@@ -1034,6 +1055,7 @@ def generate_daily_options_alpha() -> dict:
         except Exception:
             pass
 
+    cooldown_set = get_recent_cooldown_tickers()
     selected_stock = "RELIANCE"
     basket_perf = {}
     ranked_candidates = []
@@ -1046,7 +1068,12 @@ def generate_daily_options_alpha() -> dict:
         if not h.empty and len(h) >= 2:
             ret = (float(h["Close"].iloc[-1]) / float(h["Close"].iloc[-2])) - 1.0
             basket_perf[clean_name] = round(ret * 100.0, 2)
-            if not nlp_check.get("is_blocked", False):
+            # Disqualify F&O stocks that are NLP-blocked, already open in Options, or in 3-day post-exit cooldown
+            if (
+                not nlp_check.get("is_blocked", False)
+                and clean_name not in active_opt_shares
+                and clean_name not in cooldown_set
+            ):
                 ranked_candidates.append((clean_name, ret))
 
     if ranked_candidates:
@@ -1055,7 +1082,7 @@ def generate_daily_options_alpha() -> dict:
     else:
         for sym in FNO_STOCKS:
             c_name = str(sym).replace(".NS", "")
-            if not evaluate_nse_filing_nlp(c_name).get("is_blocked", False):
+            if not evaluate_nse_filing_nlp(c_name).get("is_blocked", False) and c_name not in active_opt_shares:
                 selected_stock = c_name
                 break
 
@@ -1177,18 +1204,21 @@ def get_todays_logged_equities() -> pd.DataFrame:
             con.close()
 
 def get_recent_cooldown_tickers() -> set:
+    """Enforces 3-day anti-churn cooldown across BOTH closed equity and closed option trades."""
     ist_zone = pytz.timezone('Asia/Kolkata')
     today_dt = datetime.now(ist_zone).date()
     cooldown = set()
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            recent_closed = con.execute("SELECT ticker, date_str FROM trade_journal WHERE status != 'ACTIVE'").df()
+            eq_closed = con.execute("SELECT ticker, date_str FROM trade_journal WHERE status != 'ACTIVE'").df()
+            opt_closed = con.execute("SELECT share_name AS ticker, date_key AS date_str FROM daily_options_journal WHERE status != 'ACTIVE'").df()
+            recent_closed = pd.concat([eq_closed, opt_closed], ignore_index=True)
             for _, r in recent_closed.iterrows():
                 try:
                     c_dt = datetime.strptime(str(r["date_str"])[:10], "%Y-%m-%d").date()
                     if (today_dt - c_dt).days <= COOLDOWN_CALENDAR_DAYS:
-                        cooldown.add(str(r["ticker"]).strip())
+                        cooldown.add(clean_sym_name(r["ticker"]))
                 except Exception:
                     pass
         except Exception:
@@ -1396,7 +1426,6 @@ def calculate_technical_features(df_hist, deliv_shock=1.0):
     df['trend_spread_pct'] = ((df['ema20'] - df['ema50']) / df['ema50']) * 100.0
     df['atr_pct'] = (df['atr_14'] / df['close']) * 100.0
     
-    # Intraday-Safe RVOL: Use max(today_vol, yesterday_vol) so midday scans aren't penalized for partial day hours
     vol_20 = df['volume'].rolling(20).mean().replace(0.0, np.nan)
     eff_vol = np.maximum(df['volume'], df['volume'].shift(1).fillna(df['volume']))
     df['rvol'] = (eff_vol / vol_20).fillna(1.0).clip(lower=0.5, upper=5.0)
@@ -1425,7 +1454,6 @@ def run_predictions():
             ext_sub_1000 = get_sub_1000_universe()
         except Exception:
             ext_sub_1000 = []
-        # Always lead with the 50 verified liquid sub-₹1,000 NSE stocks so batch #1 has 100% valid candidates
         target_basket = list(SUB_1000_LIQUID_BASKET) + [x for x in ext_sub_1000 if x not in SUB_1000_LIQUID_BASKET]
     elif "Nifty 200" in selected_universe:
         target_basket = list(SUB_1000_LIQUID_BASKET) + list(NIFTY_200_UNIVERSE)
@@ -1499,7 +1527,6 @@ def run_predictions():
         atr = max(float(latest.get("atr_14", close * 0.02)), close * 0.012)
         atr_pct = round((atr / close) * 100.0, 2) if close > 0 else 2.0
 
-        # Qualify trend if holding within 4.5% of EMA50 OR reclaiming EMA20 with positive RSI
         is_above_trend = (close >= (ema50 * EMA50_TOLERANCE_RATIO)) or (close >= ema20 and float(latest.get("rsi_14", 50.0)) >= 48.0)
         
         feat_dict = {
@@ -1531,7 +1558,6 @@ def run_predictions():
             except Exception:
                 raw_prob_ratio = 0.42
 
-        # LSE-Parity Non-Linear Probability Calibration Curve: maps raw tree prob (0.25-0.65) to institutional scale (60-92%)
         clamped_ratio = max(0.05, min(0.95, raw_prob_ratio))
         tech_momentum_bonus = 0.04 if (close >= ema20 and 48.0 <= feat_dict["rsi_14"] <= 68.0) else 0.0
         blended_ratio = max(0.05, min(0.95, clamped_ratio + tech_momentum_bonus))
@@ -1657,13 +1683,29 @@ with tab_scanner:
     quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
 
     col1, col2 = st.columns([4, 1])
+    with col2:
+        re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
+
+    should_run_scan = (not quota_filled or re_scan) and (
+        re_scan or st.session_state.get("force_refresh", False) or "scan_results" not in st.session_state
+    )
+    if should_run_scan:
+        st.session_state["force_refresh"] = False
+        with st.spinner("Executing systematic offset quant screen across prioritized NSE universe..."):
+            if re_scan:
+                audit_and_reconcile_all_trades()
+            res_df, has_cleared = run_predictions()
+            st.session_state["scan_results"] = res_df
+            st.session_state["has_cleared"] = has_cleared
+        # Refresh today's logged equities immediately after scan so header reflects newly logged picks
+        todays_logged_df = get_todays_logged_equities()
+        quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
+
     with col1:
         if quota_filled:
             st.write(f"Daily equity allocation complete (**{len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} slots filled**). Spotlighting today's active cohort (Net of Indian STT & Charges):")
         else:
             st.write(f"Unheld equities screened via Crumb-Free V8 Chart Feed, Calibrated ML Ensemble, NSE Filing NLP & Indian STT/TCA (**{len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} logged today**):")
-    with col2:
-        re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
     if quota_filled and not re_scan:
         st.info(f"🔒 **Daily Quota Filled ({len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} Slots Active for Today)** — Scanner locked onto today's executed positions to prevent over-trading.")
@@ -1691,17 +1733,6 @@ with tab_scanner:
                         f"🕒 **Last Audited:** `{str(t_row['last_audited'])[:19]} IST`"
                     )
     else:
-        should_run_scan = re_scan or st.session_state.get("force_refresh", False) or "scan_results" not in st.session_state
-        
-        if should_run_scan:
-            st.session_state["force_refresh"] = False
-            with st.spinner("Executing systematic offset quant screen across prioritized NSE universe..."):
-                if re_scan:
-                    audit_and_reconcile_all_trades()
-                res_df, has_cleared = run_predictions()
-                st.session_state["scan_results"] = res_df
-                st.session_state["has_cleared"] = has_cleared
-
         df_res = st.session_state.get("scan_results", pd.DataFrame())
         has_cleared_signals = st.session_state.get("has_cleared", False)
         qualified_df = df_res[df_res["Qualified"] == True] if not df_res.empty else pd.DataFrame()
@@ -1917,9 +1948,12 @@ with tab_journal:
         master_df = master_df[[c for c in cols_to_keep if c in master_df.columns]]
         
         if "Last Checked" in master_df.columns:
-            master_df["Last Checked"] = pd.to_datetime(master_df["Last Checked"], errors="coerce")
-            master_df.sort_values(by="Last Checked", ascending=False, inplace=True)
-            master_df["Last Checked"] = master_df["Last Checked"].dt.strftime('%Y-%m-%d %H:%M:%S IST').fillna("-")
+            master_df["Last Checked"] = master_df["Last Checked"].apply(lambda v: normalize_ts_str(v, ""))
+            parsed_ts = pd.to_datetime(master_df["Last Checked"], format="mixed", errors="coerce")
+            master_df["_sort_ts"] = parsed_ts.fillna(pd.to_datetime(master_df["Date"], errors="coerce"))
+            master_df.sort_values(by=["Date", "_sort_ts"], ascending=[False, False], inplace=True)
+            master_df["Last Checked"] = master_df["_sort_ts"].dt.strftime('%Y-%m-%d %H:%M:%S IST').fillna("-")
+            master_df.drop(columns=["_sort_ts"], inplace=True)
             
         for num_col in ["Entry (₹)", "Target (₹)", "Stop (₹)", "Live Price (₹)"]:
             if num_col in master_df.columns:
@@ -1999,7 +2033,7 @@ with tab_reasoning:
 
                 st.markdown(f"""
                 **1. Cross-Asset Momentum & Regulatory Tournament (Rank #1)**
-                The engine pits the top 9 F&O heavyweights against each other daily, filtering out any candidate with an active regulatory NLP block. `{share_sym}` led the eligible F&O basket in relative strength while peers consolidated.
+                The engine pits the top 9 F&O heavyweights against each other daily, filtering out any candidate with an active regulatory NLP block or 3-day cooldown. `{share_sym}` led the eligible F&O basket in relative strength while peers consolidated.
 
                 **2. NSE Corporate Filing NLP Gate (`{opt_nlp['status']}`)**
                 {nlp_summary_line}
@@ -2020,12 +2054,12 @@ with tab_reasoning:
                 con = duckdb.connect(DB_PATH, read_only=True)
                 try:
                     eq_closed = con.execute("""
-                        SELECT ticker as symbol, status, entry_price as entry, latest_price as exit_val,
+                        SELECT ticker as symbol, ticker as base_sym, status, entry_price as entry, latest_price as exit_val,
                                pnl_pct, last_audited as exit_time, features_json 
                         FROM trade_journal WHERE status != 'ACTIVE'
                     """).df()
                     opt_closed = con.execute("""
-                        SELECT option_contract as symbol, status, entry_premium as entry, current_option_price as exit_val,
+                        SELECT option_contract as symbol, share_name as base_sym, status, entry_premium as entry, current_option_price as exit_val,
                                pnl_pct, last_audited as exit_time, '{"asset": "OPTIONS_CE"}' as features_json 
                         FROM daily_options_journal WHERE status != 'ACTIVE'
                     """).df()
@@ -2034,13 +2068,14 @@ with tab_reasoning:
             
             all_closed = pd.concat([eq_closed, opt_closed], ignore_index=True)
             if not all_closed.empty:
-                all_closed['exit_time'] = pd.to_datetime(all_closed['exit_time'], errors="coerce")
+                all_closed['exit_time'] = pd.to_datetime(all_closed['exit_time'].apply(lambda v: normalize_ts_str(v, "")), format="mixed", errors="coerce")
                 all_closed = all_closed.sort_values(by='exit_time', ascending=False).head(5)
                 
                 for _, row in all_closed.iterrows():
                     exit_str = str(row['exit_time'])[:16] if pd.notnull(row['exit_time']) else "Settled"
+                    sec_label = get_ticker_sector(row.get('base_sym') or row['symbol'])
                     with st.expander(f"{row['status']} | {row['symbol']} ({exit_str}) — Net P&L: {row['pnl_pct']:+.2f}%", expanded=True):
-                        st.write(f"**Entry:** `₹{row['entry']:.2f}` | **Exit/Last:** `₹{row['exit_val']:.2f}` | **Sector:** `{get_ticker_sector(row['symbol'])}`")
+                        st.write(f"**Entry:** `₹{row['entry']:.2f}` | **Exit/Last:** `₹{row['exit_val']:.2f}` | **Sector:** `{sec_label}`")
                         if pd.notnull(row.get("features_json")) and str(row["features_json"]) != "{}":
                             st.code(f"Recorded Feature Vector: {row['features_json']}", language="json")
                         if "LOSS" in str(row['status']):
