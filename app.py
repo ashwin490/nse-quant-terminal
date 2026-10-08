@@ -9,6 +9,7 @@ import hashlib
 import calendar
 import threading
 import warnings
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, time as dtime
 import random
@@ -238,6 +239,13 @@ def init_duckdb_storage():
             """)
 
             con.execute("""
+                CREATE TABLE IF NOT EXISTS system_metadata (
+                    meta_key VARCHAR PRIMARY KEY,
+                    meta_val VARCHAR
+                )
+            """)
+
+            con.execute("""
                 CREATE TABLE IF NOT EXISTS daily_candles (
                     symbol VARCHAR,
                     ticker VARCHAR,
@@ -328,7 +336,7 @@ def check_password() -> bool:
     with st.form("nse_secure_login_form", clear_on_submit=True):
         user_in = st.text_input("Operator Username")
         pass_in = st.text_input("Cryptographic Passkey", type="password")
-        submitted = st.form_submit_button("Authenticate Session", width="stretch", type="primary")
+        submitted = st.form_submit_button("Authenticate Session", use_container_width=True, type="primary")
 
         if submitted:
             input_hash = hashlib.sha256(pass_in.encode("utf-8")).hexdigest()
@@ -415,18 +423,20 @@ def hydrate_duckdb_from_supabase():
                         last_check = normalize_ts_str(r.get('last_checked'), f"{pred_date} 15:30:00")
                         f_json = json.dumps(r.get('features_json') or {})
                         status_val = str(r.get('status', 'ACTIVE')).upper()
+                        exit_p = float(r.get('latest_price', 0.0)) if status_val != "ACTIVE" else 0.0
+                        exit_ts = last_check if status_val != "ACTIVE" else None
                         con.execute("""
                             INSERT OR REPLACE INTO trade_journal 
                             (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
                              stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
                              exit_timestamp, last_audited, features_json)
-                            VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?, ?)
+                            VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, [
                             trade_id, last_check, pred_date,
                             ticker_val, float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
                             float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
                             status_val, float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                            last_check, f_json
+                            exit_p, exit_ts, last_check, f_json
                         ])
             
             opt_data = fetch_all_supabase_rows("options_journal")
@@ -459,6 +469,7 @@ if "hydrated_once" not in st.session_state:
     st.session_state["hydrated_once"] = True
 
 def is_nse_market_open() -> bool:
+    """Evaluates live NSE market hours strictly in Indian Standard Time (09:15 to 15:30 IST, Mon-Fri)."""
     ist_zone = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist_zone)
     if now_ist.weekday() > 4:
@@ -475,12 +486,13 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
 def fetch_cached_history(yf_sym: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
     """
     CRUMB-FREE DIRECT V8 CHART FETCHER:
-    Queries Yahoo's v8/finance/chart JSON endpoint directly without requesting a Crumb token.
+    Queries Yahoo's v8/finance/chart JSON endpoint directly with URL-encoded symbol safety.
     """
+    encoded_sym = urllib.parse.quote(str(yf_sym).strip(), safe="")
     hosts = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
     for idx, host in enumerate(hosts):
         try:
-            url = f"{host}/v8/finance/chart/{yf_sym}"
+            url = f"{host}/v8/finance/chart/{encoded_sym}"
             params = {"range": period, "interval": interval, "includePrePost": "false"}
             headers = {
                 "User-Agent": USER_AGENTS[idx % len(USER_AGENTS)],
@@ -633,8 +645,14 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            eq_hist = con.execute("SELECT ticker, date_str, status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
-            opt_hist = con.execute("SELECT share_name AS ticker, date_key AS date_str, status, '{}' AS features_json FROM daily_options_journal WHERE status != 'ACTIVE'").df()
+            eq_hist = con.execute("""
+                SELECT ticker, COALESCE(exit_timestamp, last_audited, date_str) AS ref_dt, status, features_json
+                FROM trade_journal WHERE status != 'ACTIVE'
+            """).df()
+            opt_hist = con.execute("""
+                SELECT share_name AS ticker, COALESCE(last_audited, date_key) AS ref_dt, status, '{}' AS features_json
+                FROM daily_options_journal WHERE status != 'ACTIVE'
+            """).df()
             hist = pd.concat([eq_hist, opt_hist], ignore_index=True)
         except Exception:
             hist = pd.DataFrame()
@@ -652,7 +670,7 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
             decayed_win = 0.0
             for _, r in t_hist.iterrows():
                 try:
-                    dt = datetime.strptime(str(r["date_str"])[:10], "%Y-%m-%d").date()
+                    dt = datetime.strptime(str(r["ref_dt"])[:10], "%Y-%m-%d").date()
                     days_ago = max(0, (today_dt - dt).days)
                 except Exception:
                     days_ago = 15
@@ -697,8 +715,11 @@ def check_and_auto_retrain_model(feature_cols: list):
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
             closed_trades = con.execute("SELECT status, features_json FROM trade_journal WHERE status != 'ACTIVE'").df()
+            meta_df = con.execute("SELECT meta_val FROM system_metadata WHERE meta_key = 'last_retrained_count'").df()
+            persisted_count = int(meta_df["meta_val"].iloc[0]) if not meta_df.empty else 0
         except Exception:
             closed_trades = pd.DataFrame()
+            persisted_count = 0
         finally:
             con.close()
 
@@ -706,7 +727,7 @@ def check_and_auto_retrain_model(feature_cols: list):
     if total_closed < MIN_SETTLED_TO_RETRAIN:
         return
 
-    last_retrained = st.session_state.get("last_retrained_count", 0)
+    last_retrained = max(persisted_count, st.session_state.get("last_retrained_count", 0))
     if (total_closed - last_retrained) < RETRAIN_STEP_INTERVAL:
         return
 
@@ -747,16 +768,23 @@ def check_and_auto_retrain_model(feature_cols: list):
         if len(np.unique(y)) < 2:
             return
 
-        lgb_model = LGBMClassifier(n_estimators=250, learning_rate=0.03, max_depth=5, random_state=42)
+        lgb_model = LGBMClassifier(n_estimators=250, learning_rate=0.03, max_depth=5, random_state=42, verbose=-1)
         lgb_model.fit(X, y, sample_weight=w)
 
         xgb_model = XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=5, random_state=42, eval_metric='logloss')
         xgb_model.fit(X, y, sample_weight=w)
 
         new_bundle = {"lgb": lgb_model, "xgb": xgb_model, "type": "ensemble", "feature_cols": feature_cols}
+        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
         joblib.dump(new_bundle, MODEL_PATH)
         st.session_state["ml_model_bundle"] = new_bundle
         st.session_state["last_retrained_count"] = total_closed
+        with DB_LOCK:
+            con = duckdb.connect(DB_PATH, read_only=False)
+            try:
+                con.execute("INSERT OR REPLACE INTO system_metadata VALUES ('last_retrained_count', ?)", [str(total_closed)])
+            finally:
+                con.close()
         st.session_state["retrain_notice"] = f"🧠 AI Retrained autonomously on {len(rows)} live Indian market trades ({total_closed} total closed)!"
     except Exception as e:
         record_db_error("Auto-Retrain ML", e)
@@ -766,7 +794,8 @@ def check_and_auto_retrain_model(feature_cols: list):
 # ==============================================================================
 def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
     try:
-        url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
+        encoded_sym = urllib.parse.quote(clean_sym_name(symbol), safe="")
+        url = f"https://www.nseindia.com/api/option-chain-equities?symbol={encoded_sym}"
         res = yf_session.get(url, timeout=4)
         if res.status_code == 200:
             data = res.json()
@@ -915,7 +944,7 @@ def audit_and_reconcile_all_trades():
             except Exception:
                 continue
 
-    # 2. Audit Options
+    # 2. Audit Options (with Hard Stop Clamping & Time-Expiry Settlement Guard)
     if not active_opts.empty:
         for _, opt in active_opts.iterrows():
             try:
@@ -930,13 +959,18 @@ def audit_and_reconcile_all_trades():
                     continue
                     
                 current_spot = float(h_daily["Close"].iloc[-1])
+                days_elapsed = 0
+                try:
+                    orig_date = datetime.strptime(str(opt['date_key'])[:10], '%Y-%m-%d').date()
+                    days_elapsed = max(0, (today_date - orig_date).days)
+                except Exception:
+                    pass
+                days_left = max(1, int(opt['expiry_days']) - days_elapsed)
+
                 live_prem = get_live_nse_option_premium(opt['share_name'], float(opt["strike_price"]), "CE")
                 if live_prem <= 0.0:
                     returns = np.log(h_daily["Close"] / h_daily["Close"].shift(1)).dropna()
-                    sigma = max(0.15, min(0.60, float(returns.std() * np.sqrt(252))))
-                    orig_date = datetime.strptime(str(opt['date_key'])[:10], '%Y-%m-%d').date()
-                    days_elapsed = max(0, (today_date - orig_date).days)
-                    days_left = max(1, int(opt['expiry_days']) - days_elapsed)
+                    sigma = max(0.15, min(0.60, float(returns.std() * np.sqrt(252)))) if len(returns) > 2 else 0.20
 
                     live_prem = calculate_black_scholes_call(
                         spot=current_spot,
@@ -960,6 +994,8 @@ def audit_and_reconcile_all_trades():
                     opt_status = "🛑 LOSS (STOPPED OUT)"
                     live_prem = round(stop_prem, 2)
                     pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else -50.0
+                elif days_elapsed >= int(opt['expiry_days']) or days_elapsed >= (MAX_HOLD_CALENDAR_DAYS + 3):
+                    opt_status = "⏱️ EXPIRED (TIME EXIT)"
 
                 with DB_LOCK:
                     con = duckdb.connect(DB_PATH, read_only=False)
@@ -1068,7 +1104,6 @@ def generate_daily_options_alpha() -> dict:
         if not h.empty and len(h) >= 2:
             ret = (float(h["Close"].iloc[-1]) / float(h["Close"].iloc[-2])) - 1.0
             basket_perf[clean_name] = round(ret * 100.0, 2)
-            # Disqualify F&O stocks that are NLP-blocked, already open in Options, or in 3-day post-exit cooldown
             if (
                 not nlp_check.get("is_blocked", False)
                 and clean_name not in active_opt_shares
@@ -1098,7 +1133,8 @@ def generate_daily_options_alpha() -> dict:
         if not h.empty:
             spot = float(h["Close"].iloc[-1])
             returns = np.log(h["Close"] / h["Close"].shift(1)).dropna()
-            sigma = max(0.14, min(0.40, float(returns.std() * np.sqrt(252))))
+            if len(returns) > 2:
+                sigma = max(0.14, min(0.40, float(returns.std() * np.sqrt(252))))
     except Exception:
         pass
 
@@ -1106,7 +1142,7 @@ def generate_daily_options_alpha() -> dict:
     expiry_month_str = expiry_dt.strftime('%b').upper()
 
     otm_pct = 1.015 if days_to_expiry <= 7 else 1.0315
-    strike = round((spot * otm_pct) / strike_step) * strike_step
+    strike = max(strike_step, round((spot * otm_pct) / strike_step) * strike_step)
 
     theoretical_prem = calculate_black_scholes_call(
         spot=spot, strike=strike, days_to_exp=days_to_expiry, r=0.0675, sigma=sigma
@@ -1204,20 +1240,26 @@ def get_todays_logged_equities() -> pd.DataFrame:
             con.close()
 
 def get_recent_cooldown_tickers() -> set:
-    """Enforces 3-day anti-churn cooldown across BOTH closed equity and closed option trades."""
+    """Enforces 3-day anti-churn cooldown from ACTUAL EXIT DATE across closed equities and options."""
     ist_zone = pytz.timezone('Asia/Kolkata')
     today_dt = datetime.now(ist_zone).date()
     cooldown = set()
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            eq_closed = con.execute("SELECT ticker, date_str FROM trade_journal WHERE status != 'ACTIVE'").df()
-            opt_closed = con.execute("SELECT share_name AS ticker, date_key AS date_str FROM daily_options_journal WHERE status != 'ACTIVE'").df()
+            eq_closed = con.execute("""
+                SELECT ticker, COALESCE(exit_timestamp, last_audited, date_str) AS close_dt
+                FROM trade_journal WHERE status != 'ACTIVE'
+            """).df()
+            opt_closed = con.execute("""
+                SELECT share_name AS ticker, COALESCE(last_audited, date_key) AS close_dt
+                FROM daily_options_journal WHERE status != 'ACTIVE'
+            """).df()
             recent_closed = pd.concat([eq_closed, opt_closed], ignore_index=True)
             for _, r in recent_closed.iterrows():
                 try:
-                    c_dt = datetime.strptime(str(r["date_str"])[:10], "%Y-%m-%d").date()
-                    if (today_dt - c_dt).days <= COOLDOWN_CALENDAR_DAYS:
+                    c_dt = datetime.strptime(str(r["close_dt"])[:10], "%Y-%m-%d").date()
+                    if 0 <= (today_dt - c_dt).days <= COOLDOWN_CALENDAR_DAYS:
                         cooldown.add(clean_sym_name(r["ticker"]))
                 except Exception:
                     pass
@@ -1310,7 +1352,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
     return logged_local
 
 # ==============================================================================
-# 10. UI HEADER, SIDEBAR GUARDRAILS & UNIFIED AUTONOMOUS LOOP CONTROLLER
+# 10. UI HEADER, SIDEBAR GUARDRAILS & IST MARKET-HOURS AUTO-SWITCH CONTROLLER
 # ==============================================================================
 st.sidebar.header("⚙️ Institutional Guardrails")
 selected_universe = st.sidebar.selectbox(
@@ -1335,7 +1377,20 @@ broker_mode = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
 market_is_open = is_nse_market_open()
-auto_mode = st.sidebar.toggle("Continuous Background Mode", value=True)
+
+# Automatically sync the toggle when the NSE market transitions between OPEN (09:15 IST) and CLOSED (15:30 IST)
+if "last_market_open_state" not in st.session_state:
+    st.session_state["last_market_open_state"] = market_is_open
+    st.session_state["auto_loop_toggle"] = market_is_open
+elif st.session_state["last_market_open_state"] != market_is_open:
+    st.session_state["last_market_open_state"] = market_is_open
+    st.session_state["auto_loop_toggle"] = market_is_open
+
+auto_mode = st.sidebar.toggle(
+    "Continuous Background Mode",
+    key="auto_loop_toggle",
+    help="Automatically turns ON during NSE market hours (09:15–15:30 IST) and OFF when the NSE closes."
+)
 
 refresh_options = {"1 Minute (Test Mode)": 60, "5 Minutes": 300, "10 Minutes": 600, "1 Hour": 3600}
 selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=1)
@@ -1345,7 +1400,7 @@ loop_tick = 0
 if auto_mode and st_autorefresh:
     loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="nse_unified_autorefresh")
 
-# UNCONDITIONAL TOP-LEVEL AUDIT ON EVERY TIMER TICK
+# UNCONDITIONAL TOP-LEVEL AUDIT ON INITIAL LOAD OR NEW TIMER TICK
 is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
 if is_new_loop_tick:
     audit_and_reconcile_all_trades()
@@ -1353,7 +1408,10 @@ if is_new_loop_tick:
     st.session_state["force_refresh"] = True
 
 ist_heartbeat_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S IST')
-st.sidebar.caption(f"🟢 **Loop Cycle:** `#{loop_tick}` | **Synced:** `{ist_heartbeat_str}`")
+if auto_mode:
+    st.sidebar.caption(f"🟢 **Loop Cycle:** `#{loop_tick}` | **Synced:** `{ist_heartbeat_str}`")
+else:
+    st.sidebar.caption(f"⏸️ **Loop Paused (Market Closed)** | **Synced:** `{ist_heartbeat_str}`")
 
 if "db_error" in st.session_state:
     st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
@@ -1361,7 +1419,7 @@ if "db_error" in st.session_state:
 if "retrain_notice" in st.session_state:
     st.sidebar.success(st.session_state["retrain_notice"])
 
-if st.sidebar.button("🚪 Log Out", width="stretch"):
+if st.sidebar.button("🚪 Log Out", use_container_width=True):
     st.query_params.clear()
     st.session_state["password_correct"] = False
     st.rerun()
@@ -1406,11 +1464,14 @@ def calculate_technical_features(df_hist, deliv_shock=1.0):
         return pd.DataFrame()
         
     df = pd.DataFrame()
-    df['close'] = df_hist['Close'].astype(float)
+    df['close'] = df_hist['Close'].astype(float).replace(0.0, np.nan)
     df['volume'] = df_hist['Volume'].astype(float)
+    df = df.dropna(subset=['close'])
+    if len(df) < 20:
+        return pd.DataFrame()
     
-    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema20'] = df['close'].ewm(span=20, adjust=False).mean().replace(0.0, np.nan)
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean().replace(0.0, np.nan)
     
     high = df_hist['High'].astype(float)
     low = df_hist['Low'].astype(float)
@@ -1437,7 +1498,7 @@ def calculate_technical_features(df_hist, deliv_shock=1.0):
     df['rsi_14'] = 100.0 - (100.0 / (1.0 + rs.fillna(1.0)))
     
     df['deliv_shock'] = float(deliv_shock)
-    return df.dropna()
+    return df.replace([np.inf, -np.inf], np.nan).dropna()
 
 def run_predictions():
     ml_bundle = get_ml_model()
@@ -1517,6 +1578,9 @@ def run_predictions():
 
         latest = df_feat.iloc[-1]
         close = float(latest["close"])
+        if not np.isfinite(close) or close <= 0:
+            prog.progress((i + 1) / total_stocks)
+            continue
         
         if "All Market Shares < ₹1,000" in selected_universe and close >= 1050.0:
             prog.progress((i + 1) / total_stocks)
@@ -1525,7 +1589,7 @@ def run_predictions():
         ema20 = float(latest.get("ema20", close))
         ema50 = float(latest.get("ema50", close))
         atr = max(float(latest.get("atr_14", close * 0.02)), close * 0.012)
-        atr_pct = round((atr / close) * 100.0, 2) if close > 0 else 2.0
+        atr_pct = round((atr / close) * 100.0, 2)
 
         is_above_trend = (close >= (ema50 * EMA50_TOLERANCE_RATIO)) or (close >= ema20 and float(latest.get("rsi_14", 50.0)) >= 48.0)
         
@@ -1577,10 +1641,11 @@ def run_predictions():
         target = round(close + (1.6 * atr), 2)
         stop = round(close - (1.1 * atr), 2)
         
+        shares_calc = max(1, int(25000.0 / close))
         sizing = {
-            "shares": max(1, int(25000 / close)),
-            "capital_allocated": round(max(1, int(25000 / close)) * close, 2),
-            "return_pct": round(((target - close) / close) * 100, 2),
+            "shares": shares_calc,
+            "capital_allocated": round(shares_calc * close, 2),
+            "return_pct": round(((target - close) / close) * 100.0, 2),
             "time_estimate": "3-7 Days"
         }
 
@@ -1684,7 +1749,7 @@ with tab_scanner:
 
     col1, col2 = st.columns([4, 1])
     with col2:
-        re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
+        re_scan = st.button("🔄 Run Live Scan Now", use_container_width=True, type="primary")
 
     should_run_scan = (not quota_filled or re_scan) and (
         re_scan or st.session_state.get("force_refresh", False) or "scan_results" not in st.session_state
@@ -1697,7 +1762,6 @@ with tab_scanner:
             res_df, has_cleared = run_predictions()
             st.session_state["scan_results"] = res_df
             st.session_state["has_cleared"] = has_cleared
-        # Refresh today's logged equities immediately after scan so header reflects newly logged picks
         todays_logged_df = get_todays_logged_equities()
         quota_filled = len(todays_logged_df) >= MAX_DAILY_EQUITY_TRADES
 
@@ -1757,7 +1821,7 @@ with tab_scanner:
                         idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
                         already_sent = idem_token in st.session_state["dispatched_orders"]
                         btn_label = "✅ Order Dispatched (Idempotent Lock)" if already_sent else f"🚀 Execute Buy ({broker_mode})"
-                        if st.button(btn_label, key=f"exec_btn_{idem_token}", width="stretch", disabled=already_sent):
+                        if st.button(btn_label, key=f"exec_btn_{idem_token}", use_container_width=True, disabled=already_sent):
                             st.session_state["dispatched_orders"].add(idem_token)
                             log_equity_signal_safely(row.to_dict(), enforce_sector_cap=False)
                             st.info(f"Order [{idem_token}] dispatched to {broker_mode}. Logged to journal.")
@@ -1765,14 +1829,14 @@ with tab_scanner:
 
             st.markdown(f"### 📋 All {len(qualified_df)} Qualified Equities in Current Batch")
             disp_cols = ["Ticker", "Sector", "Price (₹)", "Target (₹)", "Stop Loss (₹)", "Expected Return", "AI Win Confidence", "Learner & Macro Adj", "Adjusted Score", "FilingStatus"]
-            st.dataframe(qualified_df[[c for c in disp_cols if c in qualified_df.columns]], width="stretch", hide_index=True)
+            st.dataframe(qualified_df[[c for c in disp_cols if c in qualified_df.columns]], use_container_width=True, hide_index=True)
         else:
             st.warning("🛡️ **Capital Protection Active:** No equities in the current batch passed all volume, trend, filing NLP, and ML filters.")
 
         if not df_res.empty:
             with st.expander(f"🔍 View All {len(df_res)} Evaluated Stocks & Gate Diagnostics in Current Batch"):
                 diag_cols = ["Ticker", "Sector", "Price (₹)", "Expected Return", "AI Win Confidence", "Adjusted Score", "Qualified", "Rejection Reason"]
-                st.dataframe(df_res[[c for c in diag_cols if c in df_res.columns]], width="stretch", hide_index=True)
+                st.dataframe(df_res[[c for c in diag_cols if c in df_res.columns]], use_container_width=True, hide_index=True)
 
 # ==============================================================================
 # 13. TAB 2: OPTIONS ALPHA
@@ -1806,7 +1870,7 @@ with tab_options:
             m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:19]} IST)")
             
             st.write("")
-            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", width="stretch"):
+            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", use_container_width=True):
                 st.success(f"Signal securely dispatched to {broker_mode} gateway.")
 
 # ==============================================================================
@@ -1823,7 +1887,7 @@ with tab_journal:
             f"Break-Even Stop Ratchet activates automatically at **≥ {int(BREAKEVEN_TRIGGER_RATIO * 100)}%** of target distance."
         )
     with j_col2:
-        if st.button("🧹 Reconcile & Clean Ledger", width="stretch"):
+        if st.button("🧹 Reconcile & Clean Ledger", use_container_width=True):
             deduplicate_journal_ledger()
             audit_and_reconcile_all_trades()
             st.success("Ledger deduplicated and reconciled against live NSE market!")
@@ -1962,7 +2026,7 @@ with tab_journal:
         if "P&L (%)" in master_df.columns:
             master_df["P&L (%)"] = master_df["P&L (%)"].apply(lambda x: f"{float(x):+.2f}%" if pd.notnull(x) else "0.00%")
             
-        st.dataframe(master_df, width="stretch", hide_index=True)
+        st.dataframe(master_df, use_container_width=True, hide_index=True)
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
@@ -2092,7 +2156,7 @@ with tab_reasoning:
 # ==============================================================================
 # 16. BULLETPROOF BACKGROUND LOOP FALLBACK
 # ==============================================================================
-if auto_mode and not st_autorefresh:
+if auto_mode and market_is_open and not st_autorefresh:
     st.sidebar.warning("⚠️ `streamlit-autorefresh` library not detected. Running background loop via native fallback.")
     time.sleep(refresh_interval_sec)
     st.rerun()
