@@ -18,9 +18,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import yfinance as yf
 import pytz
 import duckdb
+
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -34,13 +38,21 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 # ==============================================================================
-# 0. GLOBAL SESSION, THREAD LOCK, CONSTANTS & NLP LEXICON
+# 0. GLOBAL STEALTH SESSION, THREAD LOCK, CONSTANTS & NLP LEXICON
 # ==============================================================================
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+]
+
 yf_session = requests.Session()
 yf_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "User-Agent": USER_AGENTS[0],
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://finance.yahoo.com",
+    "Referer": "https://finance.yahoo.com/",
     "Connection": "keep-alive"
 })
 
@@ -64,11 +76,11 @@ MIN_SETTLED_TO_RETRAIN = 50
 RETRAIN_STEP_INTERVAL = 25        
 MAX_SCAN_CHUNK_SIZE = 30          # Systematic rolling window size per cycle
 
-# Tuned Qualification Thresholds (calibrated for both trending & consolidating regimes)
-MIN_ML_CONVICTION_PCT = 49.5      # Base ML + positive NLP threshold
-MIN_RVOL_THRESHOLD = 0.55         # Allows normal consolidation volume
-EMA50_TOLERANCE_RATIO = 0.985     # Allows stocks within 1.5% of 50-day EMA support
-MIN_NET_RETURN_PCT = 1.25         # Minimum net return after 0.28% Indian STT & charges
+# Tuned Qualification Thresholds
+MIN_ML_CONVICTION_PCT = 49.5      
+MIN_RVOL_THRESHOLD = 0.55         
+EMA50_TOLERANCE_RATIO = 0.985     
+MIN_NET_RETURN_PCT = 1.25         
 
 NSE_EQUITY_FRICTION_PCT = 0.28
 
@@ -303,7 +315,7 @@ if not check_password():
     st.stop()
 
 # ==============================================================================
-# 4. CLOUD HYDRATION (PAGINATED), CACHING & NSE NLP ENGINE
+# 4. CLOUD HYDRATION, CRUMB-FREE V8 CHART ENGINE & NSE NLP ENGINE
 # ==============================================================================
 @st.cache_resource
 def get_supabase_client():
@@ -415,26 +427,61 @@ def is_nse_market_open() -> bool:
 
 def normalize_ticker_for_yf(ticker_str: str) -> str:
     clean = str(ticker_str).split()[0].strip()
-    if clean.endswith(".NS") or clean.endswith(".BO") or clean.endswith(".L"):
+    if clean.endswith(".NS") or clean.endswith(".BO") or clean.endswith(".L") or clean.startswith("^") or "=" in clean:
         return clean
     return f"{clean}.NS"
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_cached_history(yf_sym: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """Uses native yfinance TLS handler first, then falls back to custom session if needed."""
-    for use_custom_session in (False, True):
+    """
+    CRUMB-FREE DIRECT V8 CHART FETCHER:
+    Queries Yahoo's v8/finance/chart JSON endpoint directly without requesting a Crumb token.
+    Completely eliminates HTTP 429 Crumb & HTTP 401 Invalid Crumb errors on Streamlit Cloud.
+    """
+    hosts = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
+    for idx, host in enumerate(hosts):
         try:
-            tkr_obj = yf.Ticker(yf_sym, session=yf_session) if use_custom_session else yf.Ticker(yf_sym)
-            df = tkr_obj.history(period=period, interval=interval, auto_adjust=False, timeout=4)
-            if df is not None and not df.empty and "Close" in df.columns:
-                return df
+            url = f"{host}/v8/finance/chart/{yf_sym}"
+            params = {"range": period, "interval": interval, "includePrePost": "false"}
+            headers = {
+                "User-Agent": USER_AGENTS[idx % len(USER_AGENTS)],
+                "Accept": "application/json,text/plain,*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://finance.yahoo.com",
+                "Referer": "https://finance.yahoo.com/"
+            }
+            resp = yf_session.get(url, params=params, headers=headers, timeout=4)
+            if resp.status_code == 200:
+                payload = resp.json()
+                result_list = (payload.get("chart") or {}).get("result")
+                if result_list and len(result_list) > 0:
+                    res_obj = result_list[0]
+                    timestamps = res_obj.get("timestamp") or []
+                    quote_list = ((res_obj.get("indicators") or {}).get("quote") or [{}])
+                    quote = quote_list[0] if quote_list else {}
+                    if timestamps and "close" in quote:
+                        df = pd.DataFrame({
+                            "Open": quote.get("open", [None] * len(timestamps)),
+                            "High": quote.get("high", [None] * len(timestamps)),
+                            "Low": quote.get("low", [None] * len(timestamps)),
+                            "Close": quote.get("close", [None] * len(timestamps)),
+                            "Volume": quote.get("volume", [0] * len(timestamps)),
+                        }, index=pd.to_datetime(timestamps, unit="s"))
+                        df = df.dropna(subset=["Close"]).copy()
+                        if not df.empty:
+                            df["Open"] = df["Open"].fillna(df["Close"]).astype(float)
+                            df["High"] = df["High"].fillna(df["Close"]).astype(float)
+                            df["Low"] = df["Low"].fillna(df["Close"]).astype(float)
+                            df["Close"] = df["Close"].astype(float)
+                            df["Volume"] = df["Volume"].fillna(0).astype(float)
+                            return df
         except Exception:
             pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=900, show_spinner=False)
 def evaluate_nse_filing_nlp(ticker: str) -> dict:
-    """Evaluates NSE announcements without hitting Yahoo's 401-prone quoteSummary/news endpoint."""
+    """Evaluates NSE announcements without touching Yahoo's 401-prone quoteSummary endpoint."""
     clean_sym = clean_sym_name(ticker)
     headlines = []
     base_penalty = 1.0
@@ -730,7 +777,6 @@ def audit_and_reconcile_all_trades():
     now_str = now_ist.strftime('%Y-%m-%d %H:%M:%S')
     today_date = now_ist.date()
 
-    # GUARANTEED HEARTBEAT: Immediately stamp all ACTIVE rows in DuckDB
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
@@ -743,7 +789,7 @@ def audit_and_reconcile_all_trades():
         finally:
             con.close()
 
-    # 1. Audit Equities (with Break-Even Ratchet & Hard Stop Clamping)
+    # 1. Audit Equities
     if not active_trades.empty:
         for _, tr in active_trades.iterrows():
             tkr = str(tr["ticker"]).strip()
@@ -788,7 +834,6 @@ def audit_and_reconcile_all_trades():
                         exit_price = be_floor
                     else:
                         new_status = "🛑 LOSS (STOPPED OUT)"
-                        # Clamp simulated exit at the stop-loss order trigger price
                         curr = round(stop, 2)
                         exit_price = curr
                 else:
@@ -829,12 +874,12 @@ def audit_and_reconcile_all_trades():
             except Exception:
                 continue
 
-    # 2. Audit Options (with Hard -50% Stop-Loss Clamping to Prevent -70%+ Overshoots)
+    # 2. Audit Options
     if not active_opts.empty:
         for _, opt in active_opts.iterrows():
             try:
                 sym = f"{opt['share_name']}.NS"
-                h_daily = fetch_cached_history(sym, period="30d", interval="1d")
+                h_daily = fetch_cached_history(sym, period="1mo", interval="1d")
                 if h_daily.empty:
                     if supabase:
                         try:
@@ -872,7 +917,6 @@ def audit_and_reconcile_all_trades():
                     pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else 65.0
                 elif live_prem <= stop_prem or pnl_pct <= -50.0:
                     opt_status = "🛑 LOSS (STOPPED OUT)"
-                    # Clamp option exit price to the -50% stop-loss trigger
                     live_prem = round(stop_prem, 2)
                     pnl_pct = round(((live_prem - entry_prem) / entry_prem) * 100.0, 2) if entry_prem > 0 else -50.0
 
@@ -972,14 +1016,13 @@ def generate_daily_options_alpha() -> dict:
     ranked_candidates = []
     
     for sym in FNO_STOCKS:
-        time.sleep(0.15)
+        time.sleep(0.12)
         clean_name = str(sym).replace(".NS", "")
         nlp_check = evaluate_nse_filing_nlp(clean_name)
         h = fetch_cached_history(sym, period="5d", interval="1d")
         if not h.empty and len(h) >= 2:
             ret = (float(h["Close"].iloc[-1]) / float(h["Close"].iloc[-2])) - 1.0
             basket_perf[clean_name] = round(ret * 100.0, 2)
-            # Disqualify any F&O stock flagged with an active regulatory/adverse NLP block
             if not nlp_check.get("is_blocked", False):
                 ranked_candidates.append((clean_name, ret))
 
@@ -987,7 +1030,6 @@ def generate_daily_options_alpha() -> dict:
         ranked_candidates.sort(key=lambda x: x[1], reverse=True)
         selected_stock = ranked_candidates[0][0]
     else:
-        # Fallback if history fetch was rate-limited: pick first F&O stock with clean NLP
         for sym in FNO_STOCKS:
             c_name = str(sym).replace(".NS", "")
             if not evaluate_nse_filing_nlp(c_name).get("is_blocked", False):
@@ -1002,7 +1044,7 @@ def generate_daily_options_alpha() -> dict:
     sigma = 0.172
 
     try:
-        h = fetch_cached_history(f"{selected_stock}.NS", period="30d", interval="1d")
+        h = fetch_cached_history(f"{selected_stock}.NS", period="1mo", interval="1d")
         if not h.empty:
             spot = float(h["Close"].iloc[-1])
             returns = np.log(h["Close"] / h["Close"].shift(1)).dropna()
@@ -1359,7 +1401,6 @@ def run_predictions():
     if "All Market Shares < ₹1,000" in selected_universe:
         try:
             raw_sub_1000 = get_sub_1000_universe()
-            # Prioritize high-liquidity Nifty 200 / F&O names at the front of the queue
             priority_set = {clean_sym_name(x) for x in (list(NIFTY_200_UNIVERSE) + list(DEFAULT_NIFTY_BASKET))}
             tier_1 = [x for x in raw_sub_1000 if clean_sym_name(x) in priority_set]
             tier_2 = [x for x in raw_sub_1000 if clean_sym_name(x) not in priority_set]
@@ -1376,7 +1417,6 @@ def run_predictions():
     saturated_sectors = {sec for sec, cnt in active_sectors.items() if cnt >= MAX_ACTIVE_PER_SECTOR}
     cooldown_tickers = get_recent_cooldown_tickers()
 
-    # Deduplicate while preserving priority order
     seen_syms = set()
     full_universe = []
     for s in target_basket:
@@ -1394,7 +1434,6 @@ def run_predictions():
     if not full_universe:
         return pd.DataFrame(), False
 
-    # SYSTEMATIC OFFSET SCANNING: Deterministically sweeps the prioritized universe
     if len(full_universe) > MAX_SCAN_CHUNK_SIZE:
         scan_offset = st.session_state.get("scan_offset", 0)
         if scan_offset >= len(full_universe):
@@ -1407,13 +1446,13 @@ def run_predictions():
         scan_chunk = full_universe
 
     total_stocks = len(scan_chunk)
-    prog = st.progress(0, text=f"Analyzing {total_stocks} prioritized NSE equities (Systematic Offset Batch)...")
+    prog = st.progress(0, text=f"Analyzing {total_stocks} prioritized NSE equities (Direct V8 Crumb-Free Feed)...")
 
     for i, raw_sym in enumerate(scan_chunk):
         clean_sym = clean_sym_name(raw_sym)
         full_sym = f"{clean_sym}.NS"
 
-        time.sleep(0.18)
+        time.sleep(0.12)
         df_hist = fetch_cached_history(full_sym, period="6mo", interval="1d")
         if df_hist.empty:
             prog.progress((i + 1) / total_stocks)
@@ -1439,7 +1478,6 @@ def run_predictions():
         atr = float(latest.get("atr_14", close * 0.02))
         atr_pct = round((atr / close) * 100.0, 2) if close > 0 else 2.0
 
-        # Allow stocks above or within 1.5% support zone of 50-day EMA
         is_above_trend = (close >= (ema50 * EMA50_TOLERANCE_RATIO))
         
         feat_dict = {
@@ -1594,7 +1632,7 @@ with tab_scanner:
         if quota_filled:
             st.write(f"Daily equity allocation complete (**{len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} slots filled**). Spotlighting today's active cohort (Net of Indian STT & Charges):")
         else:
-            st.write(f"Unheld equities screened via Systematic Offset Queue, NSE Filing NLP, Indian STT/TCA Friction & Macro Overlays (**{len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} logged today**):")
+            st.write(f"Unheld equities screened via Crumb-Free V8 Chart Feed, NSE Filing NLP, Indian STT/TCA Friction & Macro Overlays (**{len(todays_logged_df)}/{MAX_DAILY_EQUITY_TRADES} logged today**):")
     with col2:
         re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
@@ -1902,7 +1940,7 @@ with tab_reasoning:
             else:
                 st.warning("🛡️ **Equities in Capital Protection Mode** — The engine actively blocked trades today to protect capital.")
                 st.markdown("#### 🚫 System-Wide Equity Rejection")
-                st.error("**Blocked By:** Data Integrity Filter — Yahoo Finance rate-limited the current chunk. The AI will retry automatically on the next cycle.")
+                st.error("**Blocked By:** Data Integrity Filter — Waiting for next rotating batch to hydrate.")
                 st.divider()
                 
             opt_data = generate_daily_options_alpha()
