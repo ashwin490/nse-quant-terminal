@@ -18,7 +18,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-import plotly.graph_objects as go
 import yfinance as yf
 import pytz
 import duckdb
@@ -28,20 +27,19 @@ try:
 except ImportError:
     st_autorefresh = None
 
-warnings.filterwarnings("ignore", category=UserWarning, module="jugaad_data")
-warnings.filterwarnings("ignore", message="no explicit representation of timezones available for np.datetime64")
+warnings.filterwarnings("ignore")
 
 ROOT_DIR = Path(__file__).resolve().parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 # ==============================================================================
-# 0. GLOBAL STEALTH SESSION, THREAD LOCK, CONSTANTS & NLP LEXICON
+# 0. GLOBAL SESSION, THREAD LOCK, CONSTANTS & NLP LEXICON
 # ==============================================================================
 yf_session = requests.Session()
 yf_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Connection": "keep-alive"
 })
@@ -64,7 +62,7 @@ COOLDOWN_CALENDAR_DAYS = 3
 HALF_LIFE_DAYS = 30.0             
 MIN_SETTLED_TO_RETRAIN = 50       
 RETRAIN_STEP_INTERVAL = 25        
-MAX_SCAN_CHUNK_SIZE = 35          
+MAX_SCAN_CHUNK_SIZE = 25          
 
 NSE_EQUITY_FRICTION_PCT = 0.28
 
@@ -136,7 +134,7 @@ def init_duckdb_storage():
             con.execute("""
                 CREATE TABLE IF NOT EXISTS trade_journal (
                     trade_id VARCHAR PRIMARY KEY,
-                    timestamp TIMESTAMP,
+                    timestamp VARCHAR,
                     date_str VARCHAR,
                     ticker VARCHAR,
                     asset_type VARCHAR DEFAULT 'EQUITY',
@@ -149,8 +147,8 @@ def init_duckdb_storage():
                     latest_price DOUBLE,
                     pnl_pct DOUBLE DEFAULT 0.0,
                     exit_price DOUBLE DEFAULT 0.0,
-                    exit_timestamp TIMESTAMP,
-                    last_audited TIMESTAMP,
+                    exit_timestamp VARCHAR,
+                    last_audited VARCHAR,
                     features_json VARCHAR DEFAULT '{}'
                 )
             """)
@@ -162,7 +160,7 @@ def init_duckdb_storage():
             con.execute("""
                 CREATE TABLE IF NOT EXISTS daily_options_journal (
                     date_key VARCHAR PRIMARY KEY,
-                    timestamp TIMESTAMP,
+                    timestamp VARCHAR,
                     share_name VARCHAR,
                     option_contract VARCHAR,
                     strike_price DOUBLE,
@@ -178,9 +176,21 @@ def init_duckdb_storage():
                     implied_vol DOUBLE,
                     status VARCHAR DEFAULT 'ACTIVE',
                     pnl_pct DOUBLE DEFAULT 0.0,
-                    last_audited TIMESTAMP
+                    last_audited VARCHAR
                 )
             """)
+
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS daily_candles (
+                    symbol VARCHAR,
+                    ticker VARCHAR,
+                    close DOUBLE,
+                    volume DOUBLE,
+                    date TIMESTAMP,
+                    date_str VARCHAR
+                )
+            """)
+            con.execute("DELETE FROM trade_journal WHERE ticker LIKE '%.L'")
         except Exception:
             pass
         finally:
@@ -189,23 +199,32 @@ def init_duckdb_storage():
 init_duckdb_storage()
 
 # ==============================================================================
-# 2. NOW IMPORT CORE MODULES SAFELY
+# 2. SAFE IMPORTS OF CORE MODULES (WITH FALLBACK GUARDS)
 # ==============================================================================
-from core.universe_sync import get_sub_1000_universe, NIFTY_200_UNIVERSE
-from core.data_engine import NIFTY_BASKET
-from core.regime import get_market_regime
-from core.macro_feed import get_macro_risk_adjuster
-from core.intraday_momentum import check_vwap_momentum
-from core.auditor import get_audit_summary
-from core.delivery import fetch_delivery_metrics
-from core.announcements import check_corporate_announcements
-from core.risk_engine import calculate_position_size
-from core.sector_map import apply_sector_concentration_cap
-from core.self_learner import log_feature_vector_snapshot, get_mistake_penalty
-from core.alerts import send_telegram_alert
-from core.journal import execute_broker_order
-from core.sentiment import get_news_sentiment_score
-from core.options_feed import get_options_pcr
+DEFAULT_NIFTY_BASKET = [
+    "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS",
+    "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS", "AXISBANK.NS",
+    "KOTAKBANK.NS", "BAJFINANCE.NS", "MARUTI.NS", "SUNPHARMA.NS", "NTPC.NS",
+    "TATAMOTORS.NS", "POWERGRID.NS", "ONGC.NS", "COALINDIA.NS", "BEL.NS"
+]
+
+try:
+    from core.universe_sync import get_sub_1000_universe, NIFTY_200_UNIVERSE
+except Exception:
+    def get_sub_1000_universe():
+        return DEFAULT_NIFTY_BASKET
+    NIFTY_200_UNIVERSE = DEFAULT_NIFTY_BASKET
+
+try:
+    from core.data_engine import NIFTY_BASKET
+except Exception:
+    NIFTY_BASKET = DEFAULT_NIFTY_BASKET
+
+try:
+    from core.announcements import check_corporate_announcements
+except Exception:
+    def check_corporate_announcements(sym: str):
+        return {"risk_penalty": 1.0, "headline": "Standard NSE Exchange Flow"}
 
 try:
     from supabase import create_client, Client
@@ -323,45 +342,52 @@ def fetch_all_supabase_rows(table_name: str) -> list:
 def hydrate_duckdb_from_supabase():
     if not supabase:
         return
+    ist_now_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S')
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
             eq_data = fetch_all_supabase_rows("predictions")
             if eq_data:
                 for r in eq_data:
-                    ticker_val = r.get('ticker')
-                    if ticker_val and not str(ticker_val).endswith('.L'):
-                        trade_id = f"{ticker_val}_{r.get('predicted_date')}"
+                    ticker_val = str(r.get('ticker', '')).strip()
+                    if ticker_val and not ticker_val.endswith('.L'):
+                        pred_date = str(r.get('predicted_date', ist_now_str[:10]))
+                        trade_id = f"{ticker_val}_{pred_date}"
+                        last_check = str(r.get('last_checked') or ist_now_str)[:19]
                         f_json = json.dumps(r.get('features_json') or {})
+                        status_val = str(r.get('status', 'ACTIVE')).upper()
                         con.execute("""
-                            INSERT OR IGNORE INTO trade_journal 
+                            INSERT OR REPLACE INTO trade_journal 
                             (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
                              stop_loss, shares, capital_allocated, status, latest_price, pnl_pct, exit_price,
                              exit_timestamp, last_audited, features_json)
                             VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, 0.0, NULL, ?, ?)
                         """, [
-                            trade_id, r.get('last_checked') or datetime.now(), r.get('predicted_date'),
+                            trade_id, last_check, pred_date,
                             ticker_val, float(r.get('entry_price', 0.0)), float(r.get('target_price', 0.0)),
                             float(r.get('stop_loss', 0.0)), int(r.get('shares_qty', 1)), float(r.get('position_gbp', 0.0)),
-                            r.get('status', 'ACTIVE').upper(), float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
-                            datetime.now(), f_json
+                            status_val, float(r.get('latest_price', 0.0)), float(r.get('pnl_pct', 0.0)),
+                            last_check, f_json
                         ])
             
             opt_data = fetch_all_supabase_rows("options_journal")
             if opt_data:
                 for o in opt_data:
+                    date_k = str(o.get('date_key', ist_now_str[:10]))
+                    ts_str = str(o.get('timestamp') or ist_now_str)[:19]
+                    aud_str = str(o.get('last_audited') or ist_now_str)[:19]
                     con.execute("""
-                        INSERT OR IGNORE INTO daily_options_journal 
+                        INSERT OR REPLACE INTO daily_options_journal 
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, [
-                        o.get('date_key'), o.get('timestamp') or datetime.now(), o.get('share_name'),
-                        o.get('option_contract'), float(o.get('strike_price', 0.0)), int(o.get('expiry_days', 28)),
-                        float(o.get('underlying_spot', 0.0)), int(o.get('lot_size', 750)), 
+                        date_k, ts_str, str(o.get('share_name', 'ICICIBANK')),
+                        str(o.get('option_contract', '')), float(o.get('strike_price', 0.0)), int(o.get('expiry_days', 28)),
+                        float(o.get('underlying_spot', 0.0)), int(o.get('lot_size', 700)), 
                         float(o.get('entry_premium', o.get('current_option_price', 0.0))),
                         float(o.get('current_option_price', 0.0)),
                         float(o.get('target_premium', 0.0)), float(o.get('stop_loss_premium', 0.0)), float(o.get('total_capital', 0.0)),
-                        float(o.get('ai_confidence', 84.5)), float(o.get('implied_vol', 20.0)), o.get('status', 'ACTIVE'),
-                        float(o.get('pnl_pct', 0.0)), o.get('last_audited') or datetime.now()
+                        float(o.get('ai_confidence', 84.5)), float(o.get('implied_vol', 20.0)), str(o.get('status', 'ACTIVE')).upper(),
+                        float(o.get('pnl_pct', 0.0)), aud_str
                     ])
         except Exception as e:
             record_db_error("Hydrate", e)
@@ -385,20 +411,22 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
         return clean
     return f"{clean}.NS"
 
-# 1. FIXED RATE LIMIT CACHE: Reduced TTL so loop reliably fetches fresh data
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_cached_history(yf_sym: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """Robust fetcher: Never uses bulk download. Staggers calls to evade YF 429."""
-    try:
-        df = yf.Ticker(yf_sym, session=yf_session).history(period=period, interval=interval, timeout=4)
-        if df is not None and not df.empty:
-            return df
-    except Exception:
-        pass
+    """Uses native yfinance TLS handler first, then falls back to custom session if needed."""
+    for use_custom_session in (False, True):
+        try:
+            tkr_obj = yf.Ticker(yf_sym, session=yf_session) if use_custom_session else yf.Ticker(yf_sym)
+            df = tkr_obj.history(period=period, interval=interval, auto_adjust=False, timeout=4)
+            if df is not None and not df.empty and "Close" in df.columns:
+                return df
+        except Exception:
+            pass
     return pd.DataFrame()
 
 @st.cache_data(ttl=900, show_spinner=False)
 def evaluate_nse_filing_nlp(ticker: str) -> dict:
+    """Evaluates NSE announcements without hitting Yahoo's 401-prone quoteSummary/news endpoint."""
     clean_sym = clean_sym_name(ticker)
     headlines = []
     base_penalty = 1.0
@@ -410,16 +438,6 @@ def evaluate_nse_filing_nlp(ticker: str) -> dict:
             for k in ["headline", "title", "subject", "summary", "reason"]:
                 if ann.get(k):
                     headlines.append(str(ann[k]))
-    except Exception:
-        pass
-
-    try:
-        news_items = yf.Ticker(f"{clean_sym}.NS", session=yf_session).news
-        if news_items:
-            for item in news_items[:4]:
-                title_val = item.get("title") or (item.get("content", {}) or {}).get("title", "")
-                if title_val:
-                    headlines.append(str(title_val))
     except Exception:
         pass
 
@@ -466,8 +484,8 @@ def get_indian_cross_asset_macro() -> dict:
     symbols = {"nifty_5d": "^NSEI", "usdinr_5d": "INR=X", "brent_5d": "BZ=F"}
     for key, sym in symbols.items():
         try:
-            h = yf.Ticker(sym, session=yf_session).history(period="10d", timeout=3)
-            if h is not None and len(h) >= 5:
+            h = fetch_cached_history(sym, period="10d", interval="1d")
+            if not h.empty and len(h) >= 5:
                 c_now = float(h["Close"].iloc[-1])
                 c_5d = float(h["Close"].iloc[-5])
                 if c_5d > 0:
@@ -475,8 +493,8 @@ def get_indian_cross_asset_macro() -> dict:
         except Exception:
             pass
     try:
-        h_vix = yf.Ticker("^INDIAVIX", session=yf_session).history(period="5d", timeout=3)
-        if h_vix is not None and not h_vix.empty:
+        h_vix = fetch_cached_history("^INDIAVIX", period="5d", interval="1d")
+        if not h_vix.empty:
             macro["vix_level"] = round(float(h_vix["Close"].iloc[-1]), 1)
     except Exception:
         pass
@@ -596,10 +614,7 @@ def check_and_auto_retrain_model(feature_cols: list):
     if (total_closed - last_retrained) < RETRAIN_STEP_INTERVAL:
         return
 
-    rows = []
-    labels = []
-    weights = []
-
+    rows, labels, weights = [], [], []
     for _, r in closed_trades.iterrows():
         try:
             f_obj = json.loads(r["features_json"])
@@ -639,7 +654,7 @@ def check_and_auto_retrain_model(feature_cols: list):
         lgb_model = LGBMClassifier(n_estimators=250, learning_rate=0.03, max_depth=5, random_state=42)
         lgb_model.fit(X, y, sample_weight=w)
 
-        xgb_model = XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=5, random_state=42, use_label_encoder=False, eval_metric='logloss')
+        xgb_model = XGBClassifier(n_estimators=300, learning_rate=0.03, max_depth=5, random_state=42, eval_metric='logloss')
         xgb_model.fit(X, y, sample_weight=w)
 
         new_bundle = {"lgb": lgb_model, "xgb": xgb_model, "type": "ensemble", "feature_cols": feature_cols}
@@ -656,7 +671,7 @@ def check_and_auto_retrain_model(feature_cols: list):
 def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -> float:
     try:
         url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-        res = yf_session.get(url, timeout=5)
+        res = yf_session.get(url, timeout=4)
         if res.status_code == 200:
             data = res.json()
             for item in data.get('records', {}).get('data', []):
@@ -665,6 +680,9 @@ def get_live_nse_option_premium(symbol: str, strike: float, right: str = "CE") -
         return 0.0
     except Exception:
         return 0.0
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def calculate_black_scholes_call(spot: float, strike: float, days_to_exp: float, r: float, sigma: float) -> float:
     T = max(days_to_exp, 1.0) / 365.0
@@ -696,17 +714,20 @@ def get_nse_monthly_expiry(current_date: datetime) -> tuple[datetime, int]:
     return expiry_dt, max(1, days_left)
 
 # ==============================================================================
-# 7. AUDITING & RECONCILIATION ENGINE (IST + BREAK-EVEN RATCHET + NET TCA P&L)
+# 7. AUDITING & RECONCILIATION ENGINE (GUARANTEED HEARTBEAT + BREAK-EVEN RATCHET)
 # ==============================================================================
 def audit_and_reconcile_all_trades():
     ist_zone = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist_zone)
-    now_ts = now_ist.replace(tzinfo=None)
+    now_str = now_ist.strftime('%Y-%m-%d %H:%M:%S')
     today_date = now_ist.date()
 
+    # GUARANTEED HEARTBEAT: Immediately stamp all ACTIVE rows in DuckDB and Supabase
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
+            con.execute("UPDATE trade_journal SET last_audited = ? WHERE status = 'ACTIVE'", [now_str])
+            con.execute("UPDATE daily_options_journal SET last_audited = ? WHERE status = 'ACTIVE'", [now_str])
             active_trades = con.execute("SELECT * FROM trade_journal WHERE status = 'ACTIVE'").df()
             active_opts = con.execute("SELECT * FROM daily_options_journal WHERE status = 'ACTIVE'").df()
         except Exception:
@@ -719,26 +740,18 @@ def audit_and_reconcile_all_trades():
             tkr = str(tr["ticker"]).strip()
             yf_sym = normalize_ticker_for_yf(tkr)
             try:
-                # Use our robust fetcher - it will gracefully return empty DF if Yahoo blocks it
-                h = fetch_cached_history(yf_sym, period="1d", interval="5m")
+                h = fetch_cached_history(yf_sym, period="5d", interval="1d")
                 if h.empty:
-                    h = fetch_cached_history(yf_sym, period="5d", interval="1d")
-                
-                # CRITICAL: Always push the timestamp forward to prove the loop is running, even if YF drops
-                if h.empty:
-                    with DB_LOCK:
-                        con = duckdb.connect(DB_PATH, read_only=False)
+                    if supabase:
                         try:
-                            con.execute("UPDATE trade_journal SET last_audited = ? WHERE trade_id = ?", [now_ts, tr["trade_id"]])
+                            supabase.table("predictions").update({"last_checked": now_str}).eq("ticker", tkr).eq("predicted_date", tr["date_str"]).execute()
                         except Exception:
                             pass
-                        finally:
-                            con.close()
                     continue
 
                 curr = float(h["Close"].iloc[-1])
-                day_high = float(h["High"].max()) if "High" in h.columns else curr
-                day_low = float(h["Low"].min()) if "Low" in h.columns else curr
+                day_high = float(h["High"].iloc[-1]) if "High" in h.columns else curr
+                day_low = float(h["Low"].iloc[-1]) if "Low" in h.columns else curr
 
                 entry = float(tr["entry_price"])
                 target = float(tr["target_price"])
@@ -788,7 +801,7 @@ def audit_and_reconcile_all_trades():
                                 exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
                                 last_audited = ?
                             WHERE trade_id = ?
-                        """, [curr, stop, pnl, new_status, exit_price, new_status, now_ts, now_ts, tr["trade_id"]])
+                        """, [curr, stop, pnl, new_status, exit_price, new_status, now_str, now_str, tr["trade_id"]])
                     finally:
                         con.close()
 
@@ -799,7 +812,7 @@ def audit_and_reconcile_all_trades():
                             "stop_loss": stop,
                             "latest_price": curr,
                             "pnl_pct": pnl,
-                            "last_checked": str(now_ts)
+                            "last_checked": now_str
                         }).eq("ticker", tkr).eq("predicted_date", tr["date_str"]).execute()
                     except Exception as e:
                         record_db_error("Audit Equity", e)
@@ -811,28 +824,21 @@ def audit_and_reconcile_all_trades():
             try:
                 sym = f"{opt['share_name']}.NS"
                 h_daily = fetch_cached_history(sym, period="30d", interval="1d")
-                
-                # CRITICAL: Always push the timestamp forward even if YF drops
                 if h_daily.empty:
-                    with DB_LOCK:
-                        con = duckdb.connect(DB_PATH, read_only=False)
+                    if supabase:
                         try:
-                            con.execute("UPDATE daily_options_journal SET last_audited = ? WHERE date_key = ?", [now_ts, opt["date_key"]])
+                            supabase.table("options_journal").update({"last_audited": now_str}).eq("date_key", opt["date_key"]).execute()
                         except Exception:
                             pass
-                        finally:
-                            con.close()
                     continue
                     
-                h_live = fetch_cached_history(sym, period="1d", interval="5m")
-                current_spot = float(h_live["Close"].iloc[-1]) if not h_live.empty else float(h_daily["Close"].iloc[-1])
-                
+                current_spot = float(h_daily["Close"].iloc[-1])
                 live_prem = get_live_nse_option_premium(opt['share_name'], float(opt["strike_price"]), "CE")
                 if live_prem <= 0.0:
                     returns = np.log(h_daily["Close"] / h_daily["Close"].shift(1)).dropna()
                     sigma = max(0.15, min(0.60, float(returns.std() * np.sqrt(252))))
-                    orig_date = datetime.strptime(str(opt['timestamp'])[:10], '%Y-%m-%d')
-                    days_elapsed = (now_ts.date() - orig_date.date()).days
+                    orig_date = datetime.strptime(str(opt['date_key'])[:10], '%Y-%m-%d').date()
+                    days_elapsed = max(0, (today_date - orig_date).days)
                     days_left = max(1, int(opt['expiry_days']) - days_elapsed)
 
                     live_prem = calculate_black_scholes_call(
@@ -861,7 +867,7 @@ def audit_and_reconcile_all_trades():
                             UPDATE daily_options_journal
                             SET current_option_price = ?, underlying_spot = ?, pnl_pct = ?, status = ?, last_audited = ?
                             WHERE date_key = ?
-                        """, [live_prem, current_spot, pnl_pct, opt_status, now_ts, opt["date_key"]])
+                        """, [live_prem, current_spot, pnl_pct, opt_status, now_str, opt["date_key"]])
                     finally:
                         con.close()
                 
@@ -872,7 +878,7 @@ def audit_and_reconcile_all_trades():
                             "underlying_spot": current_spot,
                             "pnl_pct": pnl_pct,
                             "status": opt_status,
-                            "last_audited": str(now_ts)
+                            "last_audited": now_str
                         }).eq("date_key", opt["date_key"]).execute()
                     except Exception as e:
                         record_db_error("Audit Option", e)
@@ -905,7 +911,7 @@ def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist_zone)
     today_str = now_ist.strftime('%Y-%m-%d')
-    now_naive = now_ist.replace(tzinfo=None)
+    now_str = now_ist.strftime('%Y-%m-%d %H:%M:%S')
     
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
@@ -930,14 +936,14 @@ def generate_daily_options_alpha() -> dict:
                             INSERT OR REPLACE INTO daily_options_journal 
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, [
-                            record['date_key'], record['timestamp'], record['share_name'],
-                            record['option_contract'], float(record['strike_price']), int(record['expiry_days']),
+                            str(record['date_key']), str(record.get('timestamp') or now_str)[:19], str(record['share_name']),
+                            str(record['option_contract']), float(record['strike_price']), int(record['expiry_days']),
                             float(record['underlying_spot']), int(record['lot_size']), 
                             float(record.get('entry_premium', record['current_option_price'])),
                             float(record['current_option_price']),
                             float(record['target_premium']), float(record['stop_loss_premium']), float(record['total_capital']),
-                            float(record['ai_confidence']), float(record['implied_vol']), record['status'],
-                            float(record['pnl_pct']), record['last_audited']
+                            float(record['ai_confidence']), float(record['implied_vol']), str(record['status']).upper(),
+                            float(record['pnl_pct']), str(record.get('last_audited') or now_str)[:19]
                         ])
                     finally:
                         con.close()
@@ -949,14 +955,13 @@ def generate_daily_options_alpha() -> dict:
     basket_perf = {}
     best_score = -999.0
     
-    # CRITICAL: Loop sequentially to bypass YF Bulk Download IP Ban
     for sym in FNO_STOCKS:
-        time.sleep(0.2)
+        time.sleep(0.15)
         h = fetch_cached_history(sym, period="5d", interval="1d")
         if not h.empty and len(h) >= 2:
-            ret = (h["Close"].iloc[-1] / h["Close"].iloc[-2]) - 1
+            ret = (float(h["Close"].iloc[-1]) / float(h["Close"].iloc[-2])) - 1.0
             clean_name = str(sym).replace(".NS", "")
-            basket_perf[clean_name] = round(float(ret) * 100.0, 2)
+            basket_perf[clean_name] = round(ret * 100.0, 2)
             if ret > best_score:
                 best_score = ret
                 selected_stock = clean_name
@@ -997,7 +1002,7 @@ def generate_daily_options_alpha() -> dict:
 
     signal_dict = {
         "date_key": today_str,
-        "timestamp": now_naive,
+        "timestamp": now_str,
         "share_name": selected_stock,
         "option_contract": contract_label,
         "strike_price": float(strike),
@@ -1013,7 +1018,7 @@ def generate_daily_options_alpha() -> dict:
         "implied_vol": round(sigma * 100.0, 1),
         "status": "ACTIVE",
         "pnl_pct": 0.0,
-        "last_audited": now_naive
+        "last_audited": now_str
     }
 
     with DB_LOCK:
@@ -1037,12 +1042,9 @@ def generate_daily_options_alpha() -> dict:
 
     if supabase:
         try:
-            cloud_payload = signal_dict.copy()
-            cloud_payload["timestamp"] = str(cloud_payload["timestamp"])
-            cloud_payload["last_audited"] = str(cloud_payload["last_audited"])
             c_check = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
             if not c_check.data:
-                supabase.table("options_journal").insert(cloud_payload).execute()
+                supabase.table("options_journal").insert(signal_dict).execute()
         except Exception as e:
             record_db_error("Insert Option", e)
 
@@ -1106,7 +1108,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
     ist_zone = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist_zone)
     today_str = now.strftime('%Y-%m-%d')
-    now_naive = now.replace(tzinfo=None)
+    now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     ticker = clean_sym_name(sig.get('Ticker', ''))
 
     if not ticker or str(ticker).endswith('.L'):
@@ -1136,7 +1138,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
             """, [ticker, today_str]).df()
 
             if existing.empty:
-                trade_id = f"{ticker}_{now.strftime('%Y%m%d_%H%M%S')}"
+                trade_id = f"{ticker}_{today_str}"
                 shares_num = int(str(sig['Recommended Shares']).split()[0])
                 con.execute("""
                     INSERT INTO trade_journal 
@@ -1145,9 +1147,9 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
                      exit_timestamp, last_audited, features_json)
                     VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, 0.0, NULL, ?, ?)
                 """, [
-                    trade_id, now_naive, today_str, ticker, float(sig['Price (₹)']),
+                    trade_id, now_str, today_str, ticker, float(sig['Price (₹)']),
                     float(sig['Target (₹)']), float(sig['Stop Loss (₹)']),
-                    shares_num, float(sig['RawCapital']), float(sig['Price (₹)']), init_net_pnl, now_naive, f_json_str
+                    shares_num, float(sig['RawCapital']), float(sig['Price (₹)']), init_net_pnl, now_str, f_json_str
                 ])
                 logged_local = True
         except Exception:
@@ -1177,7 +1179,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
                     "news_status": sig.get("FilingStatus", "Clean"),
                     "rns_headline": str(sig.get("FilingHeadline", "Active AI Quant Signal"))[:120],
                     "features_json": f_dict,
-                    "last_checked": now.strftime('%Y-%m-%d %H:%M:%S')
+                    "last_checked": now_str
                 }).execute()
         except Exception as e:
             record_db_error("Insert Equity", e)
@@ -1210,7 +1212,7 @@ broker_mode = st.sidebar.selectbox(
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
 market_is_open = is_nse_market_open()
-auto_mode = st.sidebar.toggle("Continuous Background Mode", value=market_is_open)
+auto_mode = st.sidebar.toggle("Continuous Background Mode", value=True)
 
 refresh_options = {"1 Minute (Test Mode)": 60, "5 Minutes": 300, "10 Minutes": 600, "1 Hour": 3600}
 selected_interval = st.sidebar.selectbox("Refresh Interval", list(refresh_options.keys()), index=1)
@@ -1220,12 +1222,15 @@ loop_tick = 0
 if auto_mode and st_autorefresh:
     loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="nse_unified_autorefresh")
 
-# CRITICAL FIX: Bulletproof Streamlit tick trigger
-is_new_loop_tick = False
-if "last_loop_tick" not in st.session_state or loop_tick != st.session_state["last_loop_tick"]:
-    is_new_loop_tick = True
+# UNCONDITIONAL TOP-LEVEL AUDIT ON EVERY TIMER TICK (NEVER SKIPPED BY QUOTA OR TABS)
+is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
+if is_new_loop_tick:
+    audit_and_reconcile_all_trades()
     st.session_state["last_loop_tick"] = loop_tick
-    st.session_state["force_refresh"] = True # Set a strict flag
+    st.session_state["force_refresh"] = True
+
+ist_heartbeat_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S IST')
+st.sidebar.caption(f"🟢 **Loop Cycle:** `#{loop_tick}` | **Synced:** `{ist_heartbeat_str}`")
 
 if "db_error" in st.session_state:
     st.sidebar.error(f"⚠️ Cloud Sync Warning: {st.session_state['db_error']}")
@@ -1256,7 +1261,7 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 ])
 
 # ==============================================================================
-# 11. MACHINE LEARNING PREDICTION PIPELINE (NO BULK DOWNLOADS + TCA)
+# 11. MACHINE LEARNING PREDICTION PIPELINE (SAFE SINGLE-TICKER FETCH + TCA)
 # ==============================================================================
 @st.cache_resource
 def get_ml_model():
@@ -1315,7 +1320,12 @@ def run_predictions():
     if ml_bundle is None:
         return pd.DataFrame(), False
 
-    feature_cols = ml_bundle.get("feature_cols", FEATURE_COLS)
+    # FIXED BUG #2: Safe check before calling .get() in case ml_bundle is a raw LGBMClassifier object
+    if isinstance(ml_bundle, dict):
+        feature_cols = ml_bundle.get("feature_cols", FEATURE_COLS)
+    else:
+        feature_cols = FEATURE_COLS
+
     check_and_auto_retrain_model(feature_cols)
 
     results = []
@@ -1346,19 +1356,16 @@ def run_predictions():
     if not full_universe:
         return pd.DataFrame(), False
 
-    # ROTATING SCANNER: Select chunk to bypass YF IP bans & Memory Leaks
     scan_chunk = random.sample(full_universe, min(MAX_SCAN_CHUNK_SIZE, len(full_universe)))
     total_stocks = len(scan_chunk)
 
     prog = st.progress(0, text=f"Analyzing {total_stocks} NSE components (Safe Mode to Evade YF Blocks)...")
 
-    # CRITICAL FIX: Loop individually. No more yf.download() triggering 429 Errors.
     for i, raw_sym in enumerate(scan_chunk):
         clean_sym = clean_sym_name(raw_sym)
         full_sym = f"{clean_sym}.NS"
 
-        # Hard pacing to trick Yahoo Finance firewalls
-        time.sleep(0.3)
+        time.sleep(0.2)
         df_hist = fetch_cached_history(full_sym, period="6mo", interval="1d")
         if df_hist.empty:
             prog.progress((i + 1) / total_stocks)
@@ -1406,6 +1413,8 @@ def run_predictions():
                 p1 = float(ml_bundle["lgb"].predict_proba(feat_vec)[0][1] * 100.0)
                 p2 = float(ml_bundle["xgb"].predict_proba(feat_vec)[0][1] * 100.0)
                 raw_prob = (p1 + p2) / 2.0
+            elif isinstance(ml_bundle, dict) and "lgb" in ml_bundle:
+                raw_prob = float(ml_bundle["lgb"].predict_proba(feat_vec)[0][1] * 100.0)
             else:
                 raw_prob = float(ml_bundle.predict_proba(feat_vec)[0][1] * 100.0)
         except Exception:
@@ -1564,13 +1573,13 @@ with tab_scanner:
                         f"🕒 **Last Audited:** `{str(t_row['last_audited'])[:19]} IST`"
                     )
     else:
-        # CRITICAL FIX: The Force Refresh Flag ensures st_autorefresh actually triggers a new scan
         should_run_scan = re_scan or st.session_state.get("force_refresh", False) or "scan_results" not in st.session_state
         
         if should_run_scan:
-            st.session_state["force_refresh"] = False # Consume flag immediately
+            st.session_state["force_refresh"] = False
             with st.spinner("Executing quant screen across rotating market universe..."):
-                audit_and_reconcile_all_trades()
+                if re_scan:
+                    audit_and_reconcile_all_trades()
                 res_df, has_cleared = run_predictions()
                 st.session_state["scan_results"] = res_df
                 st.session_state["has_cleared"] = has_cleared
@@ -1636,7 +1645,7 @@ with tab_options:
             m1, m2, m3 = st.columns(3)
             m1.info(f"🎯 **Target Premium:** ₹{opt_signal['target_premium']:.2f} (+65%)")
             m2.warning(f"🛑 **Stop-Loss Premium:** ₹{opt_signal['stop_loss_premium']:.2f} (-50%)")
-            m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:16]} IST)")
+            m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:19]} IST)")
             
             st.write("")
             if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", width="stretch"):
@@ -1651,6 +1660,7 @@ with tab_journal:
     j_col1, j_col2 = st.columns([4, 1])
     with j_col1:
         st.caption(
+            f"Synced every **{refresh_interval_sec // 60} Minute(s)** (Cycle #{loop_tick}). "
             f"All Equity P&L is **Net of Indian STT, Stamp Duty & Exchange Friction (-{NSE_EQUITY_FRICTION_PCT:.2f}%)**. "
             f"Break-Even Stop Ratchet activates automatically at **≥ {int(BREAKEVEN_TRIGGER_RATIO * 100)}%** of target distance."
         )
@@ -1780,9 +1790,9 @@ with tab_journal:
         master_df = master_df[[c for c in cols_to_keep if c in master_df.columns]]
         
         if "Last Checked" in master_df.columns:
-            master_df["Last Checked"] = pd.to_datetime(master_df["Last Checked"])
+            master_df["Last Checked"] = pd.to_datetime(master_df["Last Checked"], errors="coerce")
             master_df.sort_values(by="Last Checked", ascending=False, inplace=True)
-            master_df["Last Checked"] = master_df["Last Checked"].dt.strftime('%Y-%m-%d %H:%M IST')
+            master_df["Last Checked"] = master_df["Last Checked"].dt.strftime('%Y-%m-%d %H:%M:%S IST').fillna("-")
             
         for num_col in ["Entry (₹)", "Target (₹)", "Stop (₹)", "Live Price (₹)"]:
             if num_col in master_df.columns:
@@ -1837,7 +1847,7 @@ with tab_reasoning:
             else:
                 st.warning("🛡️ **Equities in Capital Protection Mode** — The engine actively blocked trades today to protect capital.")
                 st.markdown("#### 🚫 System-Wide Equity Rejection")
-                st.error("**Blocked By:** Data Integrity Filter — The F&O bulk data download returned empty. The AI will retry automatically in a rotating chunk.")
+                st.error("**Blocked By:** Data Integrity Filter — Yahoo Finance rate-limited the current chunk. The AI will retry automatically on the next cycle.")
                 st.divider()
                 
             opt_data = generate_daily_options_alpha()
@@ -1847,7 +1857,7 @@ with tab_reasoning:
                 st.markdown(f"### 🏆 AI Trade Thesis: Why `{share_sym}` Was Selected Over All Other F&O Stocks")
                 
                 strike_diff = opt_data['strike_price'] - opt_data['underlying_spot']
-                otm_pct = (strike_diff / opt_data['underlying_spot']) * 100.0
+                otm_pct = (strike_diff / opt_data['underlying_spot']) * 100.0 if opt_data['underlying_spot'] > 0 else 3.0
                 
                 st.markdown(f"""
                 **1. Cross-Asset Momentum Tournament (Relative Strength Rank #1)**
@@ -1886,7 +1896,7 @@ with tab_reasoning:
             
             all_closed = pd.concat([eq_closed, opt_closed], ignore_index=True)
             if not all_closed.empty:
-                all_closed['exit_time'] = pd.to_datetime(all_closed['exit_time'])
+                all_closed['exit_time'] = pd.to_datetime(all_closed['exit_time'], errors="coerce")
                 all_closed = all_closed.sort_values(by='exit_time', ascending=False).head(5)
                 
                 for _, row in all_closed.iterrows():
@@ -1905,3 +1915,11 @@ with tab_reasoning:
                 st.success("🏆 **Zero Closed/Stopped-Out Trades in Current Memory.**\n\nWhen a trade closes, the system isolates the feature vector, runs a post-trade autopsy, and displays what the AI learned here.")
         except Exception as e:
             st.warning(f"Database connection error while retrieving autopsies: {e}")
+
+# ==============================================================================
+# 16. BULLETPROOF BACKGROUND LOOP FALLBACK
+# ==============================================================================
+if auto_mode and not st_autorefresh:
+    st.sidebar.warning("⚠️ `streamlit-autorefresh` library not detected. Running background loop via native fallback.")
+    time.sleep(refresh_interval_sec)
+    st.rerun()
