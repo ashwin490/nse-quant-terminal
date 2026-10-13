@@ -73,14 +73,13 @@ BREAKEVEN_TRIGGER_RATIO = 0.65
 MAX_ACTIVE_PER_SECTOR = 2         
 COOLDOWN_CALENDAR_DAYS = 3        
 HALF_LIFE_DAYS = 30.0             
-MIN_SETTLED_TO_RETRAIN = 50       
-RETRAIN_STEP_INTERVAL = 25        
+MIN_SETTLED_TO_RETRAIN = 20       # LOWERED: Autonomously retrain every 20 trades
+RETRAIN_STEP_INTERVAL = 20        
 MAX_SCAN_CHUNK_SIZE = 30          
 
 # Calibrated Institutional Qualification Thresholds (LSE Parity)
 MIN_CALIBRATED_CONFIDENCE = 60.0  # Calibrated AI Win Confidence threshold (60%+)
 MIN_RVOL_THRESHOLD = 0.45         # Normalized RVOL gate (intraday-safe)
-EMA50_TOLERANCE_RATIO = 0.955     # Allows stocks within 4.5% of 50-day EMA or above EMA20
 MIN_NET_RETURN_PCT = 1.10         # Minimum net target return after 0.28% Indian STT
 
 NSE_EQUITY_FRICTION_PCT = 0.28
@@ -635,8 +634,8 @@ def compute_nse_macro_lead_lag(ticker: str, macro: dict) -> tuple:
 # ==============================================================================
 # 5. CONTINUOUS LEARNING: 30-DAY EXPONENTIAL DECAY & AUTONOMOUS RETRAINING
 # ==============================================================================
-def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
-    """Applies 30-day exponential decay across BOTH closed equity and closed option trades."""
+def get_closed_loop_self_learning(ticker: str, current_feats: dict) -> dict:
+    """Applies Feature-Wide Autopsy Learning across ALL past losses + Ticker decay penalty."""
     delta = 0.0
     reasons = []
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -662,6 +661,7 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
     if hist.empty:
         return {"delta": 0.0, "reason": "Neutral (Building memory)"}
 
+    # 1. Ticker-Specific Time-Decayed Penalty
     try:
         t_clean = clean_sym_name(ticker)
         t_hist = hist[hist["ticker"].apply(clean_sym_name) == t_clean]
@@ -689,22 +689,50 @@ def get_closed_loop_self_learning(ticker: str, current_atr_pct: float) -> dict:
                 bst_i = round(decayed_win, 1)
                 delta += bst_i
                 reasons.append(f"+{bst_i}% (Decayed target hit memory)")
+    except Exception:
+        pass
 
+    # 2. Feature-Wide Autopsy Learning across ALL past losses
+    try:
         all_losses = hist[hist["status"].str.contains("LOSS", na=False)]
-        if not all_losses.empty:
-            loss_atrs = []
+        if len(all_losses) >= 5:
+            loss_feats = []
             for f_str in all_losses["features_json"].dropna():
                 try:
                     f_obj = json.loads(f_str)
-                    if "atr_pct" in f_obj:
-                        loss_atrs.append(float(f_obj["atr_pct"]))
+                    if "raw_features" in f_obj:
+                        loss_feats.append(f_obj["raw_features"])
+                    elif "atr_pct" in f_obj:
+                        loss_feats.append(f_obj)
                 except Exception:
                     pass
-            if loss_atrs:
-                p75_loss_atr = max(3.0, float(np.percentile(loss_atrs, 75)))
-                if current_atr_pct >= p75_loss_atr:
-                    delta -= 8.0
-                    reasons.append(f"-8% (High-ATR regime >= {p75_loss_atr:.1f}%)")
+
+            if len(loss_feats) >= 5:
+                df_lf = pd.DataFrame(loss_feats)
+                
+                if current_feats.get("dist_ema20_pct", 0.0) < 0.0 and "dist_ema20_pct" in df_lf.columns:
+                    pct_match = (df_lf["dist_ema20_pct"] < 0.0).mean()
+                    if pct_match >= 0.60:
+                        delta -= 10.0
+                        reasons.append(f"-10% (Autopsy: {pct_match*100:.0f}% of past losses were below EMA20)")
+
+                if current_feats.get("trend_spread_pct", 0.0) < -1.0 and "trend_spread_pct" in df_lf.columns:
+                    pct_match = (df_lf["trend_spread_pct"] < -1.0).mean()
+                    if pct_match >= 0.60:
+                        delta -= 10.0
+                        reasons.append(f"-10% (Autopsy: {pct_match*100:.0f}% of past losses had bearish spread)")
+
+                if current_feats.get("rsi_14", 50.0) < 48.0 and "rsi_14" in df_lf.columns:
+                    pct_match = (df_lf["rsi_14"] < 48.0).mean()
+                    if pct_match >= 0.60:
+                        delta -= 10.0
+                        reasons.append(f"-10% (Autopsy: {pct_match*100:.0f}% of past losses had RSI < 48)")
+
+                if "atr_pct" in df_lf.columns:
+                    p75_loss_atr = max(3.0, float(np.percentile(df_lf["atr_pct"].dropna(), 75)))
+                    if current_feats.get("atr_pct", 0.0) >= p75_loss_atr:
+                        delta -= 8.0
+                        reasons.append(f"-8% (High-ATR regime >= {p75_loss_atr:.1f}%)")
     except Exception:
         pass
 
@@ -944,7 +972,7 @@ def audit_and_reconcile_all_trades():
             except Exception:
                 continue
 
-    # 2. Audit Options (with Hard Stop Clamping & Time-Expiry Settlement Guard)
+    # 2. Audit Options
     if not active_opts.empty:
         for _, opt in active_opts.iterrows():
             try:
@@ -1042,7 +1070,7 @@ def deduplicate_journal_ledger():
             con.close()
 
 # ==============================================================================
-# 8. DAILY OPTIONS ALPHA GENERATOR (WITH STRICT NLP & ANTI-CHURN COOLDOWN GATE)
+# 8. DAILY OPTIONS ALPHA GENERATOR
 # ==============================================================================
 def generate_daily_options_alpha() -> dict:
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -1240,7 +1268,6 @@ def get_todays_logged_equities() -> pd.DataFrame:
             con.close()
 
 def get_recent_cooldown_tickers() -> set:
-    """Enforces 3-day anti-churn cooldown from ACTUAL EXIT DATE across closed equities and options."""
     ist_zone = pytz.timezone('Asia/Kolkata')
     today_dt = datetime.now(ist_zone).date()
     cooldown = set()
@@ -1378,7 +1405,6 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔄 Autonomous Loop")
 market_is_open = is_nse_market_open()
 
-# Automatically sync the toggle when the NSE market transitions between OPEN (09:15 IST) and CLOSED (15:30 IST)
 if "last_market_open_state" not in st.session_state:
     st.session_state["last_market_open_state"] = market_is_open
     st.session_state["auto_loop_toggle"] = market_is_open
@@ -1400,7 +1426,6 @@ loop_tick = 0
 if auto_mode and st_autorefresh:
     loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="nse_unified_autorefresh")
 
-# UNCONDITIONAL TOP-LEVEL AUDIT ON INITIAL LOAD OR NEW TIMER TICK
 is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
 if is_new_loop_tick:
     audit_and_reconcile_all_trades()
@@ -1430,8 +1455,10 @@ db_status_text = "🟢 ONLINE (SUPABASE)" if supabase else "🔴 OFFLINE"
 
 st.title("⚡ Autonomous Self-Learning Quant Terminal (NSE)")
 st.caption(
-    f"Status: **10-Year Autonomous Quant AI** • Database: **{db_status_text}** • Market (IST): **{market_status}** • "
-    f"5D Macro: **Nifty {macro_cross['nifty_5d']:+.1f}% | USD/INR {macro_cross['usdinr_5d']:+.1f}% | Brent {macro_cross['brent_5d']:+.1f}% | India VIX {macro_cross['vix_level']}**"
+    f"- Status: **10-Year Autonomous Quant AI**"
+    f"Database: **{db_status_text}**"
+    f"Market (IST): **{market_status}**"
+    f"5D Macro: \nNifty {macro_cross['nifty_5d']:+.1f}% | USD/INR {macro_cross['usdinr_5d']:+.1f}% | Brent {macro_cross['brent_5d']:+.1f}% | India VIX {macro_cross['vix_level']}"
 )
 
 tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
@@ -1442,7 +1469,7 @@ tab_scanner, tab_options, tab_journal, tab_reasoning = st.tabs([
 ])
 
 # ==============================================================================
-# 11. MACHINE LEARNING PREDICTION PIPELINE (LSE CALIBRATION + INTRADAY-SAFE RVOL)
+# 11. MACHINE LEARNING PREDICTION PIPELINE (STRICT TREND FLOOR)
 # ==============================================================================
 @st.cache_resource
 def get_ml_model():
@@ -1587,12 +1614,9 @@ def run_predictions():
             continue
 
         ema20 = float(latest.get("ema20", close))
-        ema50 = float(latest.get("ema50", close))
         atr = max(float(latest.get("atr_14", close * 0.02)), close * 0.012)
         atr_pct = round((atr / close) * 100.0, 2)
 
-        is_above_trend = (close >= (ema50 * EMA50_TOLERANCE_RATIO)) or (close >= ema20 and float(latest.get("rsi_14", 50.0)) >= 48.0)
-        
         feat_dict = {
             "dist_ema20_pct": round(float(latest.get("dist_ema20_pct", 0.0)), 2),
             "trend_spread_pct": round(float(latest.get("trend_spread_pct", 0.0)), 2),
@@ -1604,6 +1628,8 @@ def run_predictions():
 
         raw_feature_map = {c: float(latest.get(c, feat_dict.get(c, 0.0))) for c in feature_cols}
 
+        # STRICT TREND GATES (No Knife-Catching)
+        is_above_trend = (close >= ema20) and (feat_dict["rsi_14"] >= 48.0) and (feat_dict["trend_spread_pct"] >= -1.0)
         is_exhausted = (feat_dict["rsi_14"] > 78.0) or (feat_dict["dist_ema20_pct"] > 8.5)
         has_volume = feat_dict["rvol"] >= MIN_RVOL_THRESHOLD
 
@@ -1631,9 +1657,9 @@ def run_predictions():
         nlp_delta = nlp_info["delta"]
         is_nlp_blocked = nlp_info["is_blocked"]
 
-        learner_info = get_closed_loop_self_learning(clean_sym, atr_pct)
+        learner_info = get_closed_loop_self_learning(clean_sym, feat_dict)
         macro_delta, macro_note = compute_nse_macro_lead_lag(clean_sym, macro_cross)
-        trend_penalty = 0.0 if close >= ema50 else (-2.5 if is_above_trend else -10.0)
+        trend_penalty = 0.0 if is_above_trend else -10.0
 
         total_adj = round(learner_info["delta"] + macro_delta + nlp_delta + trend_penalty, 1)
         final_score = round(min(98.0, max(20.0, calibrated_base_conf + total_adj)), 1)
@@ -1665,7 +1691,7 @@ def run_predictions():
         if is_nlp_blocked:
             rejection_reason = f"NSE Filing NLP Kill-Switch: {nlp_info['nlp_tags']}"
         elif not is_above_trend:
-            rejection_reason = "Trend Filter: Price >4.5% below 50-day EMA & below 20-day EMA"
+            rejection_reason = "Trend Filter: Price < EMA20, RSI < 48, or Spread < -1.0%"
         elif is_exhausted:
             rejection_reason = "Momentum Filter: Overbought (RSI > 78 or Extended > 8.5%)"
         elif not has_volume:
@@ -2143,7 +2169,7 @@ with tab_reasoning:
                         if pd.notnull(row.get("features_json")) and str(row["features_json"]) != "{}":
                             st.code(f"Recorded Feature Vector: {row['features_json']}", language="json")
                         if "LOSS" in str(row['status']):
-                            st.error("🤖 **Active Self-Correction Rule:** Future setups on this symbol receive a **30-Day Time-Decayed Penalty**, and its ATR volatility signature feeds the **75th-percentile regime filter**.")
+                            st.error("🤖 **Active Self-Correction Rule:** Feature Autopsy learning applied. Model weights and regime thresholds adapt dynamically.")
                         elif "BREAK-EVEN" in str(row['status']):
                             st.info("🛡️ **Active Rule Applied:** Capital & Indian STT preserved via 65% Break-Even Stop Ratchet. Neutral memory weight (0% penalty).")
                         else:
