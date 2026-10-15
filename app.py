@@ -73,14 +73,15 @@ BREAKEVEN_TRIGGER_RATIO = 0.65
 MAX_ACTIVE_PER_SECTOR = 2         
 COOLDOWN_CALENDAR_DAYS = 3        
 HALF_LIFE_DAYS = 30.0             
-MIN_SETTLED_TO_RETRAIN = 20       # LOWERED: Autonomously retrain every 20 trades
+MIN_SETTLED_TO_RETRAIN = 20       
 RETRAIN_STEP_INTERVAL = 20        
 MAX_SCAN_CHUNK_SIZE = 30          
 
-# Calibrated Institutional Qualification Thresholds (LSE Parity)
-MIN_CALIBRATED_CONFIDENCE = 60.0  # Calibrated AI Win Confidence threshold (60%+)
-MIN_RVOL_THRESHOLD = 0.45         # Normalized RVOL gate (intraday-safe)
-MIN_NET_RETURN_PCT = 1.10         # Minimum net target return after 0.28% Indian STT
+# Calibrated Institutional Qualification Thresholds
+MIN_CALIBRATED_CONFIDENCE = 60.0  
+MIN_RVOL_THRESHOLD = 0.45         
+EMA50_TOLERANCE_RATIO = 0.955     
+MIN_NET_RETURN_PCT = 1.10         
 
 NSE_EQUITY_FRICTION_PCT = 0.28
 
@@ -145,13 +146,11 @@ NSE_BEARISH_LEXICON = {
 }
 
 def clean_sym_name(sym: str) -> str:
-    """Extracts the base NSE symbol even if passed an option contract like 'BHARTIARTL OCT 1900 CE'."""
     raw = str(sym).strip().lstrip("$")
     base_token = raw.split()[0] if raw else ""
     return base_token.replace(".NS", "").replace(".BO", "")
 
 def normalize_ts_str(val, fallback_str: str) -> str:
-    """Normalizes ISO or timestamp strings into clean 'YYYY-MM-DD HH:MM:SS' format for DuckDB & Pandas."""
     if val is None or pd.isna(val):
         return fallback_str
     s = str(val).strip().replace("T", " ").replace(" IST", "")
@@ -335,7 +334,7 @@ def check_password() -> bool:
     with st.form("nse_secure_login_form", clear_on_submit=True):
         user_in = st.text_input("Operator Username")
         pass_in = st.text_input("Cryptographic Passkey", type="password")
-        submitted = st.form_submit_button("Authenticate Session", use_container_width=True, type="primary")
+        submitted = st.form_submit_button("Authenticate Session", width="stretch", type="primary")
 
         if submitted:
             input_hash = hashlib.sha256(pass_in.encode("utf-8")).hexdigest()
@@ -468,7 +467,6 @@ if "hydrated_once" not in st.session_state:
     st.session_state["hydrated_once"] = True
 
 def is_nse_market_open() -> bool:
-    """Evaluates live NSE market hours strictly in Indian Standard Time (09:15 to 15:30 IST, Mon-Fri)."""
     ist_zone = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist_zone)
     if now_ist.weekday() > 4:
@@ -483,10 +481,6 @@ def normalize_ticker_for_yf(ticker_str: str) -> str:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_cached_history(yf_sym: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """
-    CRUMB-FREE DIRECT V8 CHART FETCHER:
-    Queries Yahoo's v8/finance/chart JSON endpoint directly with URL-encoded symbol safety.
-    """
     encoded_sym = urllib.parse.quote(str(yf_sym).strip(), safe="")
     hosts = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
     for idx, host in enumerate(hosts):
@@ -635,7 +629,6 @@ def compute_nse_macro_lead_lag(ticker: str, macro: dict) -> tuple:
 # 5. CONTINUOUS LEARNING: 30-DAY EXPONENTIAL DECAY & AUTONOMOUS RETRAINING
 # ==============================================================================
 def get_closed_loop_self_learning(ticker: str, current_feats: dict) -> dict:
-    """Applies Feature-Wide Autopsy Learning across ALL past losses + Ticker decay penalty."""
     delta = 0.0
     reasons = []
     ist_zone = pytz.timezone('Asia/Kolkata')
@@ -661,7 +654,6 @@ def get_closed_loop_self_learning(ticker: str, current_feats: dict) -> dict:
     if hist.empty:
         return {"delta": 0.0, "reason": "Neutral (Building memory)"}
 
-    # 1. Ticker-Specific Time-Decayed Penalty
     try:
         t_clean = clean_sym_name(ticker)
         t_hist = hist[hist["ticker"].apply(clean_sym_name) == t_clean]
@@ -692,7 +684,6 @@ def get_closed_loop_self_learning(ticker: str, current_feats: dict) -> dict:
     except Exception:
         pass
 
-    # 2. Feature-Wide Autopsy Learning across ALL past losses
     try:
         all_losses = hist[hist["status"].str.contains("LOSS", na=False)]
         if len(all_losses) >= 5:
@@ -887,7 +878,6 @@ def audit_and_reconcile_all_trades():
         finally:
             con.close()
 
-    # 1. Audit Equities
     if not active_trades.empty:
         for _, tr in active_trades.iterrows():
             tkr = str(tr["ticker"]).strip()
@@ -972,7 +962,6 @@ def audit_and_reconcile_all_trades():
             except Exception:
                 continue
 
-    # 2. Audit Options
     if not active_opts.empty:
         for _, opt in active_opts.iterrows():
             try:
@@ -1444,7 +1433,7 @@ if "db_error" in st.session_state:
 if "retrain_notice" in st.session_state:
     st.sidebar.success(st.session_state["retrain_notice"])
 
-if st.sidebar.button("🚪 Log Out", use_container_width=True):
+if st.sidebar.button("🚪 Log Out", width="stretch"):
     st.query_params.clear()
     st.session_state["password_correct"] = False
     st.rerun()
@@ -1628,7 +1617,6 @@ def run_predictions():
 
         raw_feature_map = {c: float(latest.get(c, feat_dict.get(c, 0.0))) for c in feature_cols}
 
-        # STRICT TREND GATES (No Knife-Catching)
         is_above_trend = (close >= ema20) and (feat_dict["rsi_14"] >= 48.0) and (feat_dict["trend_spread_pct"] >= -1.0)
         is_exhausted = (feat_dict["rsi_14"] > 78.0) or (feat_dict["dist_ema20_pct"] > 8.5)
         has_volume = feat_dict["rvol"] >= MIN_RVOL_THRESHOLD
@@ -1775,7 +1763,7 @@ with tab_scanner:
 
     col1, col2 = st.columns([4, 1])
     with col2:
-        re_scan = st.button("🔄 Run Live Scan Now", use_container_width=True, type="primary")
+        re_scan = st.button("🔄 Run Live Scan Now", width="stretch", type="primary")
 
     should_run_scan = (not quota_filled or re_scan) and (
         re_scan or st.session_state.get("force_refresh", False) or "scan_results" not in st.session_state
@@ -1847,7 +1835,7 @@ with tab_scanner:
                         idem_token = hashlib.sha256(f"{row['Ticker']}_{today_key}_{broker_mode}".encode()).hexdigest()[:12]
                         already_sent = idem_token in st.session_state["dispatched_orders"]
                         btn_label = "✅ Order Dispatched (Idempotent Lock)" if already_sent else f"🚀 Execute Buy ({broker_mode})"
-                        if st.button(btn_label, key=f"exec_btn_{idem_token}", use_container_width=True, disabled=already_sent):
+                        if st.button(btn_label, key=f"exec_btn_{idem_token}", width="stretch", disabled=already_sent):
                             st.session_state["dispatched_orders"].add(idem_token)
                             log_equity_signal_safely(row.to_dict(), enforce_sector_cap=False)
                             st.info(f"Order [{idem_token}] dispatched to {broker_mode}. Logged to journal.")
@@ -1855,14 +1843,14 @@ with tab_scanner:
 
             st.markdown(f"### 📋 All {len(qualified_df)} Qualified Equities in Current Batch")
             disp_cols = ["Ticker", "Sector", "Price (₹)", "Target (₹)", "Stop Loss (₹)", "Expected Return", "AI Win Confidence", "Learner & Macro Adj", "Adjusted Score", "FilingStatus"]
-            st.dataframe(qualified_df[[c for c in disp_cols if c in qualified_df.columns]], use_container_width=True, hide_index=True)
+            st.dataframe(qualified_df[[c for c in disp_cols if c in qualified_df.columns]], width="stretch", hide_index=True)
         else:
             st.warning("🛡️ **Capital Protection Active:** No equities in the current batch passed all volume, trend, filing NLP, and ML filters.")
 
         if not df_res.empty:
             with st.expander(f"🔍 View All {len(df_res)} Evaluated Stocks & Gate Diagnostics in Current Batch"):
                 diag_cols = ["Ticker", "Sector", "Price (₹)", "Expected Return", "AI Win Confidence", "Adjusted Score", "Qualified", "Rejection Reason"]
-                st.dataframe(df_res[[c for c in diag_cols if c in df_res.columns]], use_container_width=True, hide_index=True)
+                st.dataframe(df_res[[c for c in diag_cols if c in df_res.columns]], width="stretch", hide_index=True)
 
 # ==============================================================================
 # 13. TAB 2: OPTIONS ALPHA
@@ -1896,7 +1884,7 @@ with tab_options:
             m3.success(f"Status: **{opt_signal['status']}** (Audited: {str(opt_signal['last_audited'])[:19]} IST)")
             
             st.write("")
-            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", use_container_width=True):
+            if st.button(f"🚀 Send Option Order to Broker ({broker_mode})", key="exec_opt_order", width="stretch"):
                 st.success(f"Signal securely dispatched to {broker_mode} gateway.")
 
 # ==============================================================================
@@ -1913,7 +1901,7 @@ with tab_journal:
             f"Break-Even Stop Ratchet activates automatically at **≥ {int(BREAKEVEN_TRIGGER_RATIO * 100)}%** of target distance."
         )
     with j_col2:
-        if st.button("🧹 Reconcile & Clean Ledger", use_container_width=True):
+        if st.button("🧹 Reconcile & Clean Ledger", width="stretch"):
             deduplicate_journal_ledger()
             audit_and_reconcile_all_trades()
             st.success("Ledger deduplicated and reconciled against live NSE market!")
@@ -2052,7 +2040,7 @@ with tab_journal:
         if "P&L (%)" in master_df.columns:
             master_df["P&L (%)"] = master_df["P&L (%)"].apply(lambda x: f"{float(x):+.2f}%" if pd.notnull(x) else "0.00%")
             
-        st.dataframe(master_df, use_container_width=True, hide_index=True)
+        st.dataframe(master_df, width="stretch", hide_index=True)
     else:
         st.info("No trades currently logged. Active trades will appear here as the engine confirms signals.")
 
