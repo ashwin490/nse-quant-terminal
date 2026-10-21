@@ -115,6 +115,12 @@ OPTION_STOP_MULT = 0.50
 # NSE revises lot sizes now and then — VERIFY these against NSE's current contract list.
 FNO_STOCKS = ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS", "TCS.NS", "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS"]
 LOT_SIZES = {"RELIANCE": 250, "HDFCBANK": 400, "ICICIBANK": 700, "INFY": 400, "TCS": 175, "SBIN": 750, "BHARTIARTL": 950, "ITC": 1600, "LT": 300}
+# ---- Options learner (separate from the share AI; it only ever changes the options idea) ----
+OPT_LEARN_MIN_TRADES = 10              # finished option ideas (in the window below) before it becomes pickier
+OPT_LEARN_WINDOW_DAYS = 60             # only the last 60 days count, so a strict rule lifts by itself and gets re-tested
+OPT_REST_THRESHOLD = 0.75              # a share 'rests' from options after a recent loss (one loss ≈ 12 days)
+OPT_LIVE_ONLY_MIN_MODEL = 8            # estimated-price ideas needed before it may decide to use real NSE quotes only
+OPT_MAX_TREND_BAR = 82.0               # the pickiest it can get (trend strength needed)
 STRIKE_STEPS = {"RELIANCE": 20, "HDFCBANK": 10, "ICICIBANK": 10, "INFY": 20, "TCS": 50, "SBIN": 10, "BHARTIARTL": 20, "ITC": 10, "LT": 50}
 
 # ---- AI governance ----
@@ -1542,11 +1548,16 @@ def generate_daily_options_alpha() -> dict:
         return {}
 
     cooldown_set = get_recent_cooldown_tickers()
+    learn = options_learning()
+    skipped = {"rest": 0, "bar": 0, "live_only": 0}
     prefetch_histories(FNO_STOCKS, "1mo")
     ranked = []
     for sym in FNO_STOCKS:
         clean_name = clean_sym_name(sym)
         if clean_name in active_opt_shares or clean_name in cooldown_set:
+            continue
+        if clean_name in learn["rest"]:
+            skipped["rest"] += 1                                # the options learner is resting this share
             continue
         if evaluate_nse_filing_nlp(clean_name).get("is_blocked", False):
             continue
@@ -1562,6 +1573,10 @@ def generate_daily_options_alpha() -> dict:
 
     expiry_dt, days_to_expiry = get_nse_monthly_expiry(now_ist)
     for ret_5d, name, spot, sigma in ranked:
+        score = round(min(92.0, max(60.0, 70.0 + ret_5d * 150.0)), 1)
+        if score < learn["bar"]:
+            skipped["bar"] += 1                                 # not a strong enough climb for the learner's current bar
+            continue
         lot = LOT_SIZES.get(name, 500)
         step = STRIKE_STEPS.get(name, 10)
         strike = max(step, math.ceil((spot * 1.02) / step) * step)
@@ -1572,11 +1587,13 @@ def generate_daily_options_alpha() -> dict:
             entry = model_option_price(spot, strike, days_to_expiry, sigma, "ask")
             mark = model_option_price(spot, strike, days_to_expiry, sigma, "bid")
             iv_pct, live = sigma * 100.0, False
+        if learn["live_only"] and not live:
+            skipped["live_only"] += 1                           # the learner only trusts real NSE quotes right now
+            continue
         total_cap = round(entry * lot, 2)
         if total_cap > OPTION_BUDGET_INR:
             continue
         label = f"{name} {expiry_dt.strftime('%d %b %Y').upper()} {int(strike)} CE ({'live quote' if live else 'model price'})"
-        score = round(min(92.0, max(60.0, 70.0 + ret_5d * 150.0)), 1)
         sig = {
             "date_key": today_str, "timestamp": now_str, "share_name": name, "option_contract": label,
             "strike_price": float(strike), "expiry_days": int(days_to_expiry), "underlying_spot": float(spot), "lot_size": int(lot),
@@ -1605,7 +1622,15 @@ def generate_daily_options_alpha() -> dict:
                 record_db_error("Insert Option", e)
         return sig
 
-    st.session_state["opt_note"] = f"No option idea today: none of the F&O shares had a recent live price with a contract under ₹{OPTION_BUDGET_INR:,.0f}."
+    why = []
+    if skipped["rest"]:
+        why.append(f"{skipped['rest']} share(s) are resting after a recent option loss")
+    if skipped["bar"]:
+        why.append(f"{skipped['bar']} didn't climb enough for the learner's current bar (trend strength {learn['bar']:.0f}+)")
+    if skipped["live_only"]:
+        why.append(f"{skipped['live_only']} had only an estimated price, and the learner currently wants a real NSE quote")
+    st.session_state["opt_note"] = ("No option idea today — the options learner is being picky: " + "; ".join(why) + ". Doing nothing is a valid choice."
+                                    if why else f"No option idea today: none of the F&O shares had a recent live price with a contract under ₹{OPTION_BUDGET_INR:,.0f}.")
     return {}
 
 def audit_option(opt, now_str: str, today_date):
@@ -1683,6 +1708,71 @@ def audit_option(opt, now_str: str, today_date):
     cloud_update("options_journal", {"date_key": opt["date_key"]},
                  {"current_option_price": live, "underlying_spot": spot_now, "pnl_pct": pnl_pct, "status": status, "last_audited": now_str},
                  "Audit Option")
+
+
+# ---------- the OPTIONS learner: simple, visible rules that adapt to its own option results ----------
+def load_options_journal_df() -> pd.DataFrame:
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            return con.execute("SELECT * FROM daily_options_journal ORDER BY date_key ASC").df()
+        except Exception:
+            return pd.DataFrame()
+        finally:
+            con.close()
+
+def _opt_group(g: pd.DataFrame):
+    if g is None or g.empty:
+        return None
+    return {"n": int(len(g)), "avg": round(float(g["pnl_pct"].mean()), 1),
+            "win_rate": round(float((g["outcome"] == "WIN").mean() * 100.0), 0),
+            "wavg": round(float((g["w"] * g["pnl_pct"]).sum() / max(1e-9, g["w"].sum())), 1)}
+
+def options_learning(df_all: pd.DataFrame = None) -> dict:
+    """Learns ONLY from finished option ideas and ONLY changes the options idea:
+       1) a share whose option lost recently takes a break from options (fades like the share memory: half every 30 days),
+       2) after enough results, if recent ideas lose on average, it only takes shares with a stronger 5-day climb,
+       3) if estimated-price ideas keep losing, it only takes ideas with a real NSE quote.
+       Rules 2 and 3 look at the last 60 days only, so if a rule stops all ideas it lifts by itself and gets re-tested."""
+    out = {"n": 0, "recent_n": 0, "ready": False, "bar": 60.0, "rest": {}, "live_only": False, "wavg": None,
+           "live": None, "model": None, "by_share": {}}
+    if df_all is None:
+        df_all = load_options_journal_df()
+    d = prep_perf_frame(df_all, "total_capital", is_option=True)
+    if d is None or d.empty:
+        return out
+    today = ist_now().date()
+    d = d.copy()
+    d["age"] = d["exit_date"].apply(lambda x: max(0, (today - x).days) if x else 0)
+    d["w"] = 0.5 ** (d["age"] / HALF_LIFE_DAYS)
+    d["live_src"] = d["option_contract"].apply(is_live_option)
+    out["n"] = int(len(d))
+    out["live"], out["model"] = _opt_group(d[d["live_src"]]), _opt_group(d[~d["live_src"]])
+    for share, g in d.groupby("share_name"):
+        out["by_share"][str(share)] = _opt_group(g)
+        sc = 0.0
+        for _, r in g.iterrows():
+            o = r["outcome"]
+            v = 1.0 if o == "WIN" else (-1.0 if o == "LOSS" else (-0.5 if float(r["pnl_pct"]) < 0 else 0.0))
+            sc += float(r["w"]) * v
+        if sc <= -OPT_REST_THRESHOLD:
+            out["rest"][str(share)] = max(1, int(math.ceil(HALF_LIFE_DAYS * math.log2(abs(sc) / OPT_REST_THRESHOLD))))
+    recent = d[d["age"] <= OPT_LEARN_WINDOW_DAYS]
+    out["recent_n"] = int(len(recent))
+    if len(recent) >= OPT_LEARN_MIN_TRADES:
+        out["ready"] = True
+        wavg = float((recent["w"] * recent["pnl_pct"]).sum() / max(1e-9, recent["w"].sum()))
+        out["wavg"] = round(wavg, 1)
+        if wavg < 0:
+            out["bar"] = round(min(OPT_MAX_TREND_BAR, 60.0 + abs(wavg) * 0.5), 1)
+    rm, rl = _opt_group(recent[~recent["live_src"]]), _opt_group(recent[recent["live_src"]])
+    if rm and rm["n"] >= OPT_LIVE_ONLY_MIN_MODEL and rm["wavg"] < 0 and (rl is None or rl["n"] < 5 or rl["wavg"] > rm["wavg"]):
+        out["live_only"] = True
+    return out
+
+def trend_bar_to_rise(bar: float) -> float:
+    """Trend strength = 70 + 5-day rise(%) × 1.5  ->  the 5-day rise (%) a share needs to reach a given bar."""
+    return (float(bar) - 70.0) / 1.5
 
 # ==============================================================================
 # 9. AUDIT ENGINE (BAR-BY-BAR, GAP-AWARE, STOP-FIRST, HONEST FILLS)
@@ -2354,6 +2444,7 @@ footer{visibility:hidden;}
 .tcard,.mini{transition:transform .15s ease,box-shadow .15s ease;}
 .tcard:hover,.mini:hover{transform:translateY(-3px);box-shadow:0 10px 28px rgba(0,0,0,.18);}
 .mini{padding:12px 14px;}
+.mini.opt{border-left:4px solid var(--info);}
 .fin{padding:10px 14px;display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;}
 .empty{text-align:center;opacity:.75;font-size:.9rem;padding:22px 16px;border-style:dashed;}
 .tag{font-size:.66rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 9px;border-radius:999px;border:1px solid var(--line);}
@@ -2552,26 +2643,43 @@ def mini_trade_html(ticker, sector, entry, target, stop, live, pnl_pct, locked, 
     </div>
     """)
 
+def option_short_name(contract) -> str:
+    return str(contract).split(" (")[0]
+
+def option_mini_html(o) -> str:
+    entry, target, stop = float(o["entry_premium"]), float(o["target_premium"]), float(o["stop_loss_premium"])
+    live, pnl = float(o["current_option_price"]), float(o["pnl_pct"])
+    src = '<span class="tag good">Live NSE quote</span>' if is_live_option(o["option_contract"]) else '<span class="tag warn">Estimated price</span>'
+    cls = "pos" if pnl >= 0 else "neg"
+    return _collapse(f"""
+    <div class="mini opt">
+      <div class="tags"><span class="tag info">Option</span>{src}</div>
+      <div class="row"><span class="mtk">{esc(option_short_name(o['option_contract']))}</span><span class="mp {cls}">{pnl:+.2f}%</span></div>
+      {price_bar_html(entry, target, stop, live, compact=True)}
+      <div class="sub2">bought ₹{entry:,.2f} · now ₹{live:,.2f} · 1 lot of {int(float(o['lot_size']))} · since {esc(str(o['date_key']))}</div>
+    </div>
+    """)
+
 def finished_row_html(ticker, status, pnl_pct, when) -> str:
     s_text, s_kind = outcome_style(status)
     cls = "pos" if pnl_pct >= 0 else "neg"
     return _collapse(f'<div class="fin"><div><b>{esc(ticker)}</b> <span class="tag {s_kind}">{esc(s_text)}</span><div class="sub2">{esc(when)}</div></div><div class="mp {cls}">{pnl_pct:+.2f}%</div></div>')
 
 # ---------- charts ----------
-def show_fig(fig):
+def show_fig(fig, key=None):
     if not PLOTLY_OK or fig is None:
         return
     try:
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, width="stretch", key=key)
     except TypeError:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=key)
 
 def _layout(fig, height=320, title=None):
     fig.update_layout(height=height, margin=dict(l=10, r=10, t=44 if title else 16, b=10), title=title,
                       legend=dict(orientation="h", y=1.14), hovermode="x unified")
     return fig
 
-def chart_cumulative(perf_df: pd.DataFrame, title: str):
+def chart_cumulative(perf_df: pd.DataFrame, title: str, key: str = None):
     if perf_df.empty:
         return
     x = [str(d) for d in perf_df["exit_date"]]
@@ -2582,16 +2690,16 @@ def chart_cumulative(perf_df: pd.DataFrame, title: str):
     colour = "#16a34a" if cum.iloc[-1] >= 0 else "#dc2626"
     fig = go.Figure(go.Scatter(x=x, y=cum, mode="lines+markers", line=dict(color=colour, width=3, shape="hv"), fill="tozeroy",
                                name="Running profit/loss (₹)", hovertemplate="%{x}<br>₹%{y:,.0f}<extra></extra>"))
-    show_fig(_layout(fig, 320, title))
+    show_fig(_layout(fig, 320, title), key=key)
 
-def chart_outcomes(perf: dict):
+def chart_outcomes(perf: dict, title: str = "How your trades ended", key: str = None):
     labels, vals = ["Hit the goal", "Safety exit", "Sold with no loss", "Time ran out"], [perf["wins"], perf["losses"], perf["be"], perf["expired"]]
     if not PLOTLY_OK:
-        st.bar_chart(pd.DataFrame({"trades": vals}, index=labels))
+        st.bar_chart(pd.DataFrame({title: vals}, index=labels))
         return
     fig = go.Figure(go.Pie(labels=labels, values=vals, hole=0.62, sort=False, marker=dict(colors=["#16a34a", "#dc2626", "#d97706", "#64748b"]), textinfo="label+percent"))
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title="How your trades ended", showlegend=False)
-    show_fig(fig)
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title=title, showlegend=False)
+    show_fig(fig, key=key)
 
 def chart_hist(perf_df: pd.DataFrame):
     if perf_df.empty:
@@ -2912,6 +3020,10 @@ with DB_LOCK:
 perf_eq_df = prep_perf_frame(df_eq, "capital_allocated")
 perf_opt_df = prep_perf_frame(df_opt, "total_capital", is_option=True)
 perf = compute_performance(perf_eq_df)
+perf_o = compute_performance(perf_opt_df)
+active_opt = df_opt[df_opt["status"].apply(classify_outcome) == "ACTIVE"].copy() if not df_opt.empty else pd.DataFrame()
+opt_open_unreal = float((pd.to_numeric(active_opt["total_capital"], errors="coerce").fillna(0) * pd.to_numeric(active_opt["pnl_pct"], errors="coerce").fillna(0) / 100.0).sum()) if not active_opt.empty else 0.0
+opt_learn = options_learning(df_opt)
 active_eq = df_eq[df_eq["status"].apply(classify_outcome) == "ACTIVE"].copy() if not df_eq.empty else pd.DataFrame()
 active_cap = float(active_eq["capital_allocated"].sum()) if not active_eq.empty else 0.0
 open_unreal = float((active_eq["capital_allocated"] * active_eq["pnl_pct"] / 100.0).sum()) if not active_eq.empty else 0.0
@@ -2958,11 +3070,13 @@ with hero_box:
       </div>
     </div>"""), unsafe_allow_html=True)
     n_open_now = len(active_eq)
+    opt_bit = (f" Plus <b>{len(active_opt)} option idea{'s' if len(active_opt) != 1 else ''} running</b> ({inr(opt_open_unreal)}), kept separate."
+               if len(active_opt) else "")
     if perf["n"]:
-        story = (f"<b>{n_open_now} trade{'s' if n_open_now != 1 else ''} running</b> ({inr(open_unreal)} so far). "
-                 f"<b>{perf['n']} finished</b>, {perf['wins']} hit their goal, total {inr(perf['net_inr'])} after all costs.")
+        story = (f"<b>{n_open_now} share trade{'s' if n_open_now != 1 else ''} running</b> ({inr(open_unreal)} so far). "
+                 f"<b>{perf['n']} finished</b>, {perf['wins']} hit their goal, total {inr(perf['net_inr'])} after all costs." + opt_bit)
     else:
-        story = f"<b>{n_open_now} trade{'s' if n_open_now != 1 else ''} running.</b> Nothing has finished yet, so there are no results to judge."
+        story = f"<b>{n_open_now} share trade{'s' if n_open_now != 1 else ''} running.</b> Nothing has finished yet, so there are no results to judge." + opt_bit
     callout("good" if open_unreal > 0 else ("bad" if open_unreal < 0 else "info"), "📍", story)
     with st.expander("💡 New here? 30-second guide"):
         st.markdown(
@@ -3036,26 +3150,37 @@ with tab_board:
                     st.rerun()
 
     with c_run:
-        col_header("run", "🟢 Running", len(active_eq))
-        if active_eq.empty:
+        col_header("run", "🟢 Running", len(active_eq) + len(active_opt))
+        if active_eq.empty and active_opt.empty:
             empty_box("No open trades.")
         else:
-            for _, r in active_eq.sort_values("pnl_pct", ascending=False).head(12).iterrows():
+            if len(active_opt):
+                st.caption(f"{len(active_eq)} share trade{'s' if len(active_eq) != 1 else ''} · {len(active_opt)} option idea{'s' if len(active_opt) != 1 else ''} (options are counted separately)")
+            for _, r in (active_eq.sort_values("pnl_pct", ascending=False).head(12).iterrows() if not active_eq.empty else []):
                 st.markdown(mini_trade_html(r["ticker"], get_trade_sector(r["ticker"], r["features_json"]), float(r["entry_price"]), float(r["target_price"]),
                                             float(r["stop_loss"]), float(r["latest_price"]), float(r["pnl_pct"]),
                                             is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"])), r["shares"]), unsafe_allow_html=True)
-            st.caption("Dot = current price · green side = nearer the goal · 🛡️ = can no longer lose")
             if len(active_eq) > 12:
-                st.caption(f"Showing 12 of {len(active_eq)}.")
+                st.caption(f"Showing 12 of {len(active_eq)} share trades.")
+            for _, o in (active_opt.iterrows() if not active_opt.empty else []):
+                st.markdown(option_mini_html(o), unsafe_allow_html=True)
+            st.caption("Dot = current price · green side = nearer the goal · 🛡️ = can no longer lose")
 
     with c_done:
-        recent = perf_eq_df.tail(8).iloc[::-1] if not perf_eq_df.empty else pd.DataFrame()
-        col_header("done", "🏁 Finished", len(perf_eq_df))
-        if recent.empty:
+        col_header("done", "🏁 Finished", len(perf_eq_df) + len(perf_opt_df))
+        fin_rows = []
+        for _, r in (perf_eq_df.iterrows() if not perf_eq_df.empty else []):
+            fin_rows.append((r["exit_date"], r["ticker"], r["status"], float(r["pnl_pct"]), f"closed {r['exit_date']}"))
+        for _, r in (perf_opt_df.iterrows() if not perf_opt_df.empty else []):
+            fin_rows.append((r["exit_date"], "📜 " + option_short_name(r["option_contract"]), r["status"], float(r["pnl_pct"]), f"option · closed {r['exit_date']}"))
+        fin_rows.sort(key=lambda x: str(x[0]), reverse=True)
+        if not fin_rows:
             empty_box("Finished trades appear here.")
         else:
-            for _, r in recent.iterrows():
-                st.markdown(finished_row_html(r["ticker"], r["status"], float(r["pnl_pct"]), f"closed {r['exit_date']}"), unsafe_allow_html=True)
+            if len(perf_opt_df):
+                st.caption(f"{len(perf_eq_df)} share trades · {len(perf_opt_df)} option ideas")
+            for _, tk, stt, pp, when in fin_rows[:8]:
+                st.markdown(finished_row_html(tk, stt, pp, when), unsafe_allow_html=True)
 
     if stats.get("scanned"):
         sec_title("🌡️", "Market pulse", "the whole NSE, from this check")
@@ -3134,9 +3259,9 @@ with tab_results:
             callout("bad", "⚠️", f"<b>Losing money after costs.</b> On average <b>{exp_:+.2f}%</b> per trade ({n_} trades). Don't use real money.")
         ch1, ch2 = st.columns([3, 2])
         with ch1:
-            chart_cumulative(perf_eq_df, "Your running profit/loss (₹) — going up is good")
+            chart_cumulative(perf_eq_df, "Your running profit/loss (₹) — going up is good", key="cum_shares")
         with ch2:
-            chart_outcomes(perf)
+            chart_outcomes(perf, key="outcomes_shares")
 
         sec_title("✨", "Highlights")
         best_i, worst_i = perf_eq_df["pnl_pct"].idxmax(), perf_eq_df["pnl_pct"].idxmin()
@@ -3293,7 +3418,8 @@ with tab_learn:
         f"- **Version in use:** {st.session_state.get('ml_model_source', 'not loaded yet')}\n"
         f"- **Last upgrade:** {rstate.get('last_promoted', 'never — still the original')}\n"
         f"- **Upgrade rule:** only after {MIN_SETTLED_TO_RETRAIN}+ clear win/loss trades, and only if the new version tests better. Your original model file is never overwritten."
-        + (f"\n- **Confidence tuning:** {cal['mode']}." if cal else ""))
+        + (f"\n- **Confidence tuning:** {cal['mode']}." if cal else "")
+        + "\n- **Options:** this AI learns from share trades only. Options have their own separate learner — see the 🎲 Options tab.")
     with st.expander("How the AI picks a share"):
         st.markdown(
             "1. Downloads prices for **every share on the NSE** (normal 'EQ' series), skipping ones that are thinly traded, under ₹10, stuck at their price limit or extremely jumpy.\n"
@@ -3312,20 +3438,20 @@ with tab_options:
     if opt_signal:
         live_src = is_live_option(opt_signal["option_contract"])
         with st.container(border=True):
-            st.markdown(f'<span class="tag {"good" if live_src else "warn"}">{"Live NSE quote" if live_src else "Model price — live quote unavailable"}</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="tag {"good" if live_src else "warn"}">{"Live NSE quote" if live_src else "Estimated price — live quote unavailable"}</span>', unsafe_allow_html=True)
             o1, o2, o3 = st.columns(3)
             with o1:
-                st.metric("Idea", str(opt_signal["option_contract"]).split(" (")[0], help="A 'CE' (call) option gains value if the share price rises.")
-                st.markdown(f"Share price when picked: **₹{opt_signal['underlying_spot']:,.2f}**")
+                st.metric("Idea", option_short_name(opt_signal["option_contract"]), help="A 'CE' (call) option gains value if the share price rises.")
+                st.markdown(f"Share price when picked: **₹{float(opt_signal['underlying_spot']):,.2f}**")
             with o2:
-                st.metric("Sell price now", f"₹{opt_signal['current_option_price']:.2f}", f"{opt_signal['pnl_pct']:+.2f}% vs cost (₹{opt_signal['entry_premium']:.2f})")
+                st.metric("Sell price now", f"₹{float(opt_signal['current_option_price']):.2f}", f"{float(opt_signal['pnl_pct']):+.2f}% vs cost (₹{float(opt_signal['entry_premium']):.2f})")
                 st.markdown(f"Expected wobble: **{opt_signal['implied_vol']}%** a year")
             with o3:
-                st.metric("Cost to buy", inr(opt_signal["total_capital"]), f"{int(opt_signal['lot_size'])} shares in one lot", delta_color="off")
+                st.metric("Cost to buy", inr(opt_signal["total_capital"]), f"{int(float(opt_signal['lot_size']))} shares in one lot", delta_color="off")
                 st.markdown(f"Trend strength: **{opt_signal['ai_confidence']}** (not a chance of winning)")
             m1, m2, m3 = st.columns(3)
-            m1.info(f"🎯 Goal: ₹{opt_signal['target_premium']:.2f} (+{(OPTION_TARGET_MULT - 1) * 100:.0f}%)")
-            m2.warning(f"🛑 Safety exit: ₹{opt_signal['stop_loss_premium']:.2f} (-{(1 - OPTION_STOP_MULT) * 100:.0f}%)")
+            m1.info(f"🎯 Goal: ₹{float(opt_signal['target_premium']):.2f} (+{(OPTION_TARGET_MULT - 1) * 100:.0f}%)")
+            m2.warning(f"🛑 Safety exit: ₹{float(opt_signal['stop_loss_premium']):.2f} (-{(1 - OPTION_STOP_MULT) * 100:.0f}%)")
             m3.success(f"Status: **{friendly_status(opt_signal['status'])}**")
             if not live_src:
                 st.caption("The price comes from a maths formula (Black-Scholes) because NSE's live quote wasn't available. It is only an estimate.")
@@ -3333,13 +3459,100 @@ with tab_options:
         st.info(st.session_state.get("opt_note") or "No option idea today.")
     if not state["trading_day"]:
         st.caption(f"NSE is closed today ({state['reason']}), so no new idea is created.")
+
+    # ---------- scoreboard ----------
+    sec_title("📊", "Options scoreboard", "finished option ideas, kept apart from your share results")
+    if perf_o["n"] == 0:
+        score_cards([("Options profit/loss", "₹0", "no finished ideas yet", "", ""), ("Win rate", "–", "needs finished ideas", "", ""),
+                     ("Finished ideas", "0", "one idea a day at most", "", ""), ("Open right now", str(len(active_opt)), f"{inr(opt_open_unreal)} so far", "", "")])
+        callout("info", "⏳", "<b>No option idea has finished yet.</b> Each one closes at its goal, its safety exit, or after 7 days.")
+    else:
+        net_o = perf_o["net_inr"]
+        score_cards([
+            ("Options profit/loss", inr(net_o), f"{inr(perf_o['expectancy_inr'])} per idea on average", "good" if net_o > 0 else ("bad" if net_o < 0 else ""), "pos" if net_o > 0 else ("neg" if net_o < 0 else "")),
+            ("Win rate", f"{perf_o['target_hit_rate']:.0f}%", f"{perf_o['wins']} won · {perf_o['losses']} lost · {perf_o['expired']} timed out", "", ""),
+            ("Finished ideas", str(perf_o["n"]), f"likely win rate {perf_o['ci_low']:.0f}–{perf_o['ci_high']:.0f}%", "", ""),
+            ("Open right now", str(len(active_opt)), f"{inr(opt_open_unreal)} so far", "good" if opt_open_unreal > 0 else ("bad" if opt_open_unreal < 0 else ""), ""),
+        ])
+        if perf_o["n"] < 20:
+            callout("warn", "⏳", f"<b>Too early to judge.</b> Only {perf_o['n']} option idea{'s have' if perf_o['n'] != 1 else ' has'} finished. Options swing a lot, so early results are mostly luck.")
+        oc1, oc2 = st.columns([3, 2])
+        with oc1:
+            chart_cumulative(perf_opt_df, "Options running profit/loss (₹)", key="cum_options")
+        with oc2:
+            chart_outcomes(perf_o, title="How your option ideas ended", key="outcomes_options")
+        lv, md_ = opt_learn.get("live"), opt_learn.get("model")
+        if lv or md_:
+            q1, q2 = st.columns(2)
+            with q1:
+                stat_card("📡 Ideas with a live NSE price", f"{lv['avg']:+.1f}% average" if lv else "none yet",
+                          f"{lv['n']} finished · {lv['win_rate']:.0f}% won" if lv else "NSE's quote wasn't reachable for any idea so far")
+            with q2:
+                stat_card("🧮 Ideas with an estimated price", f"{md_['avg']:+.1f}% average" if md_ else "none yet",
+                          f"{md_['n']} finished · {md_['win_rate']:.0f}% won · results are estimates too" if md_ else "every idea so far had a live quote")
+
+    # ---------- open options ----------
+    sec_title("🟢", "Open option ideas", f"{len(active_opt)} running")
+    if active_opt.empty:
+        empty_box("No option ideas are open right now.")
+    else:
+        oc = st.columns(min(3, len(active_opt)))
+        for i_, (_, o) in enumerate(active_opt.iterrows()):
+            with oc[i_ % len(oc)]:
+                st.markdown(option_mini_html(o), unsafe_allow_html=True)
+
+    # ---------- the options learner ----------
+    sec_title("🧠", "What the options learner has learned", "separate from the share AI")
+    rn = int(opt_learn.get("recent_n", 0))
+    st.markdown(_collapse(
+        f'<div class="stat"><div class="l">Options experience</div><div class="v">{opt_learn["n"]} finished idea{"s" if opt_learn["n"] != 1 else ""}</div>'
+        f'<div class="meter"><div style="width:{min(100.0, rn / OPT_LEARN_MIN_TRADES * 100.0):.0f}%"></div></div>'
+        f'<div class="sub2">{min(rn, OPT_LEARN_MIN_TRADES)} of {OPT_LEARN_MIN_TRADES} recent ideas (last {OPT_LEARN_WINDOW_DAYS} days) needed before it may become pickier. '
+        f'Until then only the “rest a share after a loss” rule is used.</div></div>'), unsafe_allow_html=True)
+    rules = []
+    if opt_learn["rest"]:
+        rules.append("🚧 <b>Taking a break from:</b> " + ", ".join(f"{esc(k)} (~{v} day{'s' if v != 1 else ''} left)" for k, v in sorted(opt_learn["rest"].items(), key=lambda x: -x[1]))
+                     + " — their recent options lost money. The break fades by itself.")
+    if opt_learn["bar"] > 60.0:
+        rise = trend_bar_to_rise(opt_learn["bar"])
+        rise_txt = f"a 5-day rise of at least <b>{rise:+.1f}%</b>" if rise > 0 else f"trend strength {opt_learn['bar']:.0f}+"
+        rules.append(f"📈 <b>Pickier:</b> recent ideas lost <b>{opt_learn['wavg']:+.1f}%</b> on average, so it now needs {rise_txt} before it picks a share.")
+    elif opt_learn["ready"]:
+        rules.append(f"✅ <b>Normal pickiness:</b> recent ideas made <b>{opt_learn['wavg']:+.1f}%</b> on average, so it isn't adding extra filters.")
+    if opt_learn["live_only"]:
+        rules.append("📡 <b>Real prices only:</b> ideas priced with the maths formula have been losing, so it now only takes ideas with a real NSE quote.")
+    if rules:
+        for r_ in rules:
+            callout("info", "🧠", r_)
+    else:
+        callout("info", "🌱", "<b>No rules in force yet.</b> It hasn't seen enough finished option ideas to change anything.")
+    if opt_learn.get("by_share"):
+        bs = sorted(((k, v) for k, v in opt_learn["by_share"].items() if v), key=lambda x: -x[1]["avg"])
+        st.markdown(hbars_html([(k, float(v["avg"]), f"{v['avg']:+.1f}% · {v['n']} idea{'s' if v['n'] != 1 else ''}") for k, v in bs[:9]]), unsafe_allow_html=True)
+        st.caption("Average result of finished option ideas, per share.")
+
+    # ---------- every option idea ----------
+    if not df_opt.empty:
+        sec_title("📜", "Every option idea")
+        od = df_opt.copy()
+        od["Price source"] = od["option_contract"].apply(lambda c: "Live NSE quote" if is_live_option(c) else "Estimated")
+        od["Contract"] = od["option_contract"].apply(option_short_name)
+        od["Result"] = od["status"].apply(friendly_status)
+        od = od.rename(columns={"date_key": "Date", "entry_premium": "Bought at (₹)", "current_option_price": "Price now (₹)", "target_premium": "Goal (₹)",
+                                "stop_loss_premium": "Safety exit (₹)", "pnl_pct": "Profit/Loss (%)", "ai_confidence": "Trend strength", "last_audited": "Last checked"})
+        ocols = ["Date", "Contract", "Price source", "Bought at (₹)", "Goal (₹)", "Safety exit (₹)", "Price now (₹)", "Profit/Loss (%)", "Trend strength", "Result", "Last checked"]
+        st.dataframe(style_ledger(od[[c for c in ocols if c in od.columns]]), width="stretch", hide_index=True)
+
     with st.expander("How the options idea works"):
         st.markdown(
-            "- It looks at the biggest F&O shares and picks the one with the strongest 5-day trend (skipping any with bad news or a recent trade).\n"
+            "- It looks at the biggest F&O shares and picks the one with the strongest 5-day climb (skipping any with bad news or a recent trade).\n"
             "- The contract is a **call about 2% above the share price**, expiring on the **last Tuesday of the month** (NSE's stock-option expiry day).\n"
             "- If NSE gives a real buy/sell quote with a tight gap and real trading, that's used. Otherwise a maths-formula price is used and clearly labelled.\n"
             "- You \"buy\" at the higher asking price and are valued at the lower selling price, so every trade starts slightly down.\n"
             f"- Goal +{(OPTION_TARGET_MULT - 1) * 100:.0f}%, safety exit -{(1 - OPTION_STOP_MULT) * 100:.0f}%, and it closes after {MAX_HOLD_CALENDAR_DAYS} days anyway.\n"
+            "- **The options learner** only learns from finished option ideas and only changes the options idea — never the share AI. "
+            "It rests a share after a recent option loss, gets pickier about the 5-day climb if recent ideas lose on average, and can insist on real NSE prices. "
+            f"Its stricter rules only look at the last {OPT_LEARN_WINDOW_DAYS} days, so they lift by themselves and get re-tested.\n"
             "- Lot sizes come from a built-in table. **NSE changes them from time to time — please check them against NSE's current list.**")
 
 st.markdown('<div class="disc">Practice tool using pretend money. Not investment advice. Past results don’t predict future results.</div>', unsafe_allow_html=True)
