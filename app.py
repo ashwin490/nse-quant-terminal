@@ -2496,9 +2496,13 @@ footer{visibility:hidden;}
 @media(max-width:700px){.fn{grid-template-columns:120px 1fr 56px;font-size:.78rem;}}
 .disc{font-size:.76rem;opacity:.6;text-align:center;margin:30px 0 6px;}
 [data-testid="stMetric"]{border:1px solid var(--line);border-radius:14px;padding:12px 14px;background:var(--soft);}
-button[data-baseweb="tab"]{font-weight:700;font-size:1rem;}
+[data-baseweb="tab-list"]{gap:6px;flex-wrap:wrap;}
+button[data-baseweb="tab"],button[data-testid="stTab"],.stTabs button[role="tab"]{height:auto !important;padding:12px 18px !important;border-radius:12px 12px 0 0;}
+button[data-baseweb="tab"],button[data-baseweb="tab"] p,button[data-baseweb="tab"] div,button[data-baseweb="tab"] span,
+button[data-testid="stTab"] p,.stTabs button[role="tab"] p{font-size:1.15rem !important;font-weight:700 !important;line-height:1.3 !important;}
+button[data-baseweb="tab"][aria-selected="true"],button[data-testid="stTab"][aria-selected="true"]{background:var(--soft);}
 .stButton>button{border-radius:12px;font-weight:600;}
-@media(max-width:700px){.hb{grid-template-columns:96px 1fr 80px;}.sc .val{font-size:1.7rem;}.hero h1{font-size:1.45rem;}}
+@media(max-width:700px){button[data-baseweb="tab"],button[data-testid="stTab"]{padding:9px 11px !important;}button[data-baseweb="tab"],button[data-baseweb="tab"] p,button[data-baseweb="tab"] div,button[data-baseweb="tab"] span,button[data-testid="stTab"] p,.stTabs button[role="tab"] p{font-size:1rem !important;}.hb{grid-template-columns:96px 1fr 80px;}.sc .val{font-size:1.7rem;}.hero h1{font-size:1.45rem;}}
 """
 
 def inject_css():
@@ -2506,7 +2510,11 @@ def inject_css():
 
 def inr(x, d=0) -> str:
     try:
-        return f"₹{float(x):,.{d}f}"
+        v = float(x)
+        if not math.isfinite(v):
+            return "₹–"
+        txt = f"₹{abs(v):,.{d}f}"
+        return ("-" + txt) if round(v, d) < 0 else txt
     except Exception:
         return "₹–"
 
@@ -2944,7 +2952,13 @@ with st.sidebar.expander("🩺 System health"):
     if _ib:
         st.write(f"{'🟢' if _ib[1] else '🟠'} Sector labels: {len(_ib[1]):,} shares labelled by NSE" + ("" if _ib[1] else " (not reachable — unknown shares go in 'Other')"))
     jc, hi_ = journal_counts(), st.session_state.get("hydrate_info", {})
-    st.write(f"📒 Journal: {jc['total']} trades — {jc['open']} open, {jc['closed']} finished")
+    st.write(f"📒 Journal: {jc['total']} share trades — {jc['open']} open, {jc['closed']} finished")
+    try:
+        _oj = load_options_journal_df()
+        _oo = int((_oj["status"].apply(classify_outcome) == "ACTIVE").sum()) if not _oj.empty else 0
+        st.write(f"📜 Options: {len(_oj)} ideas — {_oo} open, {len(_oj) - _oo} finished")
+    except Exception:
+        pass
     if supabase:
         st.write(f"☁️ Backup: {hi_.get('remote', 0)} trades online ({hi_.get('remote_active', 0)} open) · restored {hi_.get('restored', 0)} · skipped {hi_.get('bad_rows', 0)}")
     if not st_autorefresh:
@@ -3028,6 +3042,16 @@ active_eq = df_eq[df_eq["status"].apply(classify_outcome) == "ACTIVE"].copy() if
 active_cap = float(active_eq["capital_allocated"].sum()) if not active_eq.empty else 0.0
 open_unreal = float((active_eq["capital_allocated"] * active_eq["pnl_pct"] / 100.0).sum()) if not active_eq.empty else 0.0
 be_prot = int(sum(is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"])) for _, r in active_eq.iterrows())) if not active_eq.empty else 0
+open_unreal_all = open_unreal + opt_open_unreal
+n_open_all = len(active_eq) + len(active_opt)
+
+def open_split_text() -> str:
+    """'3 shares · 1 option' — the same wording wherever open trades are counted."""
+    parts = [f"{len(active_eq)} share{'s' if len(active_eq) != 1 else ''}"]
+    if len(active_opt):
+        parts.append(f"{len(active_opt)} option{'s' if len(active_opt) != 1 else ''}")
+    return " · ".join(parts)
+
 closed_all = load_closed_trades_df()
 todays_df = get_todays_logged_equities()
 cap_state = get_portfolio_capacity()
@@ -3069,15 +3093,17 @@ with hero_box:
         <span class="chip">Last price check {esc(st.session_state.get('last_price_check', '-'))}</span>
       </div>
     </div>"""), unsafe_allow_html=True)
-    n_open_now = len(active_eq)
-    opt_bit = (f" Plus <b>{len(active_opt)} option idea{'s' if len(active_opt) != 1 else ''} running</b> ({inr(opt_open_unreal)}), kept separate."
-               if len(active_opt) else "")
-    if perf["n"]:
-        story = (f"<b>{n_open_now} share trade{'s' if n_open_now != 1 else ''} running</b> ({inr(open_unreal)} so far). "
-                 f"<b>{perf['n']} finished</b>, {perf['wins']} hit their goal, total {inr(perf['net_inr'])} after all costs." + opt_bit)
+    if n_open_all:
+        story = f"<b>{n_open_all} trade{'s' if n_open_all != 1 else ''} running</b> ({open_split_text()}, {inr(open_unreal_all)} so far)."
     else:
-        story = f"<b>{n_open_now} share trade{'s' if n_open_now != 1 else ''} running.</b> Nothing has finished yet, so there are no results to judge." + opt_bit
-    callout("good" if open_unreal > 0 else ("bad" if open_unreal < 0 else "info"), "📍", story)
+        story = "<b>Nothing running right now.</b>"
+    if perf["n"]:
+        story += f" <b>{perf['n']} share trade{'s' if perf['n'] != 1 else ''} finished</b>, {perf['wins']} hit their goal, {inr(perf['net_inr'])} after all costs."
+    else:
+        story += " No share trade has finished yet, so there are no results to judge."
+    if perf_o["n"]:
+        story += f" Options: {perf_o['n']} finished, {inr(perf_o['net_inr'])} (kept separate)."
+    callout("good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else "info"), "📍", story)
     with st.expander("💡 New here? 30-second guide"):
         st.markdown(
             "- This app **pretends to buy** Indian shares, about **₹25,000 each**. It's practice — no real money is used and nothing is sent to a broker.\n"
@@ -3106,7 +3132,7 @@ with tab_board:
 
     hi_ = st.session_state.get("hydrate_info", {})
     if supabase and (hi_.get("remote_active", 0) > len(active_eq) or hi_.get("bad_rows", 0)):
-        callout("warn", "☁️", f"<b>The online backup lists {hi_.get('remote_active', 0)} open trade(s), but {len(active_eq)} show here.</b> "
+        callout("warn", "☁️", f"<b>The online backup lists {hi_.get('remote_active', 0)} open share trade(s), but {len(active_eq)} show here.</b> "
                               f"{hi_.get('bad_rows', 0)} backup row(s) were unreadable ({esc(hi_.get('first_error', '') or 'none')}). Press “Find new picks / refresh” to retry. "
                               "(Trades that already closed here legitimately differ from an older backup.)")
     stats = st.session_state.get("scan_stats", {})
@@ -3155,7 +3181,7 @@ with tab_board:
             empty_box("No open trades.")
         else:
             if len(active_opt):
-                st.caption(f"{len(active_eq)} share trade{'s' if len(active_eq) != 1 else ''} · {len(active_opt)} option idea{'s' if len(active_opt) != 1 else ''} (options are counted separately)")
+                st.caption(f"{open_split_text()} — option results are kept separate (🎲 Options tab)")
             for _, r in (active_eq.sort_values("pnl_pct", ascending=False).head(12).iterrows() if not active_eq.empty else []):
                 st.markdown(mini_trade_html(r["ticker"], get_trade_sector(r["ticker"], r["features_json"]), float(r["entry_price"]), float(r["target_price"]),
                                             float(r["stop_loss"]), float(r["latest_price"]), float(r["pnl_pct"]),
@@ -3237,17 +3263,19 @@ with tab_results:
     n_ = perf["n"]
     if n_ == 0:
         sec_title("📈", "Results")
-        score_cards([("Total profit/loss", "₹0", "no finished trades yet", "", ""), ("Win rate", "–", "needs finished trades", "", ""),
-                     ("Finished trades", "0", "come back soon", "", ""), ("Open right now", str(len(active_eq)), f"{inr(active_cap)} invested (pretend)", "", "")])
-        callout("info", "⏳", "<b>Nothing has finished yet.</b> Once the first trades reach their goal or safety exit, your honest results appear here.")
+        score_cards([("Share profit/loss", "₹0", "no finished share trades yet", "", ""), ("Win rate", "–", "needs finished share trades", "", ""),
+                     ("Finished share trades", "0", (f"+ {len(perf_opt_df)} option idea{'s' if len(perf_opt_df) != 1 else ''} → 🎲 Options tab" if len(perf_opt_df) else "come back soon"), "", ""),
+                     ("Open right now", str(n_open_all), f"{open_split_text()} · {inr(open_unreal_all)} so far", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), "")])
+        callout("info", "⏳", "<b>No share trade has finished yet.</b> Once the first ones reach their goal or safety exit, your honest results appear here."
+                + (" Option results are on the 🎲 Options tab." if len(perf_opt_df) or len(active_opt) else ""))
     else:
         exp_, net = perf["expectancy_pct"], perf["net_inr"]
         sec_title("📈", "Results", "finished share trades, after all costs")
         score_cards([
-            ("Total profit/loss", inr(net), f"{inr(perf['expectancy_inr'])} per trade on average", "good" if net > 0 else ("bad" if net < 0 else ""), "pos" if net > 0 else ("neg" if net < 0 else "")),
+            ("Share profit/loss", inr(net), f"{inr(perf['expectancy_inr'])} per trade on average", "good" if net > 0 else ("bad" if net < 0 else ""), "pos" if net > 0 else ("neg" if net < 0 else "")),
             ("Win rate", f"{perf['target_hit_rate']:.0f}%", f"{perf['wins']} won · {perf['losses']} lost · {perf['be']} saved · {perf['expired']} timed out", "", ""),
-            ("Finished trades", str(n_), f"likely win rate {perf['ci_low']:.0f}–{perf['ci_high']:.0f}%", "", ""),
-            ("Open right now", str(len(active_eq)), f"{inr(open_unreal)} so far · 🛡️ {be_prot} can't lose", "good" if open_unreal > 0 else ("bad" if open_unreal < 0 else ""), ""),
+            ("Finished share trades", str(n_), f"likely win rate {perf['ci_low']:.0f}–{perf['ci_high']:.0f}%" + (f" · + {len(perf_opt_df)} option idea{'s' if len(perf_opt_df) != 1 else ''} → 🎲 Options" if len(perf_opt_df) else ""), "", ""),
+            ("Open right now", str(n_open_all), f"{open_split_text()} · {inr(open_unreal_all)} so far · 🛡️ {be_prot} can't lose", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
         ])
         if n_ < 30:
             callout("warn", "⏳", f"<b>Too early to judge.</b> Only {n_} trades have finished. Results this early can be pure luck.")
