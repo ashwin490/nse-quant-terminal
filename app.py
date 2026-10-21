@@ -65,7 +65,7 @@ MAX_HOLD_CALENDAR_DAYS = 7
 BREAKEVEN_TRIGGER_RATIO = 0.65
 MAX_ACTIVE_PER_SECTOR = 2
 MAX_ACTIVE_OTHER_SECTOR = 4            # shares we couldn't classify share one bigger bucket
-MAX_OPEN_POSITIONS = 10
+MAX_OPEN_POSITIONS = 20
 MAX_OPEN_RISK_INR = 7000.0
 COOLDOWN_CALENDAR_DAYS = 3
 HALF_LIFE_DAYS = 30.0
@@ -3310,7 +3310,9 @@ with tab_results:
         nifty_since = nifty_return_between(nifty_s, first_d, ist_now().date()) if first_d else None
         excess = [float(r["pnl_pct"]) - x for _, r in perf_eq_df.iterrows() for x in [nifty_return_between(nifty_s, r["entry_date"], r["exit_date"])] if x is not None]
         if nifty_since is not None:
-            beat = f" On the same days, your trades beat the market by <b>{np.mean(excess):+.2f}%</b> per trade on average." if excess else ""
+            ex_ = float(np.mean(excess)) if excess else None
+            beat = ("" if ex_ is None else (f" On the same days, your trades <b>beat the market by {ex_:.2f}%</b> per trade on average." if ex_ >= 0
+                                            else f" On the same days, your trades <b>trailed the market by {abs(ex_):.2f}%</b> per trade on average."))
             callout("info", "🇮🇳", f"<b>Compared with the market:</b> the Nifty 50 moved <b>{nifty_since:+.2f}%</b> since your first trade.{beat}")
         with st.expander("🔍 More detail"):
             b1, b2, b3, b4 = st.columns(4)
