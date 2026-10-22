@@ -2319,8 +2319,9 @@ def run_predictions():
 
             target = round(live_price + 1.6 * atr, 2)
             stop = round(live_price - 1.1 * atr, 2)
+            live_price = round(live_price, 2)                      # the price the trade is recorded at
             shares = max(1, int(POSITION_SIZE_INR / live_price))
-            capital = round(shares * live_price, 2)
+            capital = round(shares * live_price, 2)                    # so shares x price always equals money in
             slip = slippage_pct_per_side(avg_turnover)
             friction = compute_costs_pct(capital, slip)
             net_return = round(((target - live_price) / live_price) * 100.0 - friction, 2)
@@ -2394,8 +2395,8 @@ def run_predictions():
         pool = df_sorted[(df_sorted["Safe"] == True) & (df_sorted["Qualified"] == False) & (df_sorted["Loggable"] == True)]
         pool = pool.sort_values(by=["Adjusted Score", "Expected value"], ascending=[False, False])
         for idx, sig in pool.iterrows():
-            if room <= 0 or len(get_todays_logged_equities()) >= MAX_DAILY_EQUITY_TRADES:
-                break
+            if room <= 0 or todays_learning_picks() >= LEARNING_PICKS_PER_DAY or len(get_todays_logged_equities()) >= MAX_DAILY_EQUITY_TRADES:
+                break                                       # re-checked right before buying, in case another open tab just bought one
             d = sig.to_dict()
             d["FeaturesDict"] = dict(d["FeaturesDict"], learning_pick=True)
             if log_equity_signal_safely(d, enforce_sector_cap=True):
@@ -3243,7 +3244,11 @@ with tab_board:
             empty_box(f"All {MAX_DAILY_EQUITY_TRADES} picks for today are used. This stops over-trading.")
         elif picks.empty:
             _ss = st.session_state.get("scan_stats", {}) or {}
-            if _ss.get("learning_mode"):
+            _bought = set(clean_sym_name(t) for t in (todays_df["ticker"].tolist() if not todays_df.empty else []))
+            _conf_bought = [t for t in (df_res[df_res["Qualified"] == True]["Ticker"].tolist() if (not df_res.empty and "Qualified" in df_res.columns) else []) if t in _bought]
+            if _conf_bought:
+                empty_box(f"✅ Bought today: {', '.join(_conf_bought)} — they passed every check and are in Running. No other share passes every check right now.")
+            elif _ss.get("learning_mode"):
                 empty_box(f"No share is expected to make money after costs right now. While the AI is still learning ({_ss.get('decided', 0)} of "
                           f"{MIN_CALIBRATION_SAMPLES} clear results), it buys at most {LEARNING_PICKS_PER_DAY} 🧪 learning pick a day during buying hours so it keeps improving.")
             else:
@@ -3317,8 +3322,8 @@ with tab_board:
                 ("Easy & safe to trade", n_sc),
                 ("Going up (uptrend)", stats.get("uptrend", 0)),
                 ("Not overheated, normal volume", healthy),
-                ("Strong AI score", stats.get("candidates", 0)),
-                ("Finalists, fully checked", stats.get("deep", 0)),
+                ("Scored by the AI", stats.get("candidates", 0)),
+                ("Best scores, fully checked", stats.get("deep", 0)),
                 ("Passed every check", stats.get("qualified", 0)),
             ]), unsafe_allow_html=True)
             st.caption(f"{stats.get('held', 0)} rising shares were left out because you already own them, sold them in the last {COOLDOWN_CALENDAR_DAYS} days, or their sector is full.")
