@@ -60,7 +60,7 @@ LIVE_MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker_live.pkl")
 
 # ---- Portfolio & risk rules ----
 POSITION_SIZE_INR = 25000.0
-MAX_DAILY_EQUITY_TRADES = 5
+MAX_DAILY_EQUITY_TRADES = 20
 MAX_HOLD_CALENDAR_DAYS = 7
 BREAKEVEN_TRIGGER_RATIO = 0.65
 MAX_ACTIVE_PER_SECTOR = 2
