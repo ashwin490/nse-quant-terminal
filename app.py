@@ -66,7 +66,7 @@ BREAKEVEN_TRIGGER_RATIO = 0.65
 MAX_ACTIVE_PER_SECTOR = 2
 MAX_ACTIVE_OTHER_SECTOR = 4            # shares we couldn't classify share one bigger bucket
 MAX_OPEN_POSITIONS = 20
-MAX_OPEN_RISK_INR = 15000.0
+MAX_OPEN_RISK_INR = 30000.0
 COOLDOWN_CALENDAR_DAYS = 3
 HALF_LIFE_DAYS = 30.0
 # ---- Whole-market scan (every NSE share in the EQ series) ----
