@@ -66,6 +66,9 @@ MAX_OPEN_POSITIONS = 10
 MAX_OPEN_RISK_INR = 30000.0
 COOLDOWN_CALENDAR_DAYS = 3
 HALF_LIFE_DAYS = 30.0
+# Baseline from the previously displayed 20 active share records. Not a fabrication of records.
+# Configure HISTORY_EXPECTED_MIN_SHARES=0 only after explicitly accepting a fresh start.
+HISTORY_EXPECTED_MIN_SHARES = 20
 # ---- Whole-market scan (every NSE share in the EQ series) ----
 SCAN_WORKERS = 12                      # parallel price downloads
 SCAN_TIME_BUDGET_SEC = 240             # stop downloading after this long; the rest is checked next time
@@ -590,6 +593,21 @@ def journal_counts() -> dict:
         finally:
             con.close()
 
+def get_history_integrity() -> dict:
+    """Do not mark a newly empty local file as restored, or spend missing paper capital."""
+    try:
+        local_count = journal_counts()["total"]
+    except Exception:
+        local_count = 0
+    cloud_info = st.session_state.get("hydrate_info") or {}
+    return history_state(
+        local_count,
+        HISTORY_EXPECTED_MIN_SHARES,
+        cloud_configured=bool(supabase),
+        cloud_shares=cloud_info.get("remote") if supabase and cloud_info else None,
+        cloud_failed=bool(cloud_info.get("fetch_failed", False)),
+    )
+
 def get_meta(key: str, default=None):
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
@@ -648,6 +666,14 @@ def _secret(name: str, default="") -> str:
         return str(st.secrets.get(name, os.environ.get(name, default)))
     except Exception:
         return str(os.environ.get(name, default))
+
+from history_integrity import history_state
+
+# Streamlit Cloud can override the baseline without committing any credentials.
+try:
+    HISTORY_EXPECTED_MIN_SHARES = max(0, int(_secret("HISTORY_EXPECTED_MIN_SHARES", str(HISTORY_EXPECTED_MIN_SHARES))))
+except ValueError:
+    HISTORY_EXPECTED_MIN_SHARES = 20
 
 def check_password() -> bool:
     if st.session_state.get("password_correct"):
@@ -743,6 +769,8 @@ def fetch_all_supabase_rows(table_name: str) -> list:
     if not supabase:
         return []
     all_rows = []
+    st.session_state.setdefault("supabase_fetch_errors", {})
+    st.session_state["supabase_fetch_errors"].pop(table_name, None)
     chunk_size = 1000
     start = 0
     while True:
@@ -756,6 +784,7 @@ def fetch_all_supabase_rows(table_name: str) -> list:
             start += chunk_size
         except Exception as e:
             record_db_error(f"Paginate {table_name}", e)
+            st.session_state.setdefault("supabase_fetch_errors", {})[table_name] = type(e).__name__
             break
     return all_rows
 
@@ -791,6 +820,7 @@ def hydrate_duckdb_from_supabase():
     ist_now_str = ist_now().strftime('%Y-%m-%d %H:%M:%S')
     eq_data = fetch_all_supabase_rows("predictions")
     opt_data = fetch_all_supabase_rows("options_journal")
+    info["fetch_failed"] = bool(st.session_state.get("supabase_fetch_errors", {}).get("predictions"))
     info["remote"] = len(eq_data or [])
     info["remote_options"] = len(opt_data or [])
     info["remote_active"] = sum(1 for r in (eq_data or []) if _norm_status(r.get("status")) == "ACTIVE" and clean_sym_name(r.get("ticker", "")) and not str(r.get("ticker", "")).endswith(".L"))
@@ -1809,6 +1839,9 @@ def generate_daily_options_alpha() -> dict:
     if saved_option is not None:
         persist_daily_option_to_supabase(saved_option)
         return saved_option
+    if not get_history_integrity()["allow_new_paper_entries"]:
+        st.session_state["opt_note"] = "New paper option ideas are paused until the missing share history is restored."
+        return {}
     reviews = st.session_state.get("option_candidates")
     if not isinstance(reviews,pd.DataFrame) or reviews.empty or not is_entry_window_open():
         return {}
@@ -2258,6 +2291,8 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
 
     if not ticker:
         return fail("Invalid stock")
+    if not get_history_integrity()["allow_new_paper_entries"]:
+        return fail("Historical share records have not been reconciled. New paper entries are paused to avoid exceeding the true portfolio allocation.")
     if not bool(sig.get("Qualified", False)):
         return fail("Unqualified signal cannot be recorded as a research buy")
     if not is_entry_window_open():
@@ -3232,6 +3267,7 @@ with st.sidebar:
         jc = journal_counts()
         st.caption(f"DuckDB schema v{DB_SCHEMA_STATUS.get('version', '?')}")
         st.write(f"📚 Shares saved locally: **{jc['total']:,}**")
+        st.caption(f"Expected historical share baseline: at least {HISTORY_EXPECTED_MIN_SHARES:,} records")
         st.write(f"📚 Options saved locally: **{len(load_options_journal_df()):,}**")
         st.write(f"☁️ Supabase: **{'configured' if supabase else 'not configured'}**")
         hi = st.session_state.get("hydrate_info", {})
@@ -3250,16 +3286,33 @@ if auto_refresh and st_autorefresh:
 st.markdown(ui_hero(now.strftime('%d %b %Y · %H:%M'), market_open), unsafe_allow_html=True)
 cap = get_portfolio_capacity()
 counts = journal_counts()
+integrity = get_history_integrity()
 opt_all = load_options_journal_df()
 opt_open = (opt_all[opt_all["status"].apply(classify_outcome) == "ACTIVE"]
             if not opt_all.empty else pd.DataFrame())
 
 st.markdown(ui_kpis([
     ("Total research budget", "₹10,00,000", "Combined shares and options", "🏦", "lav"),
-    ("Available capacity", inr(cap["remaining_inr"]), "Available for new paper ideas", "✨", "teal"),
+    ("Available capacity", inr(cap["remaining_inr"]) if integrity["verified_count"] else "Unverified",
+     "New paper entries paused until history is restored" if not integrity["verified_count"] else "Available for new paper ideas", "✨", "teal"),
     ("Shares allocated", inr(cap["equity_inr"]), f"{cap['open']} active stock ideas", "📈", ""),
     ("Options allocated", inr(cap["option_inr"]), f"{len(opt_open)} open CE / PE ideas", "🎯", ""),
 ]), unsafe_allow_html=True)
+if not integrity["verified_count"]:
+    st.error(f"🗂️ **Previous paper history is incomplete: {integrity['local']} of at least "
+             f"{integrity['minimum']} expected share records are available locally.** "
+             "The displayed share allocation may be incomplete. "
+             "New automatic paper entries are paused; scans and existing records remain accessible.")
+    st.warning(integrity["reason"] + " Open **History & learning → Recover previous data** or retry the cloud restore below. "
+               "Do not reset the database or model files.")
+    if supabase:
+        if st.button("☁️ Retry restoring earlier shares from Supabase", key="overview_retry_cloud_restore", type="primary"):
+            with st.spinner("Checking your original Supabase paper-history tables..."):
+                hydrate_duckdb_from_supabase()
+            st.rerun()
+    else:
+        st.info("Set SUPABASE_URL and SUPABASE_KEY in **Streamlit Cloud → App settings → Secrets** "
+                "for your **original** Supabase project, or upload a backed-up .duckdb file in History & learning.")
 if not cap["ok"]:
     st.info("ℹ️ " + cap["reason"])
 if DB_SCHEMA_STATUS.get("unpriced_active_shares", 0) or DB_SCHEMA_STATUS.get("unpriced_active_options", 0):
@@ -3278,6 +3331,12 @@ with page_home:
     option_snapshot = st.session_state.get("option_candidates", pd.DataFrame())
     top_shares = select_top_share_ideas(share_snapshot, 3)
     top_options = select_top_option_ideas(option_snapshot, 2)
+    if not market_open:
+        st.caption("🌙 NSE closed: the ideas below are **previous-scan research**, not fresh executable quotes. "
+                   "Revalidate prices and news after the market opens.")
+    if learning["completed"] == 0:
+        st.caption("🧠 No local completed share outcomes are available to verify these displayed scores. "
+                   "The model's estimated percentages should not be treated as proven win probabilities.")
 
     p1, p2 = st.columns([1.2, 1])
     with p1:
@@ -3321,7 +3380,10 @@ with page_home:
                     ("Max risk", inr(r["Maximum premium loss (₹)"]))], str(r.get("Why") or "Contract reviewed")),
                     unsafe_allow_html=True)
         else:
-            st.info("Run the options scan to populate the top CE / PE setups.")
+            if not market_open:
+                st.info("No currently validated CE / PE contracts. NSE is closed, so real bid/ask quotes cannot be refreshed. Review again during market hours.")
+            else:
+                st.info("No validated CE / PE contract from the latest scan. Open Calls & puts to retry; no trade is required.")
 
     d1, d2 = st.columns([1.2, 1])
     with d1:
@@ -3494,6 +3556,9 @@ with page_options:
 
 with page_history:
     st.markdown(ui_intro("History, learning and recovery", "All previous records • no graphs"), unsafe_allow_html=True)
+    if not integrity["verified_count"]:
+        st.warning(f"History check: {integrity['local']} of {integrity['minimum']} previously expected share records are present. "
+                   "Restore the original history before relying on paper-profit totals or retraining.")
     try:
         local_counts = count_history(DB_PATH)
     except Exception as e:

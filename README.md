@@ -166,3 +166,54 @@ git push origin HEAD
 ```
 
 Some DuckDB integration tests may be skipped if DuckDB is not installed in the environment that runs tests. Verify them locally. Also test with copies of your real historical data before publishing.
+
+
+## Version 6 — missing-history safety check (20 Nov 2026)
+
+The previously displayed portfolio contained **20 active NSE share paper records**.
+A later cloud deployment showed **0 active shares / 0 completed outcomes / 1 paper option**.
+This is evidence of a *different or incompletely restored local data snapshot*, not proof
+that those earlier records are permanently lost. **No historic trades are fabricated.**
+
+### What this update does
+
+- Sets `HISTORY_EXPECTED_MIN_SHARES = 20` as a **conservative baseline for this user's
+  existing project**; the test is total stored share records (open and closed), not
+  the number of open positions. Configure `HISTORY_EXPECTED_MIN_SHARES = "0"` in
+  Streamlit Secrets **only after explicitly verifying and accepting a fresh history**.
+- If fewer than 20 historical share records can be found locally, shows a prominent
+  warning and **marks available capital as `Unverified`** rather than showing a
+  potentially unsafe ₹10 lakh balance. New automatic share and option paper entries
+  are paused until the missing records are restored. Existing paper records are
+  preserved and still audited, and research scans remain accessible.
+- Provides a **Retry restoring earlier shares from Supabase** action at the top of
+  the dashboard when `SUPABASE_URL` and `SUPABASE_KEY` are configured.
+- Differentiates Supabase fetch failures from a successfully queried but empty
+  cloud project; the error details can be inspected in Streamlit logs.
+- Clarifies that stock and option research ideas displayed when the NSE is closed
+  are **not fresh or executable quotes**. If option quotes cannot be verified, no
+  contract is promoted merely from modelled theoretical prices.
+
+### To recover the missing 20 shares
+
+1. In Streamlit Cloud app settings → **Secrets**, confirm that `SUPABASE_URL` and
+   `SUPABASE_KEY` belong to the **original** project with your paper trading history.
+   Do not share these credentials in chat or commit `.streamlit/secrets.toml`.
+2. Open the dashboard, use **Retry restoring earlier shares from Supabase**, and
+   inspect **History & learning → Recover previous data**. Compare the local share
+   count with the remote count displayed there. If the cloud project returns zero
+   shares, verify the **original** Supabase project and the `predictions` table.
+3. If a copy of the original `market_data.duckdb` or a dated `.duckdb` backup
+   exists on your Windows laptop, upload it in **History & learning → Recover previous
+   data** and merge. Export a fresh backup after recovery.
+4. If both the original cloud project and all older backups lack those records,
+   the app cannot reconstruct the lost trades or training labels from screenshots.
+
+Your Python source, GitHub repository and Streamlit Cloud deployment do **not**
+automatically include local `.duckdb` files because `.gitignore` excludes them.
+Keeping a Streamlit tab open does not make local storage permanent. Configure a
+persistent cloud source and verify restore/backup counts before relying on automatic
+learning or the ₹10 lakh allocation limit. The original model `.pkl` must also be
+kept separately and backed up; past record recovery does not recreate a lost model.
+
+New pure-Python tests: `tests/test_history_integrity.py`.
