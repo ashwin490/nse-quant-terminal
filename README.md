@@ -1,3 +1,90 @@
+# Version 8 — colourful dashboard + NSE F&O universe parser fix (20 Nov 2026)
+
+This is a **presentation and input-data validation release**, NOT a new AI model and
+NOT a live order-execution system. No trades are removed or reset by this change.
+
+## New colourful design
+
+- **Aurora** (default): purple/teal/gold, **Sunrise**: coral/pink/orange, **Ocean**: blue/aqua/mint.
+  Switch under **Sidebar → Dashboard colours**. No charts.
+- Bold gradient hero, brighter four-colour budget cards, compact pastel-backed
+  recommendations, clear accessible `CONSIDER` / `WATCH` / `AVOID` chips.
+- A visible market-hours warning prevents confusion between historical research
+  prices and fresh executable quotes.
+- Options tab can show up to ten previously recorded option paper ideas even
+  when no fresh chain can be validated. The original option history is retained.
+
+## Fixed the “1 of 1 F&O shares” bug
+
+NSE's lot CSV commonly has **`UNDERLYING,SYMBOL,NOV-26,...`**, in that order.
+The previous parser chose the first matching column: `UNDERLYING`, which
+contains full company names, rather than the `SYMBOL` ticker. This could make
+almost the whole F&O universe fail to match the NSE equity share list.
+
+The new `nse_lot_parser.py` selects the **exact `SYMBOL` column**, correctly
+reads the monthly lot-size columns, and does not invent missing lots. The
+`option_universe_health.py` module flags implausibly small coverage (fewer
+than 50 matching stocks). This is a **sanity threshold**, not the official
+number of F&O listings. A failed download or limited coverage pauses new
+CONSIDER option ratings instead of claiming comprehensive market coverage.
+
+At market close, no live quote is created. Previous paper option ideas are
+shown separately and labelled *historical*, not current buyable contracts.
+
+## Data preservation
+
+Your reported instance previously displayed **106 stock records** (20 open,
+86 completed) and **21 option ideas**. Those numbers came from the screen
+shared on 20 November 2026; they are **not included in this ZIP**. This package
+contains **no DuckDB database, broker account data, or saved model weights**.
+Keep the existing `market_data.duckdb`, `models/` and real secrets unchanged.
+Confirm the database and model still load from their original persistent
+locations, and verify the 106 / 21 records after redeploying.
+
+## Install in the existing GitHub repository
+
+1. Make a backup of the complete project, local database and model directory.
+2. Unzip and **copy the files inside `NSE_Quant_Simple/` into the ROOT of your
+   existing StockPredictorApp repository** (not into a nested subfolder).
+3. Do not overwrite `.streamlit/secrets.toml`, a real `market_data.duckdb`,
+   or any `.pkl` in `models/`.
+4. Run from PowerShell:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+git add app.py dashboard_theme.py nse_lot_parser.py option_universe_health.py dashboard_insights.py history_integrity.py history_recovery.py schema_migrations.py quant_guardrails.py health_check.py requirements.txt README.md tests/ .streamlit/config.toml
+git commit -m "Add colourful NSE dashboard and repair F&O symbol matching"
+git push origin HEAD
+```
+
+When NSE next opens, use **Calls & puts → Analyse options**, then look for
+`Exchange universe health` and the number of F&O underlyings matched. You
+should no longer see an implausible “1 of 1” interpreted as full coverage.
+If NSE is unavailable or refuses access, the app will continue to show no
+current validated options rather than fabricate prices.
+
+## Verification for this release
+
+Python source compiled, and **43 unit-test cases** were discovered: **38
+passed and 5 DuckDB integration tests were skipped** because DuckDB wasn't
+installed in this workspace. The live exchange feed, Supabase, browser UI,
+and entire Streamlit runtime were **not tested** here. Please run the checks
+on your own system before relying on live data. The ten-year unattended service
+and automatic broker execution are **not** implemented by this package.
+
+---
+
+# Dashboard consistency update — v7
+
+This release addresses a contradictory dashboard report: **86 completed share outcomes** alongside **no recent finished ideas**. Those two panels used different SQL queries, and the recent-results query quietly returned an empty table when it failed. Now both use one read-only journal snapshot (`dashboard_insights.py`), with the recent four settled outcomes selected from the same data used for the learning count. A database read failure is reported rather than being mistaken for zero history.
+
+The available-capital label explicitly states that it is **unallocated** rather than immediately usable for new share positions when the current 10-open-share limit has already been reached. Pre-existing positions over that limit are preserved; the app does not infer that any particular row is an imported or legacy trade merely because the count is above 10. The model training threshold remains 100 *eligible* completed records, and historical records counted for display are not automatically considered validated labels.
+
+For an existing deployment, copy **both** `app.py` and `dashboard_insights.py` (plus all prior companion modules and tests) into the original project. Do not replace `market_data.duckdb`, the `models/` directory, or any real secrets. New schema/database migrations are **not** needed for this presentation fix. Unit tests cover the 20 active + 86 settled example, expired/unknown legacy statuses, and empty histories.
+
+---
+
 # NSE AI research terminal — simple, graph-free edition
 
 ## What changed

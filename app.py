@@ -1630,47 +1630,9 @@ def _quote_age_is_valid(chain: dict) -> bool:
 
 
 def parse_nse_lot_file(csv_content: str) -> dict:
-    """Return {symbol:{'NOV-26':lots,...}} from the exchange's month-specific lot file.
-
-    A stale / unparseable CSV intentionally returns {} (never fall back to old hardcoded sizes).
-    """
-    if not csv_content:
-        return {}
-    lines = csv_content.replace("\ufeff", "").splitlines()
-    # Some NSE snapshots start with a title or explanatory rows before their header.
-    start = next((i for i, line in enumerate(lines[:25])
-                  if "," in line and ("SYMBOL" in line.upper() or "UNDERLYING" in line.upper())
-                  and bool(re.search(r"[A-Z]{3}[- /]\d{2,4}",line.upper()))), None)
-    if start is None:
-        return {}
-    df = _read_csv_text("\n".join(lines[start:]))
-    if df.empty:
-        return {}
-    symbol_col = next((c for c in df.columns if c in ("SYMBOL", "UNDERLYING", "UNDERLYING SYMBOL")), None)
-    if symbol_col is None:
-        return {}
-    month_columns = []
-    for col in df.columns:
-        match = re.search(r"([A-Z]{3})[- /](\d{2,4})", str(col).upper())
-        if not match:
-            continue
-        mon, year = match.groups()
-        if mon not in {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"}:
-            continue
-        month_columns.append((col, f"{mon}-{year[-2:]}"))
-    result = {}
-    for _, row in df.iterrows():
-        sym = str(row[symbol_col]).strip().upper()
-        if not _SYM_OK.fullmatch(sym):
-            continue
-        months = {}
-        for col, month_key in month_columns:
-            value = str(row[col]).replace(",", "").strip()
-            if value.isdecimal() and 0 < int(value) <= 100_000:
-                months[month_key] = int(value)
-        if months:
-            result[sym] = months
-    return result
+    """Parse current NSE lot file by exact ticker SYMBOL column, not company name."""
+    from nse_lot_parser import parse_nse_lot_file as parse_official_nse_lots
+    return parse_official_nse_lots(csv_content)
 
 
 def _current_nse_lots() -> dict:
@@ -1715,15 +1677,27 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
     Scan outputs are saved to option_watchlist for long-running audit history.
     """
     now = ist_now()
+    if not is_entry_window_open():
+        st.session_state["option_scan_note"] = (
+            "NSE is outside the verified entry window. New CE/PE ratings are paused until "
+            "a fresh market-hours option chain is available. Your historical options remain below."
+        )
+        return pd.DataFrame()
     lots = _current_nse_lots()
     if not lots:
         st.session_state["option_scan_note"] = "Cannot verify NSE lot sizes; option trade recommendations paused."
         return pd.DataFrame()
     all_eq, _ = get_all_nse_symbols()
-    syms = sorted(set(lots).intersection(all_eq))
-    if not syms:
-        st.session_state["option_scan_note"] = "NSE F&O and equity universes could not be cross-checked."
+    from option_universe_health import validate_fno_universe
+    coverage = validate_fno_universe(lots, all_eq)
+    st.session_state["fno_coverage"] = {k:v for k,v in coverage.items() if k != "matched_symbols"}
+    if not coverage["plausible"]:
+        st.session_state["option_scan_note"] = (
+            "⚠️ Incomplete F&O data: " + coverage["problem"] +
+            " No complete-market option scan or buyable signal is claimed."
+        )
         return pd.DataFrame()
+    syms = coverage["matched_symbols"]
     batch = max(1, min(max_underlyings, len(syms)))
     bucket_count = math.ceil(len(syms)/batch)
     bucket = (now.date().toordinal() + now.hour//2) % bucket_count
@@ -2226,7 +2200,7 @@ def get_portfolio_capacity() -> dict:
         reason = f"{unpriced} open paper position(s) still have missing allocations; review History before adding more"
     elif fresh_slot_limit_reached:
         if legacy_open_excess > 0:
-            reason = (f"{open_count} active share records are loaded, including {legacy_open_excess} legacy restored position(s). "
+            reason = (f"{open_count} active share records are loaded, {legacy_open_excess} above the current fresh-entry limit. "
                       f"Fresh research ideas stay capped at {MAX_OPEN_POSITIONS} until some active positions are reconciled or closed.")
         else:
             reason = f"Fresh share ideas are capped at {MAX_OPEN_POSITIONS} active positions"
@@ -3160,29 +3134,34 @@ def _safe_num_series(s):
 
 
 def summarise_learning_progress() -> dict:
+    """One consistent read for the learning counter and recent finished trades."""
+    from dashboard_insights import summarize_share_journal
+
+    err = None
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            all_shares = con.execute("SELECT status, features_json, date_str FROM trade_journal").df()
-        except Exception:
+            all_shares = con.execute("""SELECT ticker, status, pnl_pct, date_str,
+                                               exit_timestamp, last_audited
+                                        FROM trade_journal""").df()
+        except Exception as e:
+            logging.exception("Failed loading share history for dashboard")
+            err = f"Could not read share history: {type(e).__name__}. See Manage app → Logs."
             all_shares = pd.DataFrame()
         finally:
             con.close()
-    if all_shares.empty:
-        return {"completed":0, "win_rate":None, "latest_retrain":"Not eligible yet", "last_promotion":"None recorded"}
-    completed_mask = all_shares["status"].apply(classify_outcome).isin(["WIN","LOSS","BE","EXPIRED"])
-    completed = int(completed_mask.sum())
-    wins = int((all_shares["status"].apply(classify_outcome) == "WIN").sum())
-    decisive = int(all_shares["status"].apply(classify_outcome).isin(["WIN","LOSS"]).sum())
-    win_rate = (wins / decisive * 100.0) if decisive else None
+    summary = summarize_share_journal(all_shares, recent_limit=4)
     last_state_raw = get_meta("retrain_state", "{}")
     try:
         train_state = json.loads(last_state_raw or "{}")
     except (ValueError, TypeError):
         train_state = {}
     return {
-        "completed": completed,
-        "win_rate": win_rate,
+        "completed": summary["settled"],
+        "win_rate": summary["win_rate"],
+        "decided": summary["decided"],
+        "recent_finished": summary["recent"],
+        "read_error": err,
         "latest_retrain": train_state.get("last_attempt_date", "Not eligible yet"),
         "last_promotion": train_state.get("last_promoted", "None recorded"),
     }
@@ -3223,37 +3202,27 @@ def select_top_option_ideas(df: pd.DataFrame, limit_each: int = 2) -> pd.DataFra
     return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
 
 
-def top_recent_closed(limit: int = 5) -> pd.DataFrame:
-    with DB_LOCK:
-        con = duckdb.connect(DB_PATH, read_only=True)
-        try:
-            df = con.execute("""SELECT COALESCE(exit_timestamp, last_audited, date_str) AS closed_at,
-                                      ticker, status, pnl_pct
-                               FROM trade_journal
-                               WHERE status != 'ACTIVE'
-                               ORDER BY COALESCE(exit_timestamp, last_audited, date_str) DESC NULLS LAST""").df()
-        except Exception:
-            df = pd.DataFrame()
-        finally:
-            con.close()
-    return df.head(limit) if not df.empty else df
 
 # ==============================================================================
 # 14. BRIGHT, INTERACTIVE, GRAPH-FREE DASHBOARD + HISTORY RECOVERY
 # ==============================================================================
-from dashboard_theme import THEME_CSS, hero as ui_hero, kpis as ui_kpis, item_card as ui_card, intro as ui_intro
+from dashboard_theme import theme_css, THEMES, hero as ui_hero, kpis as ui_kpis, item_card as ui_card, intro as ui_intro, status_strip as ui_status_strip
 from history_recovery import merge_history_database, snapshot_database, count_history
 import tempfile
 import logging
 
-st.markdown(f"<style>{THEME_CSS}</style>", unsafe_allow_html=True)
+# The theme selector uses only vetted CSS palettes and never modifies trade data.
+with st.sidebar:
+    theme_name = st.selectbox("🎨 Dashboard colours", THEMES, index=0, key="research_theme",
+        help="Try Aurora (purple/teal), Sunrise (coral/gold), or Ocean (blue/mint). No graphs.")
+st.markdown(f"<style>{theme_css(theme_name)}</style>", unsafe_allow_html=True)
 state = get_market_state()
 market_open = is_nse_market_open()
 now = ist_now()
 
 with st.sidebar:
     st.markdown("### ✨ Your research desk")
-    st.caption("Easy to read • No charts • Decisions explained")
+    st.caption("Colourful cards • No charts • Decisions explained")
     st.markdown("**Paper-trading capital:** ₹10,00,000")
     auto_refresh = st.toggle("Auto-refresh while open", value=True, key="main_autorefresh")
     st.markdown("---")
@@ -3284,6 +3253,10 @@ if auto_refresh and st_autorefresh:
     st_autorefresh(interval=15*60*1000, key="bright_autorefresh")
 
 st.markdown(ui_hero(now.strftime('%d %b %Y · %H:%M'), market_open), unsafe_allow_html=True)
+if not market_open:
+    st.markdown(ui_status_strip("🌙 Market closed · Prices and recommendations are previous-scan research, not executable quotes. Recheck when NSE reopens."), unsafe_allow_html=True)
+else:
+    st.markdown(ui_status_strip("🟢 NSE session open · Signals are research only. Freshness and source checks still apply.", good=True), unsafe_allow_html=True)
 cap = get_portfolio_capacity()
 counts = journal_counts()
 integrity = get_history_integrity()
@@ -3294,9 +3267,11 @@ opt_open = (opt_all[opt_all["status"].apply(classify_outcome) == "ACTIVE"]
 st.markdown(ui_kpis([
     ("Total research budget", "₹10,00,000", "Combined shares and options", "🏦", "lav"),
     ("Available capacity", inr(cap["remaining_inr"]) if integrity["verified_count"] else "Unverified",
-     "New paper entries paused until history is restored" if not integrity["verified_count"] else "Available for new paper ideas", "✨", "teal"),
-    ("Shares allocated", inr(cap["equity_inr"]), f"{cap['open']} active stock ideas", "📈", ""),
-    ("Options allocated", inr(cap["option_inr"]), f"{len(opt_open)} open CE / PE ideas", "🎯", ""),
+     "New paper entries paused until history is restored" if not integrity["verified_count"] else
+     "Unallocated; new share entries paused (position limit)" if cap["fresh_slot_limit_reached"] else
+     "Unallocated paper capital", "✨", "teal"),
+    ("Shares allocated", inr(cap["equity_inr"]), f"{cap['open']} open share records • {cap['effective_limit']} new-position limit", "🏢", "peach"),
+    ("Options allocated", inr(cap["option_inr"]), f"{len(opt_open)} open CE / PE ideas", "🎯", "sky"),
 ]), unsafe_allow_html=True)
 if not integrity["verified_count"]:
     st.error(f"🗂️ **Previous paper history is incomplete: {integrity['local']} of at least "
@@ -3334,14 +3309,16 @@ with page_home:
     if not market_open:
         st.caption("🌙 NSE closed: the ideas below are **previous-scan research**, not fresh executable quotes. "
                    "Revalidate prices and news after the market opens.")
-    if learning["completed"] == 0:
+    if learning["read_error"]:
+        st.error("⚠️ " + learning["read_error"])
+    elif learning["completed"] == 0:
         st.caption("🧠 No local completed share outcomes are available to verify these displayed scores. "
                    "The model's estimated percentages should not be treated as proven win probabilities.")
 
     p1, p2 = st.columns([1.2, 1])
     with p1:
-        legacy_note = (f"<p><b>{cap['legacy_open_excess']} legacy open record(s)</b> are included in the active count. "
-                       "These came from restored history and are preserved; the fresh-idea rule still caps new share ideas at 10.</p>") if cap.get("legacy_open_excess", 0) else ""
+        legacy_note = (f"<p><b>{cap['legacy_open_excess']} open record(s) above the current limit</b> are included in the active count. "
+                       "These are existing records kept intact; the new share-position limit is 10. Their origin cannot be confirmed from the count alone.</p>") if cap.get("legacy_open_excess", 0) else ""
         st.markdown("<div class='panel'><h3>🌱 Where things stand</h3>"
                     f"<p><b>{cap['open']} share records</b> and <b>{len(opt_open)} options</b> are currently being followed. "
                     f"Fresh share idea slots left: <b>{cap.get('fresh_slots_left', 0)}</b> out of <b>{cap.get('effective_limit', MAX_OPEN_POSITIONS)}</b>.</p>"
@@ -3350,11 +3327,14 @@ with page_home:
                     "</div>", unsafe_allow_html=True)
     with p2:
         wr = "Not enough finished results yet" if learning["win_rate"] is None else f"{learning['win_rate']:.1f}% win rate on decided outcomes"
-        st.markdown("<div class='panel'><h3>🧠 AI learning snapshot</h3>"
-                    f"<p><b>{learning['completed']:,}</b> completed share outcomes are available for evaluation.</p>"
-                    f"<p>{wr}</p>"
-                    f"<p>Last retrain attempt: <b>{learning['latest_retrain']}</b><br>"
-                    f"Last promoted model: <b>{learning['last_promotion']}</b></p></div>",
+        progress_note = (f"<p>Recorded outcomes: <b>{learning['completed']:,}</b>. "
+                         f"Minimum retrain threshold: <b>{MIN_SETTLED_TO_RETRAIN}</b> eligible results. "
+                         "Completed outcomes are not automatically valid training examples.</p>")
+        st.markdown("<div class='panel learning'><h3>🧠 AI learning snapshot</h3>"
+                    + progress_note
+                    + f"<p>{wr}</p>"
+                    f"<p>Last retrain attempt: <b>{esc(learning['latest_retrain'])}</b><br>"
+                    f"Last promoted model: <b>{esc(learning['last_promotion'])}</b></p></div>",
                     unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
@@ -3387,21 +3367,23 @@ with page_home:
 
     d1, d2 = st.columns([1.2, 1])
     with d1:
-        st.markdown("<div class='panel'><h3>💡 Simple decision guide</h3>"
+        st.markdown("<div class='panel guide'><h3>💡 Simple decision guide</h3>"
                     "<p>🟢 <b>CONSIDER</b> — research filters passed, not a buy instruction.</p>"
                     "<p>🟡 <b>WATCH</b> — data is uncertain or the setup is incomplete.</p>"
                     "<p>🔴 <b>AVOID</b> — a major check failed or risk is too high.</p>"
                     "<p>CE = call if bullish. PE = put if bearish. A long option can lose its full premium.</p></div>",
                     unsafe_allow_html=True)
     with d2:
-        closed_preview = top_recent_closed(4)
-        if closed_preview.empty:
-            st.markdown("<div class='panel'><h3>📚 Recent finished ideas</h3><p>No finished records yet in this local database.</p></div>", unsafe_allow_html=True)
+        closed_preview = learning["recent_finished"]
+        if learning["read_error"]:
+            st.warning("Recent finished ideas could not be loaded. Check the History tab and application logs.")
+        elif closed_preview.empty:
+            st.markdown("<div class='panel recent'><h3>📚 Recent finished ideas</h3><p>No recorded finished share ideas are available here yet.</p></div>", unsafe_allow_html=True)
         else:
             lines = []
             for _, rr in closed_preview.iterrows():
                 lines.append(f"<p><b>{esc(rr['ticker'])}</b> · {esc(rr['status'])} · {(_num(rr['pnl_pct'])):+.2f}%</p>")
-            st.markdown("<div class='panel'><h3>📚 Recent finished ideas</h3>" + "".join(lines) + "</div>", unsafe_allow_html=True)
+            st.markdown("<div class='panel recent'><h3>📚 Recent finished ideas</h3>" + "".join(lines) + "</div>", unsafe_allow_html=True)
 
     action1, action2 = st.columns(2)
     with action1:
@@ -3549,6 +3531,22 @@ with page_options:
             st.dataframe(filtered[cols], hide_index=True,use_container_width=True)
     else:
         st.info("No live NSE quotes validated during this check. The app will not pretend theoretical option prices are buyable quotes.")
+    coverage = st.session_state.get("fno_coverage")
+    if isinstance(coverage, dict):
+        st.caption(f"Exchange universe health: {coverage.get('matched', 0)} F&O underlyings matched from "
+                   f"{coverage.get('lot_rows', 0)} lot-file entries. This is a sanity check, not proof of a complete scan.")
+        if not coverage.get("plausible"):
+            st.warning("F&O universe coverage is incomplete. Try a fresh exchange download during market hours; "
+                       "do not treat this as 1-of-1 total coverage.")
+    if not opt_all.empty:
+        with st.expander(f"📜 See {len(opt_all)} saved historical option paper ideas (not live buy quotes)"):
+            paper_history = opt_all.sort_values("date_key", ascending=False).head(10)
+            cols = ["date_key", "option_contract", "status", "entry_premium", "pnl_pct"]
+            st.dataframe(paper_history[[c for c in cols if c in paper_history.columns]].rename(columns={
+                "date_key": "Date", "option_contract": "Contract", "status": "Paper status",
+                "entry_premium": "Recorded premium ₹", "pnl_pct": "Paper P/L %"}),
+                hide_index=True, use_container_width=True)
+            st.caption("Historical positions do not constitute fresh CE or PE recommendations.")
     idea = generate_daily_options_alpha()
     if idea:
         st.success(f"📝 Paper idea logged: {idea['option_contract']} · Premium budget {inr(idea['total_capital'])}")
@@ -3566,8 +3564,8 @@ with page_history:
         local_counts = {"trade_journal":0,"daily_options_journal":0,"option_watchlist":0}
     st.markdown(ui_kpis([
         ("Saved stock records", f"{local_counts['trade_journal']:,}", "Includes open and older records", "📚", "lav"),
-        ("Saved option ideas", f"{local_counts['daily_options_journal']:,}", "CE and PE paper history", "📜", ""),
-        ("Option checks stored", f"{local_counts['option_watchlist']:,}", "Includes rejected candidates", "🔎", ""),
+        ("Saved option ideas", f"{local_counts['daily_options_journal']:,}", "CE and PE paper history", "📜", "peach"),
+        ("Option checks stored", f"{local_counts['option_watchlist']:,}", "Includes rejected candidates", "🔎", "sky"),
         ("Cloud history", "Configured" if supabase else "Not linked", "Cloud credentials status", "☁️", "teal" if supabase else ""),
     ]), unsafe_allow_html=True)
     hx1, hx2 = st.columns(2)
