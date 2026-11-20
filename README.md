@@ -88,3 +88,48 @@ The scanner may say `WATCH` or `AVOID` if the official universe is unreachable, 
 ## Verification performed in this workspace
 
 The app and the pure Python risk-control module were syntax-checked, and the guardrail unit tests were run. **A complete live Streamlit session and live NSE/Supabase integration were not tested here** because Streamlit/DuckDB installation and NSE network access were unavailable. Validate all quoted prices, file formats and execution assumptions in a production staging environment before relying on any output.
+
+
+## Database schema v3: fix old DuckDB BinderException automatically
+
+The startup migration (`schema_migrations.py`) reconciles existing tables with the
+expected schema before the dashboard queries them. It creates missing columns such
+as `trade_journal.capital_allocated` and `daily_options_journal.total_capital`,
+converts older numeric text values only when the conversion is valid, restores
+missing allocations from quantity × entry price when possible, adds a version
+record in `system_metadata`, and preserves old journal rows and training features.
+The process is designed to be idempotent and transactional. If an upgrade is
+required, it first checkpoints and copies the existing DuckDB file into `backups/`.
+Do not delete the original database or the `models/` folder.
+
+**Fix the Streamlit Cloud deployment:** Commit **both** `app.py` and
+`schema_migrations.py` along with your existing project files; a deployment with
+only `app.py` cannot run. The app will run the migration at startup without a
+manual SQL command. In PowerShell, from your existing app directory:
+
+```powershell
+# First, copy the updated app.py and schema_migrations.py into this folder.
+git add app.py schema_migrations.py README.md tests/test_schema_migrations.py
+git commit -m "Migrate DuckDB schema safely and keep AI training history"
+git push origin HEAD
+```
+
+**Important:** Do not overwrite a persistent original `market_data.duckdb` with
+an empty one from a ZIP. The migration cannot recover previously lost cloud-local
+history. Streamlit Community Cloud does not guarantee persistence of files
+written to its local disk. For long-term learning and reliable history, configure
+persistent external storage and tested offsite backups; the existing Supabase
+backup integration alone needs monitoring and reconciliation. Local backups in
+this package are useful for an in-place upgrade but are **not** durable cloud
+backups.
+
+Check the schema version in the `🧠 Learning & history` tab or with:
+
+```powershell
+python health_check.py
+python -m unittest discover -s tests -v
+```
+
+The startup reconciler protects the local DuckDB schema only. It does not alter
+the remote Supabase PostgreSQL schema. A separate, reviewed server migration is
+required if you change the Supabase tables.

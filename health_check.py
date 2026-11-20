@@ -26,6 +26,20 @@ def main():
             import duckdb
             con=duckdb.connect(str(DB),read_only=True)
             try:
+                from schema_migrations import SCHEMA_VERSION, TABLE_COLUMNS
+                present = {str(x[0]) for x in con.execute("SHOW TABLES").fetchall()}
+                for tname, defs in TABLE_COLUMNS.items():
+                    if tname not in present:
+                        issues.append(f"Missing table: {tname}")
+                    else:
+                        cols = {r[1] for r in con.execute(f"PRAGMA table_info('{tname}')").fetchall()}
+                        missing = [name for name, _ in defs if name not in cols]
+                        if missing: issues.append(f"{tname} lacks: {', '.join(missing)}")
+                if 'system_metadata' in present:
+                    v = con.execute("SELECT meta_val FROM system_metadata WHERE meta_key='schema_version' LIMIT 1").fetchone()
+                    info['schema_version'] = v[0] if v else None
+                    if str(info['schema_version']) != str(SCHEMA_VERSION):
+                        issues.append(f"Schema version mismatch: expected {SCHEMA_VERSION}")
                 for table in ('trade_journal','daily_options_journal','system_metadata','option_watchlist'):
                     info[table+'_rows']=con.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
                 open_count=con.execute("SELECT count(*) FROM trade_journal WHERE status='ACTIVE'").fetchone()[0]

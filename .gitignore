@@ -1,2 +1,16 @@
-
+# Credentials and local environments
 .streamlit/secrets.toml
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local database copies and paper trading state (Cloud persistence is NOT guaranteed)
+market_data.duckdb
+market_data.duckdb.wal
+backups/*.duckdb
+
+# Local cache state
+nse_all_shares.json
+nse_industries.json

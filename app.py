@@ -52,20 +52,6 @@ if str(ROOT_DIR) not in sys.path:
 # 0. SETTINGS — everything you might ever want to change lives in this block
 # ==============================================================================
 DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
-BACKUP_DIR = ROOT_DIR / "backups"
-
-def backup_existing_journal():
-    """One dated non-overwriting pre-open snapshot; never truncates training history."""
-    if Path(DB_PATH).is_file():
-        try:
-            BACKUP_DIR.mkdir(exist_ok=True)
-            dest = BACKUP_DIR / f"market_data_{datetime.now().strftime('%Y%m%d')}.duckdb"
-            if not dest.exists():
-                shutil.copy2(DB_PATH, dest)
-        except OSError:
-            pass
-
-backup_existing_journal()
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker.pkl")          # your original model: NEVER overwritten
 LIVE_MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker_live.pkl")  # upgraded model (only if it tests better)
 
@@ -576,81 +562,20 @@ def get_nse_industry_map() -> dict:
 # ==============================================================================
 # 1. DATABASE (THREAD-SAFE DUCKDB)
 # ==============================================================================
-def init_duckdb_storage():
-    with DB_LOCK:
-        con = duckdb.connect(DB_PATH, read_only=False)
-        try:
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS trade_journal (
-                    trade_id VARCHAR PRIMARY KEY,
-                    timestamp VARCHAR,
-                    date_str VARCHAR,
-                    ticker VARCHAR,
-                    asset_type VARCHAR DEFAULT 'EQUITY',
-                    entry_price DOUBLE,
-                    target_price DOUBLE,
-                    stop_loss DOUBLE,
-                    shares INTEGER,
-                    capital_allocated DOUBLE,
-                    status VARCHAR DEFAULT 'ACTIVE',
-                    latest_price DOUBLE,
-                    pnl_pct DOUBLE DEFAULT 0.0,
-                    exit_price DOUBLE DEFAULT 0.0,
-                    exit_timestamp VARCHAR,
-                    last_audited VARCHAR,
-                    features_json VARCHAR DEFAULT '{}'
-                )
-            """)
-            try:
-                con.execute("ALTER TABLE trade_journal ADD COLUMN features_json VARCHAR DEFAULT '{}'")
-            except Exception:
-                pass
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS daily_options_journal (
-                    date_key VARCHAR PRIMARY KEY,
-                    timestamp VARCHAR,
-                    share_name VARCHAR,
-                    option_contract VARCHAR,
-                    strike_price DOUBLE,
-                    expiry_days INTEGER,
-                    underlying_spot DOUBLE,
-                    lot_size INTEGER,
-                    entry_premium DOUBLE,
-                    current_option_price DOUBLE,
-                    target_premium DOUBLE,
-                    stop_loss_premium DOUBLE,
-                    total_capital DOUBLE,
-                    ai_confidence DOUBLE,
-                    implied_vol DOUBLE,
-                    status VARCHAR DEFAULT 'ACTIVE',
-                    pnl_pct DOUBLE DEFAULT 0.0,
-                    last_audited VARCHAR
-                )
-            """)
-            con.execute("""CREATE TABLE IF NOT EXISTS option_watchlist (
-                date_key VARCHAR, symbol VARCHAR, side VARCHAR, expiry VARCHAR,
-                strike DOUBLE, spot DOUBLE, bid DOUBLE, ask DOUBLE, lot INTEGER,
-                cost_inr DOUBLE, decision VARCHAR, reason VARCHAR,
-                breakeven_spot DOUBLE, spread_pct DOUBLE, iv_pct DOUBLE,
-                real_vol_pct DOUBLE, ret_5d_pct DOUBLE, checked_at VARCHAR,
-                PRIMARY KEY(date_key, symbol, side, expiry, strike))""")
-            con.execute("""
-                CREATE TABLE IF NOT EXISTS system_metadata (
-                    meta_key VARCHAR PRIMARY KEY,
-                    meta_val VARCHAR
-                )
-            """)
-            # Preserve ALL historical journal rows, including legacy tickers.
-        except Exception:
-            pass
-        for tbl in ("trade_journal", "daily_options_journal"):
-            try:   # any "open" row spelled differently (emoji, lower-case, blank) is normalised to plain ACTIVE
-                con.execute(f"UPDATE {tbl} SET status = 'ACTIVE' WHERE status IS NULL OR (UPPER(status) LIKE '%ACTIVE%' AND status != 'ACTIVE')")
-            except Exception:
-                pass
-        con.close()
+from schema_migrations import ensure_schema, SCHEMA_VERSION
 
-init_duckdb_storage()
+def init_duckdb_storage():
+    """Safely migrate in-place; never silently ignore a failed schema upgrade."""
+    with DB_LOCK:
+        return ensure_schema(DB_PATH, ROOT_DIR / "backups")
+
+try:
+    DB_SCHEMA_STATUS = init_duckdb_storage()
+except Exception:
+    import logging
+    logging.exception("DuckDB schema upgrade failed")
+    st.error("The saved trading database could not be upgraded safely. No trading history was intentionally deleted. Check Streamlit Cloud logs and restore the backed-up database if necessary.")
+    st.stop()
 
 def journal_counts() -> dict:
     """Plain counts straight from the journal (used for the health check)."""
@@ -680,7 +605,7 @@ def set_meta(key: str, val: str):
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=False)
         try:
-            con.execute("INSERT OR REPLACE INTO system_metadata VALUES (?, ?)", [key, str(val)])
+            con.execute("INSERT OR REPLACE INTO system_metadata (meta_key, meta_val) VALUES (?, ?)", [key, str(val)])
         except Exception:
             pass
         finally:
@@ -950,7 +875,10 @@ def hydrate_duckdb_from_supabase():
                     if _num(o.get('entry_premium'), cur_p) <= 0 or not str(o.get('option_contract') or '').strip():
                         raise ValueError(f"option {date_k}: missing contract or price")
                     con.execute("""
-                        INSERT OR REPLACE INTO daily_options_journal 
+                        INSERT OR REPLACE INTO daily_options_journal
+                        (date_key, timestamp, share_name, option_contract, strike_price, expiry_days,
+                         underlying_spot, lot_size, entry_premium, current_option_price, target_premium,
+                         stop_loss_premium, total_capital, ai_confidence, implied_vol, status, pnl_pct, last_audited)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, [date_k, ts_str, str(o.get('share_name') or 'ICICIBANK'), str(o.get('option_contract') or ''), _num(o.get('strike_price')),
                           _int(o.get('expiry_days'), 28), _num(o.get('underlying_spot')), _int(o.get('lot_size'), 700),
@@ -2134,7 +2062,17 @@ def get_portfolio_capacity() -> dict:
             risk += cap * (e - stop) / e
     eq, opt = get_open_exposures()
     remaining = remaining_capital(eq, opt)
-    reason = (f"Maximum {MAX_OPEN_POSITIONS} concurrent share ideas" if len(df) >= MAX_OPEN_POSITIONS else
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            unpriced = int(con.execute("""SELECT COUNT(*) FROM trade_journal WHERE status='ACTIVE'
+                AND (capital_allocated IS NULL OR capital_allocated<=0 OR entry_price IS NULL OR entry_price<=0)""").fetchone()[0])
+            unpriced += int(con.execute("""SELECT COUNT(*) FROM daily_options_journal WHERE status='ACTIVE'
+                AND (total_capital IS NULL OR total_capital<=0)""").fetchone()[0])
+        finally:
+            con.close()
+    reason = (f"{unpriced} old open paper position(s) have unknown allocation; resolve before adding more" if unpriced else
+              f"Maximum {MAX_OPEN_POSITIONS} concurrent share ideas" if len(df) >= MAX_OPEN_POSITIONS else
               f"Open equity stop-risk limit ₹{MAX_OPEN_RISK_INR:,.0f} reached" if risk >= MAX_OPEN_RISK_INR else
               "Combined ₹10 lakh allocation already used" if remaining <= 0 else "")
     return {"open": len(df), "risk_inr": round(risk,2), "equity_inr": round(eq,2),
@@ -3061,13 +2999,18 @@ with st.sidebar:
                     value=DEFAULT_BROKERAGE_PER_ORDER_INR, key="brokerage_inr")
     st.number_input("DP charge per sale (₹)", min_value=0.0, max_value=100.0,
                     value=DEFAULT_DP_CHARGE_INR, key="dp_charge_inr")
-    st.caption("Existing DuckDB, cloud records and AI training samples are kept; dated local backups are created on startup.")
+    st.caption("Existing trading history and training records are retained. A local backup is created before a schema upgrade; cloud-local files are not permanent.")
     auto_refresh = st.toggle("Refresh while dashboard is open", value=True)
     if st.button("Log out"):
         st.session_state["password_correct"] = False
         st.rerun()
     with st.expander("Health and learning"):
         jc = journal_counts()
+        st.write(f"Local database schema: v{DB_SCHEMA_STATUS.get('version', '?')}")
+        if DB_SCHEMA_STATUS.get("changed"):
+            st.caption("Database structure upgraded at startup; previous copy saved locally.")
+        if DB_SCHEMA_STATUS.get("unpriced_active_shares", 0) or DB_SCHEMA_STATUS.get("unpriced_active_options", 0):
+            st.warning("Some legacy open paper positions have unknown prices or allocations. New paper ideas will be paused until reconciled.")
         st.write(f"Historical share journal: {jc['total']} rows ({jc['closed']} finished, {jc['open']} open)")
         try:
             st.write(f"Historical options journal: {len(load_options_journal_df())} rows")
