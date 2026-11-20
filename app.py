@@ -2176,6 +2176,10 @@ def get_portfolio_capacity() -> dict:
             risk += cap * (e - stop) / e
     eq, opt = get_open_exposures()
     remaining = remaining_capital(eq, opt)
+    open_count = len(df)
+    legacy_open_excess = max(0, open_count - MAX_OPEN_POSITIONS)
+    fresh_slot_limit_reached = open_count >= MAX_OPEN_POSITIONS
+    fresh_slots_left = max(0, MAX_OPEN_POSITIONS - min(open_count, MAX_OPEN_POSITIONS))
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
@@ -2185,13 +2189,33 @@ def get_portfolio_capacity() -> dict:
                 AND (total_capital IS NULL OR total_capital<=0)""").fetchone()[0])
         finally:
             con.close()
-    reason = (f"{unpriced} old open paper position(s) have unknown allocation; resolve before adding more" if unpriced else
-              f"Maximum {MAX_OPEN_POSITIONS} concurrent share ideas" if len(df) >= MAX_OPEN_POSITIONS else
-              f"Open equity stop-risk limit ₹{MAX_OPEN_RISK_INR:,.0f} reached" if risk >= MAX_OPEN_RISK_INR else
-              "Combined ₹10 lakh allocation already used" if remaining <= 0 else "")
-    return {"open": len(df), "risk_inr": round(risk,2), "equity_inr": round(eq,2),
-            "option_inr":round(opt,2), "remaining_inr":round(remaining,2),
-            "ok": not reason, "reason": reason}
+    if unpriced:
+        reason = f"{unpriced} open paper position(s) still have missing allocations; review History before adding more"
+    elif fresh_slot_limit_reached:
+        if legacy_open_excess > 0:
+            reason = (f"{open_count} active share records are loaded, including {legacy_open_excess} legacy restored position(s). "
+                      f"Fresh research ideas stay capped at {MAX_OPEN_POSITIONS} until some active positions are reconciled or closed.")
+        else:
+            reason = f"Fresh share ideas are capped at {MAX_OPEN_POSITIONS} active positions"
+    elif risk >= MAX_OPEN_RISK_INR:
+        reason = f"Open equity stop-risk limit {inr(MAX_OPEN_RISK_INR)} reached"
+    elif remaining <= 0:
+        reason = "Combined ₹10 lakh allocation already used"
+    else:
+        reason = ""
+    return {
+        "open": open_count,
+        "risk_inr": round(risk,2),
+        "equity_inr": round(eq,2),
+        "option_inr":round(opt,2),
+        "remaining_inr":round(remaining,2),
+        "ok": not reason,
+        "reason": reason,
+        "fresh_slots_left": fresh_slots_left,
+        "fresh_slot_limit_reached": fresh_slot_limit_reached,
+        "legacy_open_excess": legacy_open_excess,
+        "effective_limit": MAX_OPEN_POSITIONS,
+    }
 
 def get_todays_logged_equities() -> pd.DataFrame:
     today_str = ist_now().strftime('%Y-%m-%d')
@@ -3096,6 +3120,89 @@ def current_streak(perf_df: pd.DataFrame) -> tuple:
             break
     return k, signs[-1]
 
+def _safe_num_series(s):
+    return pd.to_numeric(s, errors="coerce") if s is not None else pd.Series(dtype=float)
+
+
+def summarise_learning_progress() -> dict:
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            all_shares = con.execute("SELECT status, features_json, date_str FROM trade_journal").df()
+        except Exception:
+            all_shares = pd.DataFrame()
+        finally:
+            con.close()
+    if all_shares.empty:
+        return {"completed":0, "win_rate":None, "latest_retrain":"Not eligible yet", "last_promotion":"None recorded"}
+    completed_mask = all_shares["status"].apply(classify_outcome).isin(["WIN","LOSS","BE","EXPIRED"])
+    completed = int(completed_mask.sum())
+    wins = int((all_shares["status"].apply(classify_outcome) == "WIN").sum())
+    decisive = int(all_shares["status"].apply(classify_outcome).isin(["WIN","LOSS"]).sum())
+    win_rate = (wins / decisive * 100.0) if decisive else None
+    last_state_raw = get_meta("retrain_state", "{}")
+    try:
+        train_state = json.loads(last_state_raw or "{}")
+    except (ValueError, TypeError):
+        train_state = {}
+    return {
+        "completed": completed,
+        "win_rate": win_rate,
+        "latest_retrain": train_state.get("last_attempt_date", "Not eligible yet"),
+        "last_promotion": train_state.get("last_promoted", "None recorded"),
+    }
+
+
+def select_top_share_ideas(df: pd.DataFrame, limit: int = 3) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    work["Decision"] = work.apply(lambda r: "CONSIDER" if r.get("Qualified", False)
+        else "AVOID" if "bad news" in str(r.get("Rejection Reason", "")).lower() or "risk" in str(r.get("Rejection Reason", "")).lower()
+        else "WATCH", axis=1)
+    pref = {"CONSIDER": 0, "WATCH": 1, "AVOID": 2}
+    work["_rank_decision"] = work["Decision"].map(pref).fillna(9)
+    work["_rank_score"] = pd.to_numeric(work.get("Adjusted Score"), errors="coerce").fillna(-9999)
+    work["_rank_ev"] = pd.to_numeric(work.get("Expected value"), errors="coerce").fillna(-9999)
+    work = work.sort_values(["_rank_decision", "_rank_score", "_rank_ev"], ascending=[True, False, False])
+    return work.head(limit)
+
+
+def select_top_option_ideas(df: pd.DataFrame, limit_each: int = 2) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    pref = {"CONSIDER": 0, "WATCH": 1, "AVOID": 2}
+    work["_rank_decision"] = work["Decision"].map(pref).fillna(9)
+    work["_rank_oi"] = pd.to_numeric(work.get("Open interest"), errors="coerce").fillna(0)
+    work["_rank_spread"] = pd.to_numeric(work.get("Spread (%)"), errors="coerce").fillna(9999)
+    work["_rank_days"] = pd.to_numeric(work.get("Days left"), errors="coerce").fillna(9999)
+    out = []
+    for side in ["CE", "PE"]:
+        side_df = work[work.get("Type").astype(str) == side].sort_values(
+            ["_rank_decision", "_rank_spread", "_rank_oi", "_rank_days"],
+            ascending=[True, True, False, True]
+        )
+        if not side_df.empty:
+            out.append(side_df.head(limit_each))
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def top_recent_closed(limit: int = 5) -> pd.DataFrame:
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            df = con.execute("""SELECT COALESCE(exit_timestamp, last_audited, date_str) AS closed_at,
+                                      ticker, status, pnl_pct
+                               FROM trade_journal
+                               WHERE status != 'ACTIVE'
+                               ORDER BY COALESCE(exit_timestamp, last_audited, date_str) DESC NULLS LAST""").df()
+        except Exception:
+            df = pd.DataFrame()
+        finally:
+            con.close()
+    return df.head(limit) if not df.empty else df
+
 # ==============================================================================
 # 14. BRIGHT, INTERACTIVE, GRAPH-FREE DASHBOARD + HISTORY RECOVERY
 # ==============================================================================
@@ -3166,21 +3273,93 @@ page_home, page_shares, page_options, page_history = st.tabs([
 
 with page_home:
     st.markdown(ui_intro("Your portfolio at a glance", "Paper portfolio • not actual broker holdings"), unsafe_allow_html=True)
-    x, y = st.columns([1.3, 1])
-    with x:
+    learning = summarise_learning_progress()
+    share_snapshot = st.session_state.get("simple_share_results", pd.DataFrame())
+    option_snapshot = st.session_state.get("option_candidates", pd.DataFrame())
+    top_shares = select_top_share_ideas(share_snapshot, 3)
+    top_options = select_top_option_ideas(option_snapshot, 2)
+
+    p1, p2 = st.columns([1.2, 1])
+    with p1:
+        legacy_note = (f"<p><b>{cap['legacy_open_excess']} legacy open record(s)</b> are included in the active count. "
+                       "These came from restored history and are preserved; the fresh-idea rule still caps new share ideas at 10.</p>") if cap.get("legacy_open_excess", 0) else ""
         st.markdown("<div class='panel'><h3>🌱 Where things stand</h3>"
-                    f"<p><b>{cap['open']} stocks</b> and <b>{len(opt_open)} options</b> are currently being followed. "
-                    "Decisions update only when market data and the app's processes are available.</p>"
-                    f"<p>Estimated stop-risk on shares: <b>{inr(cap['risk_inr'])}</b> "
-                    f"out of {inr(MAX_OPEN_RISK_INR)} planned. Stop exits are not guaranteed.</p></div>",
+                    f"<p><b>{cap['open']} share records</b> and <b>{len(opt_open)} options</b> are currently being followed. "
+                    f"Fresh share idea slots left: <b>{cap.get('fresh_slots_left', 0)}</b> out of <b>{cap.get('effective_limit', MAX_OPEN_POSITIONS)}</b>.</p>"
+                    f"<p>Estimated stop-risk on shares: <b>{inr(cap['risk_inr'])}</b> out of {inr(MAX_OPEN_RISK_INR)} planned. Stop exits are not guaranteed.</p>"
+                    + legacy_note +
+                    "</div>", unsafe_allow_html=True)
+    with p2:
+        wr = "Not enough finished results yet" if learning["win_rate"] is None else f"{learning['win_rate']:.1f}% win rate on decided outcomes"
+        st.markdown("<div class='panel'><h3>🧠 AI learning snapshot</h3>"
+                    f"<p><b>{learning['completed']:,}</b> completed share outcomes are available for evaluation.</p>"
+                    f"<p>{wr}</p>"
+                    f"<p>Last retrain attempt: <b>{learning['latest_retrain']}</b><br>"
+                    f"Last promoted model: <b>{learning['last_promotion']}</b></p></div>",
                     unsafe_allow_html=True)
-    with y:
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(ui_intro("Top stock ideas right now", "Best 3 from the last scan"), unsafe_allow_html=True)
+        if isinstance(top_shares, pd.DataFrame) and not top_shares.empty:
+            for _, r in top_shares.iterrows():
+                reason = str(r.get("Rejection Reason") or "Met model and research checks")
+                st.markdown(ui_card(str(r["Ticker"]), str(r["Decision"]), str(r["Sector"]), [
+                    ("Current share price", inr(r["Price (₹)"],2)),
+                    ("Expected value", f"{_num(r.get('Expected value')):+.2f}%"),
+                    ("Model score", f"{_num(r.get('Adjusted Score')):.1f}")], reason), unsafe_allow_html=True)
+        else:
+            st.info("Run the stock scan to populate the top share ideas.")
+    with c2:
+        st.markdown(ui_intro("Best call & put setups", "Top CE and PE reviews"), unsafe_allow_html=True)
+        if isinstance(top_options, pd.DataFrame) and not top_options.empty:
+            for _, r in top_options.iterrows():
+                name = f"{r['Stock']} · {r['Type']} {'↗' if r['Type']=='CE' else '↘'}"
+                st.markdown(ui_card(name, str(r["Decision"]), f"{r['Expiry']} · strike {inr(r['Strike (₹)'],2)}", [
+                    ("One-lot premium", inr(r["Cost (₹)"])),
+                    ("Break-even", inr(r["Breakeven at expiry (₹)"],2)),
+                    ("Max risk", inr(r["Maximum premium loss (₹)"]))], str(r.get("Why") or "Contract reviewed")),
+                    unsafe_allow_html=True)
+        else:
+            st.info("Run the options scan to populate the top CE / PE setups.")
+
+    d1, d2 = st.columns([1.2, 1])
+    with d1:
         st.markdown("<div class='panel'><h3>💡 Simple decision guide</h3>"
                     "<p>🟢 <b>CONSIDER</b> — research filters passed, not a buy instruction.</p>"
                     "<p>🟡 <b>WATCH</b> — data is uncertain or the setup is incomplete.</p>"
                     "<p>🔴 <b>AVOID</b> — a major check failed or risk is too high.</p>"
                     "<p>CE = call if bullish. PE = put if bearish. A long option can lose its full premium.</p></div>",
                     unsafe_allow_html=True)
+    with d2:
+        closed_preview = top_recent_closed(4)
+        if closed_preview.empty:
+            st.markdown("<div class='panel'><h3>📚 Recent finished ideas</h3><p>No finished records yet in this local database.</p></div>", unsafe_allow_html=True)
+        else:
+            lines = []
+            for _, rr in closed_preview.iterrows():
+                lines.append(f"<p><b>{esc(rr['ticker'])}</b> · {esc(rr['status'])} · {(_num(rr['pnl_pct'])):+.2f}%</p>")
+            st.markdown("<div class='panel'><h3>📚 Recent finished ideas</h3>" + "".join(lines) + "</div>", unsafe_allow_html=True)
+
+    action1, action2 = st.columns(2)
+    with action1:
+        if st.button("🔄 Review open positions now", use_container_width=True, key="review_positions_now"):
+            with st.spinner("Refreshing open share and option records..."):
+                audit_and_reconcile_all_trades()
+            st.success("Open paper positions reviewed.")
+            st.rerun()
+    with action2:
+        if st.button("📥 Refresh both idea lists", use_container_width=True, key="refresh_both_lists"):
+            with st.spinner("Refreshing stock and option research lists..."):
+                audit_and_reconcile_all_trades()
+                st.session_state["simple_share_results"], _ = run_predictions()
+                st.session_state["simple_share_epoch"] = time.time()
+                st.session_state["option_candidates"] = scan_option_candidates()
+                st.session_state["options_epoch"] = time.time()
+                st.session_state["last_update_ist"] = ist_now().strftime('%d %b %H:%M IST')
+            st.success("Stock and option research lists refreshed.")
+            st.rerun()
+
     with st.expander(f"📋 See {cap['open']} active share positions"):
         open_eq = get_active_positions_df()
         if open_eq.empty:
@@ -3230,6 +3409,7 @@ with page_shares:
         st.warning("Only part of the market was scanned this time; results are incomplete.")
     if isinstance(shares, pd.DataFrame) and not shares.empty:
         shares = shares.copy()
+        st.success(f"Showing the latest scan across the eligible NSE share universe. Fresh share idea slots left: {cap.get('fresh_slots_left', 0)} / {cap.get('effective_limit', MAX_OPEN_POSITIONS)}")
         shares["Decision"] = shares.apply(lambda r: "CONSIDER" if r["Qualified"]
             else "AVOID" if "Bad news" in str(r["Rejection Reason"]) or "risk" in str(r["Rejection Reason"]).lower()
             else "WATCH", axis=1)
@@ -3275,6 +3455,7 @@ with page_options:
             st.session_state["last_update_ist"] = ist_now().strftime('%d %b %H:%M IST')
     options = st.session_state.get("option_candidates", pd.DataFrame())
     st.caption(st.session_state.get("option_scan_note", "Option scan not run yet."))
+    st.caption("A CE benefits from bullish movement; a PE benefits from bearish movement. The app prefers contracts with live quotes, tighter spreads and usable open interest.")
     if isinstance(options, pd.DataFrame) and not options.empty:
         a,b = st.columns([1.4,1])
         with a:
@@ -3324,6 +3505,15 @@ with page_history:
         ("Option checks stored", f"{local_counts['option_watchlist']:,}", "Includes rejected candidates", "🔎", ""),
         ("Cloud history", "Configured" if supabase else "Not linked", "Cloud credentials status", "☁️", "teal" if supabase else ""),
     ]), unsafe_allow_html=True)
+    hx1, hx2 = st.columns(2)
+    with hx1:
+        if st.button("🔄 Reconcile all open trades", key="history_reconcile_open", use_container_width=True):
+            with st.spinner("Reviewing all active paper positions..."):
+                audit_and_reconcile_all_trades()
+            st.success("Open positions reconciled.")
+            st.rerun()
+    with hx2:
+        st.caption("Use the recovery tools below if earlier records are missing after deployment or restart.")
     with st.expander("🔁 Recover previous data", expanded=(sum(local_counts.values())==0)):
         st.markdown("**Two safe ways to bring back older records**")
         st.caption("(1) Retry Supabase if this deployment has your existing SUPABASE_URL and SUPABASE_KEY secrets. "
