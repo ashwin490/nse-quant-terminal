@@ -1,157 +1,90 @@
-# ⚡ NSE Quant Terminal: UI & Dashboard Operating Manual
+# NSE AI research terminal — simple, graph-free edition
 
-A comprehensive, plain-language reference guide detailing every metric, widget, toggle, and analytical module displayed across the terminal.
+## What changed
 
----
+- **Combined paper capital ceiling:** ₹10,00,000 (1 million INR) across stocks and **long** options.
+- **Broad NSE shares:** download the official NSE *EQ-series* list, including low- and high-price stocks; apply tradability/turnover, quality, price freshness and diversification checks rather than targeting penny shares. BSE-only listings are **not** included.
+- **Options:** separately evaluate bullish **CE/calls** and bearish **PE/puts** with `CONSIDER`, `WATCH`, and `AVOID`. For each option, show one-lot premium, expiry, strike, break-even price, maximum **premium** loss and an explanation. All additional fields are tucked away.
+- **Authentic contracts:** current NSE F&O lot-size CSV, actual expiry dates from exchange chains and fresh two-sided prices are required for a `CONSIDER` label. The system does not invent option quotes if NSE is down.
+- **Retains existing training history:** reuses the original DuckDB schema, does not drop historical legacy rows, continues the original Supabase hydration, and copies the DuckDB to a dated local backup if the original file exists.
+- **Controlled model upgrades:** when at least 100 finished, labelled equity examples exist, and 25 additional new examples have accumulated, a challenger may be trained and compared with an existing champion on later-period historical observations. It is promoted only if log loss improves by at least 2% *and* AUC does not deteriorate. The initial model is never overwritten; a prior promoted champion is archived before replacement.
+- **Options feedback:** retains all existing historical option paper records, but uses only **live-quoted** completed paper outcomes as directional feedback, not theoretical-price outcomes. It cautions against a direction if at least 12 previous live-quoted paper outcomes are consistently poor. This is not a calibrated option-pricing model.
+- **No graphs, simpler interface:** four tabs; five share ideas and four option ideas at most are shown by default, with detailed ledgers hidden in expanders.
+- **Improved security:** no default username/password, and no `?auth=` URL bypass.
 
-## Table of Contents
-- [1. Top Header & Macro Health Bar](#1-top-header--macro-health-bar)
-- [2. Left Control Sidebar](#2-left-control-sidebar)
-- [3. Tab 1: Live Recommendations & Execution](#3-tab-1-live-recommendations--execution)
-  - [Top 5 Candidate Cards](#top-5-candidate-cards)
-  - [Ranked Execution Matrix](#ranked-execution-matrix)
-  - [Candlestick Inspector & AI Forecast Cone](#candlestick-inspector--ai-forecast-cone)
-- [4. Tab 2: Self-Learning & Mistake Autopsy](#4-tab-2-self-learning--mistake-autopsy)
-- [5. Tab 3: Walk-Forward Backtester](#5-tab-3-walk-forward-backtester)
-- [6. Tab 4: Performance & Audit Ledger](#6-tab-4-performance--audit-ledger)
+## Important limitations
 
----
+**This is a research/paper-trading application, NOT a live brokerage trading bot.** It **does not send buy/sell orders**, hold or transfer real funds, integrate a broker account, or offer an execution guarantee. `CONSIDER` is a research label and is not a guarantee or an instruction to trade. Historical trades are paper assumptions rather than authenticated broker fills. Derivative positions can create **physical delivery obligations at expiry** beyond the premium shown; avoid letting stock options expire in the money without specialist understanding.
 
-## 1. Top Header & Macro Health Bar
+**The original upload contained only `app(2).py`.** It did **not** contain `market_data.duckdb`, the saved model `models/lgbm_stock_ranker.pkl`, any existing Supabase data, or your `core/announcements.py`. Consequently, this package cannot include or reconstruct those prior assets. Do not delete them; copy the updated source files into the **existing** project folder instead, after backing it up. The scanner *pauses* if no trained model exists.
 
-Provides an executive market overview before individual equity setups are evaluated.
+A Streamlit page only auto-refreshes **while a session is open**; this application cannot be trusted to trade, train, or monitor unattended for ten years. Real long-running service would need a separate scheduled background worker (not included), persistent database storage, authenticated broker and approved order-management integration (if desired), stale-feed alerts, periodic exchange/corporate-action reviews, backups, security updates and human oversight. Even then prediction accuracy cannot be guaranteed.
 
-* **Market Regime (`BULLISH_EXPANSION`, `BEARISH_CONTRACTION`, `HIGH_VOLATILITY_EXPANSION`):**
-  * **What it means:** The systemic macro backdrop for the Indian market.
-  * **Real-World Example:** `BULLISH_EXPANSION` indicates sustained index expansion and institutional participation. `BEARISH_CONTRACTION` flags broad market headwinds—taking long breakouts here equates to swimming against an outgoing tide.
-* **Nifty 50 Index (e.g., `₹24,850.50`):**
-  * **What it means:** The consolidated benchmark price of India's 50 largest listed corporations, serving as the system's baseline reference.
-* **Daily Loss Burn & Circuit Breaker (e.g., `₹3,200 Loss | Circuit Active`):**
-  * **What it means:** The portfolio-level emergency circuit breaker. Tracks cumulative intra-day realized and unrealized drawdowns.
-  * **Real-World Example:** If set to a ₹15,000 threshold and three consecutive stops fail for a total loss of ₹15,000, the circuit breaker trips, turns **RED**, and locks execution to protect capital from cascading market corrections.
-* **Engine Heartbeat (e.g., `Every 30s | Self-Correcting Loop Active`):**
-  * **What it means:** Confirms automated system operation. Every cycle interval, the terminal evaluates market data, updates trailing stops, checks target reach, and recalculates rank scores.
+## Install without erasing old data
 
----
+1. Back up the original project directory — particularly `market_data.duckdb`, `models/`, and your real Streamlit secrets.
+2. Copy `app.py`, `quant_guardrails.py`, and `requirements.txt` into that **same existing** directory. Keep the previous `market_data.duckdb`, `models/lgbm_stock_ranker.pkl`, any `models/lgbm_stock_ranker_live.pkl`, and existing optional `core/announcements.py` there.
+3. Install Python 3.10+ and dependencies:
 
-## 2. Left Control Sidebar
+   ```bash
+   python -m pip install -r requirements.txt
+   ```
 
-The primary configuration panel for automated risk and execution constraints.
+4. Put credentials in `.streamlit/secrets.toml` or environment variables. Start from `.streamlit/secrets.toml.example`. Generate a password hash locally:
 
-* **Enable Continuous Loop:**
-  * **What it means:** Master automation toggle. When enabled, the terminal polls incoming ticks and updates metrics without requiring manual browser reloads.
-* **Refresh Interval (`15s`, `30s`, `60s`, `120s`):**
-  * **What it means:** Polling cadence. A setting of `30s` runs candle evaluations and stop adjustments twice per minute.
-* **Target Universe (`Nifty 50` vs. `Nifty 200`):**
-  * **What it means:** Active scanning basket. `Nifty 50` tracks large-cap leaders (e.g., Reliance, TCS, HDFC Bank); `Nifty 200` expands the scan to liquid mid-cap growth equities.
-* **Portfolio Capital (₹) (e.g., `₹5,00,000`):**
-  * **What it means:** Total available liquid equity used by the engine to size entries and calculate capital allocations.
-* **Max Risk / Setup (% Equity) (e.g., `1.5%`):**
-  * **What it means:** Strict risk cap per individual idea.
-  * **Real-World Example:** On ₹5,00,000 capital, a 1.5% ceiling ensures that an invalidation at the stop loss caps the realized loss at ₹7,500.
-* **Position Sizing Engine:**
-  * **Price Slabs (Tiered Shares):** Allocates fixed share tranches based on nominal price (e.g., ₹1–₹2,000 = 5 shares; ₹2,000–₹5,000 = 3 shares; >₹5,000 = 1 share).
-  * **Dynamic Kelly Criterion:** Sizes position exposure proportionally based on the model's calculated statistical edge and historical win-loss distributions.
-* **Broker Routing (`PAPER_SANDBOX`, `ZERODHA`, `DHAN`):**
-  * **What it means:** Destination for order signals. `PAPER_SANDBOX` records orders locally to DuckDB with simulated slippage. `ZERODHA` and `DHAN` route orders to live broker endpoints.
+   ```bash
+   python -c "import hashlib,getpass; print(hashlib.sha256(getpass.getpass('New strong password: ').encode()).hexdigest())"
+   ```
 
----
+   Use the generated value for `AUTH_PASS_HASH` and choose your own `AUTH_USER`. **Do not use a default password or post a secret in chat.** If you previously used the insecure URL credential, remove it from links and rotate the old password.
 
-## 3. Tab 1: Live Recommendations & Execution
+5. Launch the dashboard:
 
-The core tactical dashboard displaying actionable opportunities.
+   ```bash
+   streamlit run app.py
+   ```
 
-### Top 5 Candidate Cards
+6. Run basic health checks and unit tests:
 
-Displays the five highest-scoring setups following macro, event, and sector filtering:
+   ```bash
+   python health_check.py
+   python -m unittest discover -s tests -v
+   ```
 
-* **Ticker & Sector Tag (e.g., `RELIANCE (Energy)`):**
-  * Identifies the symbol and sector classification. An automatic **Sector Cap** prevents portfolio concentration by restricting allocations to a maximum of 2 setups per sector.
-* **Price (₹) / CMP (e.g., `₹2,980.50`):**
-  * The latest market execution price.
-* **ML Probability (e.g., `74.8% Win Prob`):**
-  * Directional win probability generated by the 6-factor LightGBM ranker.
-* **Mistake Penalty (`Clean` vs. `25% Pen.`):**
-  * Real-time suppression indicator. If an incoming setup exhibits technical features similar to past stopped-out setups, the score is penalized to avoid repeating errors.
-* **Buy (Quantity) (e.g., `5 shares`):**
-  * Total shares to purchase based on active sizing rules.
-* **Invest (Capital) (e.g., `₹14,902`):**
-  * Total capital deployed for the trade (`Price × Quantity`).
-* **Target (₹) (e.g., `₹3,043.50`):**
-  * Dynamic exit level for profit capture, placed at $+1.5\text{ ATR}$ above entry.
-* **Stop Loss (₹) (e.g., `₹2,938.50`):**
-  * Invalidation price where the trade is exited to preserve capital, placed at $-1.0\text{ ATR}$ below entry.
-* **⚡ Execute Button:**
-  * One-click execution router that places the order, target, and stop loss with the active broker or paper simulator.
+## Portfolio limits (research allocations)
 
-### Ranked Execution Matrix
+| Limit | Value |
+|---|---:|
+| All open shares + long-option premiums | **₹10,00,000** |
+| Typical single share idea | ₹1,00,000 |
+| Maximum single share allocation | ₹2,00,000 |
+| Maximum paper equity stop-loss exposure across shares | ₹30,000 |
+| Maximum one options lot premium | ₹50,000 |
+| Maximum total active long-option premiums | ₹2,00,000 |
+| Maximum shares open at one time | 10 |
+| Shares added in a day | Up to 10 |
+| Options paper ideas | Up to 1 per market day |
 
-A granular overview of the screened universe:
+Stop-loss limits are **not guaranteed** because of gap moves, slippage, exchange limits or broker execution problems. `₹10,00,000` is a simulated **allocation** ceiling; it does not measure actual broker cash/margin, unfilled orders, brokerage charges, corporate actions or unsettled exposure.
 
-| Column Name | Meaning | Example |
-|---|---|---|
-| **Ticker** | NSE trading symbol | `TCS`, `SBIN`, `TATAMOTORS` |
-| **Price (₹)** | Current traded price | `₹3,850.00` |
-| **ML Probability** | Baseline machine learning confidence score | `68.4%` |
-| **Adjusted Score** | Score adjusted for macro regime, filings, and past error penalties | `61.5` |
-| **Qty to Buy** | Recommended purchase volume | `5 shares` |
-| **Capital (₹)** | Cash allocation requirement | `₹19,250` |
-| **Max Risk (₹)** | Total downside exposure if stop loss is hit | `₹325` |
-| **Filing Status** | Automated NLP classification of exchange corporate filings | `CLEAN`, `CATALYST`, `PENALTY` |
-| **Delivery %** | Percentage of volume marked for physical delivery into Demat accounts | `62%` |
-| **Deliv Shock** | Delivery volume relative to its 20-day rolling baseline | `1.8x` (80% above baseline) |
-| **Target / Stop Loss** | Prescribed exit price levels | Target: `₹3,920` \| Stop: `₹3,800` |
+## Why a stock/option can be excluded
 
-### Candlestick Inspector & AI Forecast Cone
+The scanner may say `WATCH` or `AVOID` if the official universe is unreachable, a current quote is missing, volume/open interest is thin, the option spread is too wide, implied volatility appears excessive, an expiry is too close, there is adverse corporate news, the underlying trend is unconvincing, market stress is elevated, or the ₹10 lakh ceiling would be exceeded. It is better to show no idea than fabricate a high-confidence recommendation.
 
-* **Candlesticks:** Price action history.
-* **Orange Line (EMA 20) & Blue Line (EMA 50):** Trend alignment indicators. An EMA 20 above the EMA 50 indicates an active uptrend.
-* **Green Dashed Line (Upper Target):** The $+1.5\text{ ATR}$ target objective.
-* **Red Dashed Line & Shaded Funnel (Lower Stop Invalidation):** Volatility band for trade invalidation. Price action remaining inside or above the band confirms the structural thesis.
-* **White Dotted Line (Median Drift):** Expected statistical trajectory over the upcoming 5-day window.
+## Data retention and automatic learning
 
----
+- All historical `trade_journal` and `daily_options_journal` records remain in the original DuckDB database.
+- New option reviews go into `option_watchlist`; rejected reviews also remain available for analysis.
+- Learning is conditional on complete outcomes and quality checks. Each trained candidate is compared against the saved champion, and the original model is kept.
+- Inference and learning only run when the application is executing. Maintaining a browser open is **not** a durable, supervised ten-year automation solution.
+- A local daily file backup is not sufficient for disaster recovery. Use encrypted, off-site snapshots and monitor them. On some cloud platforms, local disk is ephemeral: use persistent storage or an appropriate server database.
 
-## 4. Tab 2: Self-Learning & Mistake Autopsy
+## Official references
 
-An automated diagnostic system that conducts post-mortems on stopped-out trades.
+- [NSE individual-security derivatives information](https://www.nseindia.com/products-services/equity-derivatives-individual-securities)
+- [NSE derivative contract information (permitted lot sizes)](https://www.nseindia.com/products-services/equity-derivatives-contract-information)
+- [NSE option chain](https://www.nseindia.com/option-chain)
 
-* **Mistake ID:** Unique identifier for failed trade executions (e.g., `MST_TCS_20260914`).
-* **Primary Failure Factor:** Algorithmic root-cause attribution:
-  * **`MOMENTUM_EXHAUSTION`:** Position entered at overbought levels ($\text{RSI} > 68$), running into profit-taking.
-  * **`SPECULATIVE_FAKEOUT`:** Low delivery shock ($< 1.0\text{x}$), indicating intra-day retail churn without institutional delivery support.
-  * **`MEAN_REVERSION_WHIPSAW`:** Price extended too far beyond the 20-day EMA ($> 4.5\%$), resulting in a mean-reverting pullback.
-  * **`VOLUME_DRYUP`:** Relative volume fell below baseline, causing a loss of upward momentum.
-  * **`MACRO_CHOP`:** Technical setup was valid, but invalidated by broader market volatility or sector-wide weakness.
-* **Explanation:** Plain-language summary detailing why the trade failed.
-* **Penalty Weight:** Loss weight applied during incremental LightGBM retraining to suppress similar patterns in future scans.
+## Verification performed in this workspace
 
----
-
-## 5. Tab 3: Walk-Forward Backtester
-
-A historical simulation engine that tests strategy mechanics against past DuckDB market data.
-
-* **Total Net Return (e.g., `+42.6%`):** Cumulative portfolio return over the backtest period, net of slippage and statutory transaction costs (STT, exchange turnover, stamp duty).
-* **Sharpe Ratio (e.g., `1.85`):** Risk-adjusted return metric relative to strategy volatility:
-  * `< 1.0`: Sub-optimal risk-adjusted profile.
-  * `1.0 – 1.5`: Solid quantitative performance.
-  * `> 1.5`: Institutional-grade consistency.
-* **Max Drawdown (e.g., `-7.2%`):** Maximum peak-to-trough equity decline experienced during the simulation window.
-* **Profit Factor (e.g., `1.72`):** Ratio of gross winning rupee profits to gross losing rupee losses ($\frac{\sum \text{Gains}}{\sum \text{Losses}}$).
-* **High Water Mark (Dotted Curve):** Trailing peak equity line, illustrating portfolio recovery periods and breakouts into new highs.
-
----
-
-## 6. Tab 4: Performance & Audit Ledger
-
-An immutable audit ledger tracking all generated recommendations.
-
-* **Historical Win Rate (e.g., `58.3%`):** Proportion of audited trades reaching target versus hitting stop loss. With an asymmetric 1.5:1 reward-to-risk ratio, win rates above 50% compound capital steadily.
-* **Total Completed Trades:** Total count of closed positions tracked by the auditor.
-* **Wins vs. Losses (e.g., `28W - 20L`):** Absolute count of profitable versus unprofitable setups.
-* **Average PnL / Trade (e.g., `+1.85%`):** Mean percentage return across all closed positions, net of transaction fees.
-* **Stop Stage Tracking:**
-  * **`INITIAL`:** Position open; stop loss remains at the baseline $-1.0\text{ ATR}$ level.
-  * **`BREAKEVEN`:** Price reached $+0.75\text{ ATR}$ profit; stop loss ratcheted to the entry price ($0.0\text{ ATR}$) to eliminate downside risk.
-  * **`PROFIT_TRAIL`:** Price advanced past $+1.2\text{ ATR}$; trailing stop locks in accrued profits dynamically below swing highs.
+The app and the pure Python risk-control module were syntax-checked, and the guardrail unit tests were run. **A complete live Streamlit session and live NSE/Supabase integration were not tested here** because Streamlit/DuckDB installation and NSE network access were unavailable. Validate all quoted prices, file formats and execution assumptions in a production staging environment before relying on any output.

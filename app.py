@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, time as dtime, timedelta
 import random
+import shutil
 import requests
 
 import streamlit as st
@@ -24,13 +25,9 @@ import numpy as np
 import joblib
 import pytz
 import duckdb
-
-try:
-    import plotly.graph_objects as go
-    PLOTLY_OK = True
-except ImportError:
-    go = None
-    PLOTLY_OK = False
+from quant_guardrails import (CAPITAL_LIMIT_INR, EQUITY_TARGET_INR, OPTION_MAX_SINGLE_INR,
+    OPTION_TOTAL_LIMIT_INR, allowable_equity_shares, can_allocate_option,
+    review_long_option, remaining_capital)
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -55,17 +52,31 @@ if str(ROOT_DIR) not in sys.path:
 # 0. SETTINGS — everything you might ever want to change lives in this block
 # ==============================================================================
 DB_PATH = os.path.join(ROOT_DIR, "market_data.duckdb")
+BACKUP_DIR = ROOT_DIR / "backups"
+
+def backup_existing_journal():
+    """One dated non-overwriting pre-open snapshot; never truncates training history."""
+    if Path(DB_PATH).is_file():
+        try:
+            BACKUP_DIR.mkdir(exist_ok=True)
+            dest = BACKUP_DIR / f"market_data_{datetime.now().strftime('%Y%m%d')}.duckdb"
+            if not dest.exists():
+                shutil.copy2(DB_PATH, dest)
+        except OSError:
+            pass
+
+backup_existing_journal()
 MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker.pkl")          # your original model: NEVER overwritten
 LIVE_MODEL_PATH = os.path.join(ROOT_DIR, "models", "lgbm_stock_ranker_live.pkl")  # upgraded model (only if it tests better)
 
 # ---- Portfolio & risk rules ----
-POSITION_SIZE_INR = 25000.0
-MAX_DAILY_EQUITY_TRADES = 20
+POSITION_SIZE_INR = EQUITY_TARGET_INR
+MAX_DAILY_EQUITY_TRADES = 10
 MAX_HOLD_CALENDAR_DAYS = 7
 BREAKEVEN_TRIGGER_RATIO = 0.65
 MAX_ACTIVE_PER_SECTOR = 2
 MAX_ACTIVE_OTHER_SECTOR = 4            # shares we couldn't classify share one bigger bucket
-MAX_OPEN_POSITIONS = 20
+MAX_OPEN_POSITIONS = 10
 MAX_OPEN_RISK_INR = 30000.0
 COOLDOWN_CALENDAR_DAYS = 3
 HALF_LIFE_DAYS = 30.0
@@ -89,11 +100,11 @@ ENTRY_WINDOW_START = dtime(9, 30)
 ENTRY_WINDOW_END = dtime(15, 0)
 MIN_CALIBRATED_CONFIDENCE = 60.0       # (kept for older saved trades; picks are now chosen on expected value — see MIN_EV_PCT)
 MIN_EV_PCT = 0.2                       # a pick must be expected to make at least this much after ALL costs (in % per trade)
-LEARNING_PICKS_PER_DAY = 10             # while still learning, at most this many clearly-marked 🧪 learning picks a day
+LEARNING_PICKS_PER_DAY = 0  # do not paper-buy rejected ideas just to train             # while still learning, at most this many clearly-marked 🧪 learning picks a day
 CAL_PRIOR_TRADES = 20                  # the confidence correction starts near 50% and moves to your real win rate as results arrive
 MIN_RVOL_THRESHOLD = 0.45
 MIN_NET_RETURN_PCT = 1.10
-MIN_PRICE_INR = 10.0
+MIN_PRICE_INR = 0.01  # eligible at any price with liquidity safeguards
 MIN_AVG_TURNOVER_INR = 20_000_000      # ₹2 crore traded per day
 BE_TOLERANCE_PCT = 0.5
 
@@ -108,7 +119,7 @@ DEFAULT_DP_CHARGE_INR = 15.9           # depository charge per sale (varies by b
 DEFAULT_FRICTION_PCT = 0.28            # used for old trades that didn't store their own
 
 # ---- Options (practice) ----
-OPTION_BUDGET_INR = 30000.0
+OPTION_BUDGET_INR = OPTION_MAX_SINGLE_INR
 RISK_FREE_RATE = 0.06
 OPTION_MODEL_HALF_SPREAD = 0.03
 OPTION_MAX_SPREAD_PCT = 15.0
@@ -127,8 +138,8 @@ OPT_MAX_TREND_BAR = 82.0               # the pickiest it can get (trend strength
 STRIKE_STEPS = {"RELIANCE": 20, "HDFCBANK": 10, "ICICIBANK": 10, "INFY": 20, "TCS": 50, "SBIN": 10, "BHARTIARTL": 20, "ITC": 10, "LT": 50}
 
 # ---- AI governance ----
-MIN_SETTLED_TO_RETRAIN = 150
-RETRAIN_STEP_INTERVAL = 50
+MIN_SETTLED_TO_RETRAIN = 100
+RETRAIN_STEP_INTERVAL = 25
 MIN_CALIBRATION_SAMPLES = 80
 CONF_SHRINK = 0.5
 
@@ -616,13 +627,20 @@ def init_duckdb_storage():
                     last_audited VARCHAR
                 )
             """)
+            con.execute("""CREATE TABLE IF NOT EXISTS option_watchlist (
+                date_key VARCHAR, symbol VARCHAR, side VARCHAR, expiry VARCHAR,
+                strike DOUBLE, spot DOUBLE, bid DOUBLE, ask DOUBLE, lot INTEGER,
+                cost_inr DOUBLE, decision VARCHAR, reason VARCHAR,
+                breakeven_spot DOUBLE, spread_pct DOUBLE, iv_pct DOUBLE,
+                real_vol_pct DOUBLE, ret_5d_pct DOUBLE, checked_at VARCHAR,
+                PRIMARY KEY(date_key, symbol, side, expiry, strike))""")
             con.execute("""
                 CREATE TABLE IF NOT EXISTS system_metadata (
                     meta_key VARCHAR PRIMARY KEY,
                     meta_val VARCHAR
                 )
             """)
-            con.execute("DELETE FROM trade_journal WHERE ticker LIKE '%.L'")
+            # Preserve ALL historical journal rows, including legacy tickers.
         except Exception:
             pass
         for tbl in ("trade_journal", "daily_options_journal"):
@@ -700,46 +718,40 @@ FEATURE_COLS = [
 # ==============================================================================
 # 3. HARDENED ZERO-TRUST AUTHENTICATION  (kept exactly as you had it)
 # ==============================================================================
+def _secret(name: str, default="") -> str:
+    try:
+        return str(st.secrets.get(name, os.environ.get(name, default)))
+    except Exception:
+        return str(os.environ.get(name, default))
+
 def check_password() -> bool:
-    if st.query_params.get("auth") == "QuantTerminal2026" or st.session_state.get("password_correct", False):
-        st.session_state["password_correct"] = True
+    if st.session_state.get("password_correct"):
         return True
-
-    now_ts = time.time()
-    lockout_until = st.session_state.get("auth_lockout_until", 0.0)
-    if now_ts < lockout_until:
-        rem_min = int(math.ceil((lockout_until - now_ts) / 60.0))
-        st.error(f"🔒 Terminal Locked due to repeated failed attempts. Try again in {rem_min} minute(s).")
+    expected_user = _secret("AUTH_USER")
+    expected_hash = _secret("AUTH_PASS_HASH")
+    if not expected_user or not expected_hash:
+        st.error("Please set AUTH_USER and AUTH_PASS_HASH in Streamlit secrets before starting.")
         return False
-
-    expected_user = st.secrets.get("AUTH_USER", "admin") if hasattr(st, "secrets") else "admin"
-    default_hash = hashlib.sha256("QuantTerminal2026!".encode("utf-8")).hexdigest()
-    expected_hash = st.secrets.get("AUTH_PASS_HASH", default_hash) if hasattr(st, "secrets") else default_hash
-
-    st.subheader("🔐 Autonomous NSE Quant Terminal — Restricted Institutional Access")
-    with st.form("nse_secure_login_form", clear_on_submit=True):
-        user_in = st.text_input("Operator Username")
-        pass_in = st.text_input("Cryptographic Passkey", type="password")
-        submitted = st.form_submit_button("Authenticate Session", width="stretch", type="primary")
-
-        if submitted:
-            input_hash = hashlib.sha256(pass_in.encode("utf-8")).hexdigest()
-            user_ok = hmac.compare_digest(user_in.strip(), str(expected_user).strip())
-            pass_ok = hmac.compare_digest(input_hash, str(expected_hash).strip().lower())
-
-            if user_ok and pass_ok:
-                st.session_state["password_correct"] = True
-                st.session_state["failed_auth_attempts"] = 0
-                st.query_params["auth"] = "QuantTerminal2026"
-                st.rerun()
-            else:
-                fails = st.session_state.get("failed_auth_attempts", 0) + 1
-                st.session_state["failed_auth_attempts"] = fails
-                if fails >= 5:
-                    st.session_state["auth_lockout_until"] = time.time() + 900
-                    st.error("🔒 Maximum authentication attempts exceeded. Terminal locked for 15 minutes.")
-                else:
-                    st.error(f"😕 Invalid credentials ({5 - fails} attempt(s) remaining before lockout).")
+    if time.time() < st.session_state.get("auth_lockout_until", 0):
+        st.error("Login temporarily locked after repeated attempts.")
+        return False
+    st.title("🔐 NSE Quant Research")
+    with st.form("login"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Sign in")
+    if submit:
+        ok = hmac.compare_digest(username.strip(), expected_user.strip()) and hmac.compare_digest(
+            hashlib.sha256(password.encode()).hexdigest(), expected_hash.strip().lower())
+        if ok:
+            st.session_state["password_correct"] = True
+            st.session_state["failed_auth_attempts"] = 0
+            st.rerun()
+        n = st.session_state.get("failed_auth_attempts", 0) + 1
+        st.session_state["failed_auth_attempts"] = n
+        if n >= 5:
+            st.session_state["auth_lockout_until"] = time.time() + 900
+        st.error("Incorrect credentials")
     return False
 
 if not check_password():
@@ -752,8 +764,7 @@ if not check_password():
 def get_supabase_client():
     if create_client is None:
         return None
-    url = st.secrets.get("SUPABASE_URL") if hasattr(st, "secrets") else None
-    key = st.secrets.get("SUPABASE_KEY") if hasattr(st, "secrets") else None
+    url, key = _secret("SUPABASE_URL"), _secret("SUPABASE_KEY")
     if not url or not key:
         return None
     try:
@@ -1375,7 +1386,16 @@ def check_and_auto_retrain_model(feature_cols: list, closed_df: pd.DataFrame):
             f_l, f_x = fit_pair(X_all, y_all)
             new_bundle = {"lgb": f_l, "xgb": f_x, "type": "ensemble", "feature_cols": feature_cols}
             os.makedirs(os.path.dirname(LIVE_MODEL_PATH), exist_ok=True)
-            joblib.dump(new_bundle, LIVE_MODEL_PATH)
+            # Save a rollback copy of the previous champion before promotion.
+            old = Path(LIVE_MODEL_PATH)
+            if old.exists():
+                archive = ROOT_DIR / "models" / "archive"
+                archive.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                shutil.copy2(old, archive / f"previous_champion_{stamp}.pkl")
+            temp = LIVE_MODEL_PATH + ".tmp"
+            joblib.dump(new_bundle, temp)
+            os.replace(temp, LIVE_MODEL_PATH)
             st.session_state["ml_model_bundle"] = new_bundle
             st.session_state["ml_model_source"] = "Upgraded model"
             state["last_promoted"] = ist_now().strftime("%Y-%m-%d %H:%M")
@@ -1507,137 +1527,285 @@ def upcoming_holidays(n: int = 4) -> list:
     today = ist_now().date().isoformat()
     return [(d, name) for d, name in sorted(get_nse_holidays().items()) if d >= today][:n]
 
-def get_nse_option_quote(symbol: str, expiry_dt: datetime, strike: float):
-    """Real bid/ask for ONE contract (right expiry, right strike) or None if NSE doesn't answer or the quote is poor."""
-    data = _nse_get_json(f"https://www.nseindia.com/api/option-chain-equities?symbol={urllib.parse.quote(clean_sym_name(symbol), safe='')}")
-    if not data:
+def get_nse_option_quote(symbol: str, expiry_dt: datetime, strike: float, side: str = "CE"):
+    """Live CE or PE bid / ask. Unavailable is None; estimates are never tradable."""
+    if side not in ("CE", "PE"):
         return None
-    want = expiry_dt.strftime("%d-%b-%Y")
-    try:
-        for item in (data.get("records") or {}).get("data", []):
-            if str(item.get("expiryDate")) == want and abs(float(item.get("strikePrice", 0)) - float(strike)) < 1e-6:
-                ce = item.get("CE") or {}
-                bid, ask = float(ce.get("bidprice") or 0), float(ce.get("askPrice") or 0)
-                if not (bid > 0 and ask > 0 and ask >= bid):
-                    return None
-                spread = (ask - bid) / ((ask + bid) / 2.0) * 100.0
-                oi = float(ce.get("openInterest") or 0)
-                iv = float(ce.get("impliedVolatility") or 0)
-                return {"bid": bid, "ask": ask, "oi": oi, "iv": iv, "spread_pct": spread}
-    except Exception:
+    data = _nse_get_json("https://www.nseindia.com/api/option-chain-equities?symbol=" +
+                         urllib.parse.quote(clean_sym_name(symbol), safe=""))
+    if not data or not _quote_age_is_valid(data):
         return None
+    expiry_str = expiry_dt.strftime("%d-%b-%Y")
+    for item in (data.get("records") or {}).get("data", []):
+        try:
+            if item.get("expiryDate") != expiry_str or float(item.get("strikePrice", 0)) != float(strike):
+                continue
+            q = item.get(side) or {}
+            bid = _num(q.get("bidprice") or q.get("bidPrice"))
+            ask = _num(q.get("askPrice") or q.get("askprice"))
+            if 0 < bid <= ask:
+                return {"bid":bid, "ask":ask, "oi":_num(q.get("openInterest")),
+                        "iv":_num(q.get("impliedVolatility")),
+                        "spread_pct":round(200*(ask-bid)/(ask+bid),2)}
+        except (ValueError, TypeError):
+            continue
     return None
+
+
+def _quote_age_is_valid(chain: dict) -> bool:
+    timestamp = (chain.get("records") or {}).get("timestamp")
+    if not timestamp:
+        return False
+    try:
+        ts = datetime.strptime(str(timestamp), "%d-%b-%Y %H:%M:%S")
+        age = (ist_now().replace(tzinfo=None) - ts).total_seconds() / 60
+        return -5 <= age <= 15
+    except (ValueError, TypeError):
+        return False
+
+
+def parse_nse_lot_file(csv_content: str) -> dict:
+    """Return {symbol:{'NOV-26':lots,...}} from the exchange's month-specific lot file.
+
+    A stale / unparseable CSV intentionally returns {} (never fall back to old hardcoded sizes).
+    """
+    if not csv_content:
+        return {}
+    lines = csv_content.replace("\ufeff", "").splitlines()
+    # Some NSE snapshots start with a title or explanatory rows before their header.
+    start = next((i for i, line in enumerate(lines[:25])
+                  if "," in line and ("SYMBOL" in line.upper() or "UNDERLYING" in line.upper())
+                  and bool(re.search(r"[A-Z]{3}[- /]\d{2,4}",line.upper()))), None)
+    if start is None:
+        return {}
+    df = _read_csv_text("\n".join(lines[start:]))
+    if df.empty:
+        return {}
+    symbol_col = next((c for c in df.columns if c in ("SYMBOL", "UNDERLYING", "UNDERLYING SYMBOL")), None)
+    if symbol_col is None:
+        return {}
+    month_columns = []
+    for col in df.columns:
+        match = re.search(r"([A-Z]{3})[- /](\d{2,4})", str(col).upper())
+        if not match:
+            continue
+        mon, year = match.groups()
+        if mon not in {"JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"}:
+            continue
+        month_columns.append((col, f"{mon}-{year[-2:]}"))
+    result = {}
+    for _, row in df.iterrows():
+        sym = str(row[symbol_col]).strip().upper()
+        if not _SYM_OK.fullmatch(sym):
+            continue
+        months = {}
+        for col, month_key in month_columns:
+            value = str(row[col]).replace(",", "").strip()
+            if value.isdecimal() and 0 < int(value) <= 100_000:
+                months[month_key] = int(value)
+        if months:
+            result[sym] = months
+    return result
+
+
+def _current_nse_lots() -> dict:
+    """Current NSE month-specific F&O lot sizes (no guessed values)."""
+    box = get_nse_http_box()
+    now = time.time()
+    cached = box.get("fo_lots")
+    if cached and now-cached[0] < (21600 if cached[1] else 900):
+        return cached[1]
+    content = _http_text("https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv", timeout=10)
+    lots = parse_nse_lot_file(content)
+    box["fo_lots"] = (now, lots)
+    return lots
+
+def option_paper_feedback() -> dict:
+    """Directional outcome evidence from old *live-quoted* paper options.
+
+    Synthetic model-priced outcomes remain in the database but must not train buy ratings.
+    The result is deliberately a small caution gate, NOT a calibrated forecast.
+    """
+    d = load_options_journal_df()
+    if d.empty:
+        return {}
+    d = d[(d["status"].apply(classify_outcome) != "ACTIVE") &
+          d["option_contract"].apply(is_live_option)].copy()
+    if d.empty:
+        return {}
+    d["side"] = d["option_contract"].apply(lambda x: "PE" if re.search(r"\bPE\b",str(x)) else "CE")
+    # Outcomes marked win/loss only: do not treat unclassified or still-open as training evidence.
+    d = d[d["status"].apply(classify_outcome).isin(("WIN", "LOSS", "EXPIRED"))]
+    d["pnl_pct"] = pd.to_numeric(d["pnl_pct"],errors="coerce")
+    d = d[np.isfinite(d["pnl_pct"]) & (d["pnl_pct"] > -101) & (d["pnl_pct"] < 1000)]
+    return {side:{"n":int(len(g)),"mean":float(g["pnl_pct"].mean()),
+                  "profitable":float((g["pnl_pct"] > 0).mean())}
+            for side,g in d.groupby("side")}
+
+
+def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
+    """Rotate through the NSE F&O universe in batches; analyse BOTH CE and PE.
+
+    Current real quote and confirmed actual NSE lot size are necessary for CONSIDER.
+    Scan outputs are saved to option_watchlist for long-running audit history.
+    """
+    now = ist_now()
+    lots = _current_nse_lots()
+    if not lots:
+        st.session_state["option_scan_note"] = "Cannot verify NSE lot sizes; option trade recommendations paused."
+        return pd.DataFrame()
+    all_eq, _ = get_all_nse_symbols()
+    syms = sorted(set(lots).intersection(all_eq))
+    if not syms:
+        st.session_state["option_scan_note"] = "NSE F&O and equity universes could not be cross-checked."
+        return pd.DataFrame()
+    batch = max(1, min(max_underlyings, len(syms)))
+    bucket_count = math.ceil(len(syms)/batch)
+    bucket = (now.date().toordinal() + now.hour//2) % bucket_count
+    selected = syms[bucket*batch:(bucket+1)*batch]
+    prefetch_histories([t+".NS" for t in selected], "3mo", workers=6, ttl=SWEEP_TTL_SEC, time_budget=70)
+    eq_used, opt_used = get_open_exposures()
+    reviews = []
+    feedback = option_paper_feedback()
+    for name in selected:
+        h = get_history_fast(name+".NS", "3mo")
+        if h.empty or len(h)<35:
+            continue
+        c = h["Close"].astype(float)
+        spot = float(c.iloc[-1])
+        if not math.isfinite(spot) or spot <= 0:
+            continue
+        change5 = (spot/float(c.iloc[-6])-1)*100
+        log_returns = np.log(c/c.shift(1)).dropna().tail(20)
+        rv = float(log_returns.std()*np.sqrt(252)*100) if len(log_returns)>=15 else 0
+        diff = c.diff().tail(14)
+        up = float(diff.clip(lower=0).mean())
+        down = float((-diff.clip(upper=0)).mean())
+        rsi = 100-100/(1+up/max(1e-6, down))
+        if abs(change5)<0.6:
+            continue
+        chain = _nse_get_json("https://www.nseindia.com/api/option-chain-equities?symbol=" + urllib.parse.quote(name,safe=""))
+        if not isinstance(chain,dict):
+            continue
+        quote_fresh = is_entry_window_open() and _quote_age_is_valid(chain)
+        try:
+            dates = [(datetime.strptime(x,"%d-%b-%Y"),x) for x in (chain.get("records") or {}).get("expiryDates", [])]
+        except (TypeError,ValueError):
+            continue
+        valid_dates = [(d,label) for d,label in dates if 8 <= (d.date()-now.date()).days <= 65]
+        if not valid_dates:
+            continue
+        expiry, expiry_label = min(valid_dates,key=lambda x:x[0])
+        days_left = (expiry.date()-now.date()).days
+        series = [r for r in (chain.get("records") or {}).get("data",[]) if r.get("expiryDate")==expiry_label]
+        blocked = evaluate_nse_filing_nlp(name).get("is_blocked",False)
+        for side in ("CE", "PE"):
+            contracts = [x for x in series if isinstance(x.get(side),dict) and _num(x.get("strikePrice"))>0]
+            if not contracts:
+                continue
+            aim = spot * (1.01 if side=="CE" else 0.99)
+            contract = min(contracts,key=lambda x:abs(float(x["strikePrice"])-aim))
+            strike = float(contract["strikePrice"])
+            data = contract[side]
+            bid = _num(data.get("bidprice") or data.get("bidPrice"))
+            ask = _num(data.get("askPrice") or data.get("askprice"))
+            oi = _num(data.get("openInterest"))
+            iv = _num(data.get("impliedVolatility"))
+            expiry_month = expiry.strftime("%b-%y").upper()
+            lot = int(lots[name].get(expiry_month, 0))
+            if lot <= 0:
+                continue  # never substitute a different expiry's contract size
+            result = review_long_option(kind=side,spot=spot,strike=strike,bid=bid,ask=ask,
+                lot_size=lot,days_left=days_left,open_interest=oi,iv_pct=iv,realized_vol_pct=rv,
+                ret_5d_pct=change5,rsi=rsi,recent_filing_risk=blocked,
+                equity_exposure=eq_used,option_exposure=opt_used,quote_fresh=quote_fresh)
+            decision, why = result.decision, result.reason
+            history = feedback.get(side, {})
+            # Only real-quoted paper samples, enough observations, and clear persistent losses.
+            # Pause new optimistic labels; retained data and rules are not erased.
+            if decision == "CONSIDER" and history.get("n",0) >= 12 and history["mean"] < -10 and history["profitable"] < 0.45:
+                decision = "WATCH"
+                why = (f"Historical live-quote {side} paper ideas have averaged {history['mean']:+.1f}% "
+                       f"over {history['n']} finished samples; require better validation")
+            score = (100 if decision=="CONSIDER" else 50 if decision=="WATCH" else 0) + abs(change5)-result.spread_pct/3
+            reviews.append({"Stock":name,"Type":side,"Direction":"Up" if side=="CE" else "Down",
+                "Decision":decision,"Why":why,"Expiry":expiry.strftime('%d %b %Y'),
+                "Days left":days_left,"Strike (₹)":strike,"Share price (₹)":round(spot,2),
+                "Buy premium (₹)":ask,"Sell premium (₹)":bid,"Lot":lot,"Cost (₹)":result.cost_inr,
+                "Maximum premium loss (₹)":result.max_loss_inr,"Breakeven at expiry (₹)":result.breakeven_spot,
+                "Spread (%)":result.spread_pct,"Open interest":int(oi),"IV (%)":iv,
+                "Historical volatility (%)":round(rv,1),"5-day share move (%)":round(change5,2),
+                "Score":round(score,2),"Fresh quote":quote_fresh,
+                "Checked at":now.strftime('%Y-%m-%d %H:%M:%S')})
+    df = pd.DataFrame(reviews)
+    if not df.empty:
+        df = df.sort_values(["Score","Open interest"],ascending=[False,False]).reset_index(drop=True)
+        with DB_LOCK:
+            con=duckdb.connect(DB_PATH,read_only=False)
+            try:
+                for _,r in df.iterrows():
+                    con.execute("""INSERT OR REPLACE INTO option_watchlist
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",[
+                        now.date().isoformat(),r["Stock"],r["Type"],r["Expiry"],r["Strike (₹)"],
+                        r["Share price (₹)"],r["Sell premium (₹)"],r["Buy premium (₹)"],
+                        r["Lot"],r["Cost (₹)"],r["Decision"],r["Why"],r["Breakeven at expiry (₹)"],
+                        r["Spread (%)"],r["IV (%)"],r["Historical volatility (%)"],
+                        r["5-day share move (%)"],r["Checked at"]])
+            finally:
+                con.close()
+    st.session_state["option_scan_note"] = f"Reviewed {len(selected)} of {len(syms)} exchange-listed F&O shares in this rotating batch."
+    return df
+
+
+def generate_daily_options_alpha() -> dict:
+    """One highest-scored *paper* CE or PE per market day; no broker integration."""
+    date_key = ist_now().strftime('%Y-%m-%d')
+    with DB_LOCK:
+        con=duckdb.connect(DB_PATH,read_only=True)
+        try:
+            old=con.execute("SELECT * FROM daily_options_journal WHERE date_key=?",[date_key]).df()
+            if not old.empty:
+                return old.iloc[0].to_dict()
+        finally:
+            con.close()
+    reviews = st.session_state.get("option_candidates")
+    if not isinstance(reviews,pd.DataFrame) or reviews.empty or not is_entry_window_open():
+        return {}
+    choices = reviews[(reviews["Decision"]=="CONSIDER") & (reviews["Fresh quote"]==True)]
+    if choices.empty:
+        return {}
+    best=choices.iloc[0]
+    eq_used,opt_used=get_open_exposures()
+    if not can_allocate_option(float(best["Cost (₹)"]),eq_used,opt_used):
+        return {}
+    now=ist_now(); expiry=datetime.strptime(best["Expiry"],'%d %b %Y')
+    sig={"date_key":date_key,"timestamp":now.strftime('%Y-%m-%d %H:%M:%S'),
+        "share_name":best["Stock"],"option_contract":f"{best['Stock']} {expiry.strftime('%d %b %Y').upper()} {best['Strike (₹)']:g} {best['Type']} (live quote)",
+        "strike_price":float(best["Strike (₹)"]),"expiry_days":int(best["Days left"]),
+        "underlying_spot":float(best["Share price (₹)"]),"lot_size":int(best["Lot"]),
+        "entry_premium":float(best["Buy premium (₹)"]),"current_option_price":float(best["Sell premium (₹)"]),
+        "target_premium":round(float(best["Buy premium (₹)"])*OPTION_TARGET_MULT,2),
+        "stop_loss_premium":round(float(best["Buy premium (₹)"])*OPTION_STOP_MULT,2),
+        "total_capital":float(best["Cost (₹)"]),"ai_confidence":round(min(100.0,float(best["Score"])),1),
+        "implied_vol":float(best["IV (%)"]),"status":"ACTIVE",
+        "pnl_pct":round(100*(float(best["Sell premium (₹)"])/float(best["Buy premium (₹)"])-1),2),
+        "last_audited":now.strftime('%Y-%m-%d %H:%M:%S')}
+    with DB_LOCK:
+        con=duckdb.connect(DB_PATH,read_only=False)
+        try:
+            # avoid a concurrent duplicate paper entry; database enforces date_key uniqueness
+            con.execute("""INSERT INTO daily_options_journal
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVE',?,?) ON CONFLICT(date_key) DO NOTHING""",
+                [sig[k] for k in ("date_key","timestamp","share_name","option_contract","strike_price",
+                 "expiry_days","underlying_spot","lot_size","entry_premium","current_option_price",
+                 "target_premium","stop_loss_premium","total_capital","ai_confidence","implied_vol",
+                 "pnl_pct","last_audited")])
+        finally:
+            con.close()
+    return sig
 
 def is_live_option(contract) -> bool:
     return "(live quote)" in str(contract)
-
-def generate_daily_options_alpha() -> dict:
-    now_ist = ist_now()
-    today_str = now_ist.strftime('%Y-%m-%d')
-    now_str = now_ist.strftime('%Y-%m-%d %H:%M:%S')
-    st.session_state["opt_note"] = ""
-
-    with DB_LOCK:
-        con = duckdb.connect(DB_PATH, read_only=True)
-        try:
-            df = con.execute("SELECT * FROM daily_options_journal WHERE date_key = ?", [today_str]).df()
-            if not df.empty:
-                return df.iloc[0].to_dict()
-            active_opt_shares = set(con.execute("SELECT DISTINCT share_name FROM daily_options_journal WHERE status = 'ACTIVE'").df()["share_name"].tolist())
-        except Exception:
-            active_opt_shares = set()
-        finally:
-            con.close()
-
-    if not is_entry_window_open():
-        st.session_state["opt_note"] = "The options idea appears during market hours (09:30–15:00 IST, Mon–Fri), so it uses a real price."
-        return {}
-
-    cooldown_set = get_recent_cooldown_tickers()
-    learn = options_learning()
-    skipped = {"rest": 0, "bar": 0, "live_only": 0}
-    prefetch_histories(FNO_STOCKS, "1mo")
-    ranked = []
-    for sym in FNO_STOCKS:
-        clean_name = clean_sym_name(sym)
-        if clean_name in active_opt_shares or clean_name in cooldown_set:
-            continue
-        if clean_name in learn["rest"]:
-            skipped["rest"] += 1                                # the options learner is resting this share
-            continue
-        if evaluate_nse_filing_nlp(clean_name).get("is_blocked", False):
-            continue
-        h = get_history_fast(sym, "1mo")
-        if h.empty or len(h) < 15 or _bar_dates(h)[-1] != now_ist.date():
-            continue
-        spot = float(h["Close"].iloc[-1])
-        ret_5d = spot / float(h["Close"].iloc[-5]) - 1.0
-        rets = np.log(h["Close"] / h["Close"].shift(1)).dropna()
-        sigma = max(0.14, min(0.45, float(rets.std() * np.sqrt(252)))) if len(rets) > 2 else 0.25
-        ranked.append((ret_5d, clean_name, spot, sigma))
-    ranked.sort(reverse=True)
-
-    expiry_dt, days_to_expiry = get_nse_monthly_expiry(now_ist)
-    for ret_5d, name, spot, sigma in ranked:
-        score = round(min(92.0, max(60.0, 70.0 + ret_5d * 150.0)), 1)
-        if score < learn["bar"]:
-            skipped["bar"] += 1                                 # not a strong enough climb for the learner's current bar
-            continue
-        lot = LOT_SIZES.get(name, 500)
-        step = STRIKE_STEPS.get(name, 10)
-        strike = max(step, math.ceil((spot * 1.02) / step) * step)
-        quote = get_nse_option_quote(name, expiry_dt, strike)
-        if quote and quote["spread_pct"] <= OPTION_MAX_SPREAD_PCT and quote["oi"] >= OPTION_MIN_OPEN_INTEREST:
-            entry, mark, iv_pct, live = quote["ask"], quote["bid"], (quote["iv"] if quote["iv"] > 0 else sigma * 100.0), True
-        else:
-            entry = model_option_price(spot, strike, days_to_expiry, sigma, "ask")
-            mark = model_option_price(spot, strike, days_to_expiry, sigma, "bid")
-            iv_pct, live = sigma * 100.0, False
-        if learn["live_only"] and not live:
-            skipped["live_only"] += 1                           # the learner only trusts real NSE quotes right now
-            continue
-        total_cap = round(entry * lot, 2)
-        if total_cap > OPTION_BUDGET_INR:
-            continue
-        label = f"{name} {expiry_dt.strftime('%d %b %Y').upper()} {int(strike)} CE ({'live quote' if live else 'model price'})"
-        sig = {
-            "date_key": today_str, "timestamp": now_str, "share_name": name, "option_contract": label,
-            "strike_price": float(strike), "expiry_days": int(days_to_expiry), "underlying_spot": float(spot), "lot_size": int(lot),
-            "entry_premium": float(entry), "current_option_price": float(mark),
-            "target_premium": round(entry * OPTION_TARGET_MULT, 2), "stop_loss_premium": round(entry * OPTION_STOP_MULT, 2),
-            "total_capital": float(total_cap), "ai_confidence": score, "implied_vol": round(float(iv_pct), 1),
-            "status": "ACTIVE", "pnl_pct": round((mark - entry) / entry * 100.0, 2), "last_audited": now_str
-        }
-        with DB_LOCK:
-            con = duckdb.connect(DB_PATH, read_only=False)
-            try:
-                con.execute("""
-                    INSERT OR REPLACE INTO daily_options_journal 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
-                """, [sig[k] for k in ["date_key", "timestamp", "share_name", "option_contract", "strike_price", "expiry_days", "underlying_spot",
-                                       "lot_size", "entry_premium", "current_option_price", "target_premium", "stop_loss_premium", "total_capital",
-                                       "ai_confidence", "implied_vol", "pnl_pct", "last_audited"]])
-            finally:
-                con.close()
-        if supabase:
-            try:
-                c_check = supabase.table("options_journal").select("date_key").eq("date_key", today_str).execute()
-                if not c_check.data:
-                    supabase.table("options_journal").insert(sig).execute()
-            except Exception as e:
-                record_db_error("Insert Option", e)
-        return sig
-
-    why = []
-    if skipped["rest"]:
-        why.append(f"{skipped['rest']} share(s) are resting after a recent option loss")
-    if skipped["bar"]:
-        why.append(f"{skipped['bar']} didn't climb enough for the learner's current bar (trend strength {learn['bar']:.0f}+)")
-    if skipped["live_only"]:
-        why.append(f"{skipped['live_only']} had only an estimated price, and the learner currently wants a real NSE quote")
-    st.session_state["opt_note"] = ("No option idea today — the options learner is being picky: " + "; ".join(why) + ". Doing nothing is a valid choice."
-                                    if why else f"No option idea today: none of the F&O shares had a recent live price with a contract under ₹{OPTION_BUDGET_INR:,.0f}.")
-    return {}
 
 def audit_option(opt, now_str: str, today_date):
     """Live-quote options are re-quoted on NSE; model-price options are re-priced with the SAME volatility they started with."""
@@ -1652,6 +1820,7 @@ def audit_option(opt, now_str: str, today_date):
     elapsed = max(0, (today_date - opt_dt).days)
     last_price = float(opt["current_option_price"])
     live_src = is_live_option(opt["option_contract"])
+    kind = "PE" if re.search(r"\bPE\b", str(opt["option_contract"])) else "CE"
 
     h = fetch_cached_history(f"{name}.NS", period="1mo", interval="1d")
     if h.empty:
@@ -1667,7 +1836,7 @@ def audit_option(opt, now_str: str, today_date):
 
     if live_src:
         if is_nse_market_open():
-            q = get_nse_option_quote(name, expiry_dt, strike)
+            q = get_nse_option_quote(name, expiry_dt, strike, kind)
             if q:
                 live = q["bid"]
                 if live >= target_prem:
@@ -1695,7 +1864,8 @@ def audit_option(opt, now_str: str, today_date):
 
     if status == "ACTIVE" and today_date >= expiry_dt.date():
         status = "⏱️ EXPIRED (TIME EXIT)"
-        live = max(0.0, float(h["Close"].iloc[-1]) - strike)          # value at expiry = intrinsic value
+        live = max(0.0, (float(h["Close"].iloc[-1]) - strike) if kind == "CE"
+                   else strike - float(h["Close"].iloc[-1]))  # expiry intrinsic, not a broker fill
     elif status == "ACTIVE" and elapsed >= MAX_HOLD_CALENDAR_DAYS:
         status = "⏱️ EXPIRED (TIME EXIT)"
 
@@ -1926,7 +2096,7 @@ def get_active_positions_df() -> pd.DataFrame:
     with DB_LOCK:
         con = duckdb.connect(DB_PATH, read_only=True)
         try:
-            return con.execute("SELECT ticker, entry_price, stop_loss, capital_allocated, features_json FROM trade_journal WHERE status = 'ACTIVE'").df()
+            return con.execute("SELECT ticker, entry_price, latest_price, target_price, stop_loss, capital_allocated, pnl_pct, status, features_json FROM trade_journal WHERE status = 'ACTIVE'").df()
         except Exception:
             return pd.DataFrame()
         finally:
@@ -1944,22 +2114,32 @@ def get_active_sector_exposure() -> dict:
         counts[sec] = counts.get(sec, 0) + 1
     return counts
 
+def get_open_exposures() -> tuple:
+    """Paper capital allocated to active stock and option ideas (combined INR cap)."""
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            eq = _num(con.execute("SELECT COALESCE(SUM(capital_allocated),0) FROM trade_journal WHERE status='ACTIVE'").fetchone()[0])
+            opt = _num(con.execute("SELECT COALESCE(SUM(total_capital),0) FROM daily_options_journal WHERE status='ACTIVE'").fetchone()[0])
+            return eq, opt
+        finally:
+            con.close()
+
 def get_portfolio_capacity() -> dict:
     df = get_active_positions_df()
-    n_open, risk = len(df), 0.0
+    risk = 0.0
     for _, r in (df.iterrows() if not df.empty else []):
-        try:
-            e, s, cap = float(r["entry_price"]), float(r["stop_loss"]), float(r["capital_allocated"])
-            if e > 0 and s < e:
-                risk += cap * (e - s) / e
-        except Exception:
-            pass
-    reason = ""
-    if n_open >= MAX_OPEN_POSITIONS:
-        reason = f"You already have the maximum number of open trades ({n_open}/{MAX_OPEN_POSITIONS})"
-    elif risk >= MAX_OPEN_RISK_INR:
-        reason = f"Too much money is at risk already (₹{risk:,.0f} of ₹{MAX_OPEN_RISK_INR:,.0f})"
-    return {"open": n_open, "risk_inr": round(risk, 2), "ok": reason == "", "reason": reason}
+        e, stop, cap = _num(r["entry_price"]), _num(r["stop_loss"]), _num(r["capital_allocated"])
+        if e > stop > 0:
+            risk += cap * (e - stop) / e
+    eq, opt = get_open_exposures()
+    remaining = remaining_capital(eq, opt)
+    reason = (f"Maximum {MAX_OPEN_POSITIONS} concurrent share ideas" if len(df) >= MAX_OPEN_POSITIONS else
+              f"Open equity stop-risk limit ₹{MAX_OPEN_RISK_INR:,.0f} reached" if risk >= MAX_OPEN_RISK_INR else
+              "Combined ₹10 lakh allocation already used" if remaining <= 0 else "")
+    return {"open": len(df), "risk_inr": round(risk,2), "equity_inr": round(eq,2),
+            "option_inr":round(opt,2), "remaining_inr":round(remaining,2),
+            "ok": not reason, "reason": reason}
 
 def get_todays_logged_equities() -> pd.DataFrame:
     today_str = ist_now().strftime('%Y-%m-%d')
@@ -2002,6 +2182,8 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
 
     if not ticker:
         return fail("Invalid stock")
+    if not bool(sig.get("Qualified", False)):
+        return fail("Unqualified signal cannot be recorded as a research buy")
     if not is_entry_window_open():
         return fail("It is outside buying hours (09:30–15:00 IST, Mon–Fri)")
     if not sig.get("Loggable", True):
@@ -2029,6 +2211,14 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
             if not existing.empty:
                 return fail("You already hold this stock")
             shares_num = int(str(sig['Recommended Shares']).split()[0])
+            entry, stop = float(sig['Price (₹)']), float(sig['Stop Loss (₹)'])
+            equity_used = _num(con.execute("SELECT COALESCE(SUM(capital_allocated),0) FROM trade_journal WHERE status='ACTIVE'").fetchone()[0])
+            options_used = _num(con.execute("SELECT COALESCE(SUM(total_capital),0) FROM daily_options_journal WHERE status='ACTIVE'").fetchone()[0])
+            risk_used = _num(con.execute("""SELECT COALESCE(SUM(capital_allocated*(entry_price-stop_loss)/entry_price),0)
+                FROM trade_journal WHERE status='ACTIVE' AND entry_price > stop_loss AND entry_price > 0""").fetchone()[0])
+            allowed = allowable_equity_shares(entry, stop, equity_used, options_used, risk_used)
+            if shares_num <= 0 or shares_num > allowed:
+                return fail("Combined capital, single position or risk allowance prevents this paper trade")
             con.execute("""
                 INSERT INTO trade_journal 
                 (trade_id, timestamp, date_str, ticker, asset_type, entry_price, target_price,
@@ -2036,7 +2226,7 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
                  exit_timestamp, last_audited, features_json)
                 VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, 0.0, NULL, ?, ?)
             """, [f"{ticker}_{today_str}", now_str, today_str, ticker, float(sig['Price (₹)']), float(sig['Target (₹)']), float(sig['Stop Loss (₹)']),
-                  shares_num, float(sig['RawCapital']), float(sig['Price (₹)']), init_net_pnl, now_str, f_json_str])
+                  shares_num, round(shares_num * entry, 2), entry, init_net_pnl, now_str, f_json_str])
             logged_local = True
         except Exception as e:
             record_db_error("Log trade", e)
@@ -2320,7 +2510,9 @@ def run_predictions():
             target = round(live_price + 1.6 * atr, 2)
             stop = round(live_price - 1.1 * atr, 2)
             live_price = round(live_price, 2)                      # the price the trade is recorded at
-            shares = max(1, int(POSITION_SIZE_INR / live_price))
+            cap_state = get_portfolio_capacity()
+            shares = allowable_equity_shares(live_price, stop, cap_state["equity_inr"],
+                        cap_state["option_inr"], cap_state["risk_inr"])
             capital = round(shares * live_price, 2)                    # so shares x price always equals money in
             slip = slippage_pct_per_side(avg_turnover)
             friction = compute_costs_pct(capital, slip)
@@ -2331,8 +2523,10 @@ def run_predictions():
             ev_pct = expected_value_pct(final_score / 100.0, live_price, target, stop, friction)
             be_pct = breakeven_win_pct(live_price, target, stop, friction)
             safe = (is_above_trend and not is_exhausted and has_volume and not nlp["is_blocked"] and net_return >= MIN_NET_RETURN_PCT)
-            qualified = safe and ev_pct > MIN_EV_PCT
-            if nlp["is_blocked"]:
+            qualified = safe and ev_pct > MIN_EV_PCT and shares > 0
+            if shares <= 0:
+                reason = "Insufficient available capital or stop-risk budget"
+            elif nlp["is_blocked"]:
                 reason = f"Bad news flagged: {nlp['nlp_tags']}"
             elif not is_above_trend:
                 reason = "Not in an uptrend any more (fresh price)"
@@ -2750,117 +2944,7 @@ def finished_row_html(ticker, status, pnl_pct, when) -> str:
     cls = "pos" if pnl_pct >= 0 else "neg"
     return _collapse(f'<div class="fin"><div><b>{esc(ticker)}</b> <span class="tag {s_kind}">{esc(s_text)}</span><div class="sub2">{esc(when)}</div></div><div class="mp {cls}">{pnl_pct:+.2f}%</div></div>')
 
-# ---------- charts ----------
-def show_fig(fig, key=None):
-    if not PLOTLY_OK or fig is None:
-        return
-    try:
-        st.plotly_chart(fig, width="stretch", key=key)
-    except TypeError:
-        st.plotly_chart(fig, use_container_width=True, key=key)
-
-def _layout(fig, height=320, title=None):
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=44 if title else 16, b=10), title=title,
-                      legend=dict(orientation="h", y=1.14), hovermode="x unified")
-    return fig
-
-def chart_cumulative(perf_df: pd.DataFrame, title: str, key: str = None):
-    if perf_df.empty:
-        return
-    x = [str(d) for d in perf_df["exit_date"]]
-    cum = perf_df["pnl_inr"].cumsum()
-    if not PLOTLY_OK:
-        st.line_chart(pd.DataFrame({"Running profit/loss (₹)": cum.values}, index=x))
-        return
-    colour = "#16a34a" if cum.iloc[-1] >= 0 else "#dc2626"
-    fig = go.Figure(go.Scatter(x=x, y=cum, mode="lines+markers", line=dict(color=colour, width=3, shape="hv"), fill="tozeroy",
-                               name="Running profit/loss (₹)", hovertemplate="%{x}<br>₹%{y:,.0f}<extra></extra>"))
-    show_fig(_layout(fig, 320, title), key=key)
-
-def chart_outcomes(perf: dict, title: str = "How your trades ended", key: str = None):
-    labels, vals = ["Hit the goal", "Safety exit", "Sold with no loss", "Time ran out"], [perf["wins"], perf["losses"], perf["be"], perf["expired"]]
-    if not PLOTLY_OK:
-        st.bar_chart(pd.DataFrame({title: vals}, index=labels))
-        return
-    fig = go.Figure(go.Pie(labels=labels, values=vals, hole=0.62, sort=False, marker=dict(colors=["#16a34a", "#dc2626", "#d97706", "#64748b"]), textinfo="label+percent"))
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title=title, showlegend=False)
-    show_fig(fig, key=key)
-
-def chart_hist(perf_df: pd.DataFrame):
-    if perf_df.empty:
-        return
-    if not PLOTLY_OK:
-        st.bar_chart(perf_df["pnl_pct"].round(1).value_counts().sort_index())
-        return
-    fig = go.Figure(go.Histogram(x=perf_df["pnl_pct"], nbinsx=24, marker=dict(color="#f97316"), hovertemplate="%{x:.1f}% : %{y} trades<extra></extra>"))
-    fig.add_vline(x=0, line_dash="dash", line_color="gray")
-    fig.update_layout(height=320, margin=dict(l=10, r=10, t=44, b=10), title="How much each trade made or lost (%) — right of the dashed line = profit", bargap=0.05)
-    show_fig(fig)
-
-def chart_sector(exp: dict):
-    if not exp:
-        return
-    items = sorted(exp.items(), key=lambda x: x[1])
-    if not PLOTLY_OK:
-        st.bar_chart(pd.DataFrame({"open trades": [v for _, v in items]}, index=[k for k, _ in items]))
-        return
-    fig = go.Figure(go.Bar(x=[v for _, v in items], y=[k for k, _ in items], orientation="h",
-                           marker=dict(color=["#dc2626" if v >= sector_cap(k) else "#f97316" for k, v in items])))
-    fig.update_layout(height=max(220, 38 * len(items) + 60), margin=dict(l=10, r=10, t=40, b=10), title="Open trades per sector (red = full)", xaxis=dict(dtick=1))
-    show_fig(fig)
-
-def calibration_rows(closed_df: pd.DataFrame) -> list:
-    rows = []
-    if closed_df is None or closed_df.empty:
-        return rows
-    for _, r in closed_df.iterrows():
-        o = classify_outcome(r["status"])
-        if o not in ("WIN", "LOSS"):
-            continue
-        f = _parse_features(r["features_json"])
-        try:
-            if f.get("final_score") is not None:
-                conf = float(f["final_score"])
-            elif f.get("base_ml_conf") is not None:
-                conf = float(f["base_ml_conf"]) + float(f.get("learner_delta", 0)) + float(f.get("macro_delta", 0)) + float(f.get("nlp_delta", 0))
-            else:
-                continue
-        except Exception:
-            continue
-        rows.append((conf, 1 if o == "WIN" else 0))
-    return rows
-
-def chart_calibration(rows: list):
-    d = pd.DataFrame(rows, columns=["conf", "hit"])
-    d["bucket"] = pd.cut(d["conf"], bins=[0, 60, 70, 80, 101], labels=["Under 60%", "60–70%", "70–80%", "80%+"])
-    g = d.groupby("bucket", observed=True).agg(stated=("conf", "mean"), realised=("hit", lambda s: s.mean() * 100.0), n=("hit", "size")).reset_index()
-    if not PLOTLY_OK:
-        st.dataframe(g.rename(columns={"bucket": "AI confidence", "stated": "AI said (%)", "realised": "Actually won (%)", "n": "Trades"}), hide_index=True)
-        return
-    fig = go.Figure()
-    fig.add_bar(x=g["bucket"].astype(str), y=g["stated"], name="What the AI said", marker_color="#f97316")
-    fig.add_bar(x=g["bucket"].astype(str), y=g["realised"], name="How often it actually won", marker_color="#16a34a", customdata=g["n"],
-                hovertemplate="%{y:.0f}% won (from %{customdata} trades)<extra></extra>")
-    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=44, b=10), title="When the AI says “X% sure”, how often is it right?",
-                      yaxis=dict(range=[0, 100], title="%"), legend=dict(orientation="h", y=1.14))
-    show_fig(fig)
-
-def chart_rolling(perf_df: pd.DataFrame, window: int = 10):
-    n = len(perf_df)
-    if n < window + 5:
-        st.info(f"This chart appears once {window + 5} trades have finished (so far: {n}).")
-        return
-    wins = (perf_df["outcome"] == "WIN").astype(float)
-    roll = (wins.rolling(window).mean() * 100.0).tolist()
-    overall = float(wins.mean() * 100.0)
-    x = list(range(1, n + 1))
-    if not PLOTLY_OK:
-        st.line_chart(pd.DataFrame({f"Win rate of last {window} trades (%)": roll}, index=x))
-        return
-    fig = go.Figure(go.Scatter(x=x, y=roll, mode="lines", line=dict(color="#f97316", width=3), hovertemplate="After trade %{x}: %{y:.0f}% won<extra></extra>"))
-    fig.add_hline(y=overall, line_dash="dash", line_color="gray", annotation_text=f"overall {overall:.0f}%", annotation_position="top left")
-    fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(range=[0, 100], title="% won"), xaxis_title="Finished trade number", showlegend=False)
-    show_fig(fig)
+# No charts are created or displayed: all results use words and tables.
 
 def style_ledger(df: pd.DataFrame):
     try:
@@ -2961,731 +3045,234 @@ def current_streak(perf_df: pd.DataFrame) -> tuple:
     return k, signs[-1]
 
 # ==============================================================================
-# 14. SIDEBAR & AUTONOMOUS LOOP
+# 14. SIMPLE, GRAPH-FREE INTERFACE (research and PAPER journal only)
 # ==============================================================================
-inject_css()
 state = get_market_state()
-market_is_open = is_nse_market_open()
+market_open = is_nse_market_open()
+st.title("🇮🇳 NSE AI Research Terminal")
+st.caption("All eligible NSE EQ shares • NSE stock CALLS (CE) + PUTS (PE) • Paper-trading only • No graphs")
+st.warning("This app does NOT send broker orders. Predictions are uncertain; 'CONSIDER' is a research label, not a guaranteed gain or an instruction to buy.")
 
-st.sidebar.header("⚙️ Settings")
-st.sidebar.caption("🔭 Looks at **every share on the NSE** each time — no baskets, no price limit.")
-st.sidebar.number_input("Broker fee per order (₹)", min_value=0.0, max_value=100.0, value=DEFAULT_BROKERAGE_PER_ORDER_INR, step=1.0, key="brokerage_inr",
-                        help="Many brokers charge ₹0 for delivery trades. Charged on buy and again on sell.")
-st.sidebar.number_input("Depository charge per sale (₹)", min_value=0.0, max_value=50.0, value=DEFAULT_DP_CHARGE_INR, step=0.5, key="dp_charge_inr",
-                        help="A small fixed fee each time you sell shares. Check your broker's rate.")
-if "auto_loop_toggle" not in st.session_state or st.session_state.get("last_market_open_state") != market_is_open:
-    st.session_state["auto_loop_toggle"] = market_is_open
-    st.session_state["last_market_open_state"] = market_is_open
-auto_mode = st.sidebar.toggle("Auto-refresh", key="auto_loop_toggle", help="Turns on by itself when the NSE opens and off when it closes (including holidays).")
-refresh_options = {"5 minutes": 300, "15 minutes": 900, "1 hour": 3600}
-selected_interval = st.sidebar.selectbox("Check every", list(refresh_options.keys()), index=0,
-                                         help="Open trades are checked every time. Prices for the whole market are re-downloaded at most every 15 minutes; finalists always get a fresh price.")
-refresh_interval_sec = refresh_options[selected_interval]
+with st.sidebar:
+    st.header("Settings")
+    st.markdown("**Portfolio ceiling:** ₹10,00,000 (shares + long options combined)")
+    st.caption("Per share idea: normally ₹1 lakh, never more than ₹2 lakh. Per option lot: ₹50,000; combined options: ₹2 lakh.")
+    st.number_input("Brokerage per share order (₹)", min_value=0.0, max_value=100.0,
+                    value=DEFAULT_BROKERAGE_PER_ORDER_INR, key="brokerage_inr")
+    st.number_input("DP charge per sale (₹)", min_value=0.0, max_value=100.0,
+                    value=DEFAULT_DP_CHARGE_INR, key="dp_charge_inr")
+    st.caption("Existing DuckDB, cloud records and AI training samples are kept; dated local backups are created on startup.")
+    auto_refresh = st.toggle("Refresh while dashboard is open", value=True)
+    if st.button("Log out"):
+        st.session_state["password_correct"] = False
+        st.rerun()
+    with st.expander("Health and learning"):
+        jc = journal_counts()
+        st.write(f"Historical share journal: {jc['total']} rows ({jc['closed']} finished, {jc['open']} open)")
+        try:
+            st.write(f"Historical options journal: {len(load_options_journal_df())} rows")
+        except Exception:
+            pass
+        st.write("AI model:", st.session_state.get("ml_model_source", "available" if get_ml_model() else "not supplied"))
+        try:
+            _training = json.loads(get_meta("retrain_state","{}") or "{}")
+        except (ValueError,TypeError):
+            _training = {}
+        st.write("Last retrain attempt:",_training.get("last_attempt_date", "Not eligible yet"))
+        st.write("Cloud backup:", "connected" if supabase else "not configured")
+        st.write("Last updated:", st.session_state.get("last_update_ist", "Not checked yet"))
+        if st.session_state.get("db_error"):
+            st.error(st.session_state["db_error"])
 
-with st.sidebar.expander("🛡️ Built-in safety rules"):
-    st.markdown(
-        f"- Max **{MAX_DAILY_EQUITY_TRADES} new trades** a day, **{MAX_OPEN_POSITIONS} open** at once\n"
-        f"- Max **{MAX_ACTIVE_PER_SECTOR} trades** in any one sector\n"
-        f"- About **₹{POSITION_SIZE_INR:,.0f}** per trade; total money at risk capped near ₹{MAX_OPEN_RISK_INR:,.0f}\n"
-        f"- At about **{int(BREAKEVEN_TRIGGER_RATIO * 100)}%** of the way to the goal, the safety exit moves up so the trade can't lose money\n"
-        f"- No re-buying a stock for **{COOLDOWN_CALENDAR_DAYS} days** after selling it\n"
-        f"- Buying only **{ENTRY_WINDOW_START.strftime('%H:%M')}–{ENTRY_WINDOW_END.strftime('%H:%M')} IST** on real trading days (weekends and NSE holidays are skipped)\n"
-        f"- Skips thinly traded shares (under ₹{MIN_AVG_TURNOVER_INR / 1e7:.0f} crore/day), shares under ₹{MIN_PRICE_INR:.0f}, shares stuck at their price limit, and shares that swing more than {MAX_ATR_PCT:.0f}% on a normal day\n"
-        f"- Buying pauses if the Nifty falls sharply or India VIX is very high\n"
-        f"- A share is bought only if it's **expected to make money after all costs**\n"
-        f"- While still learning (under {MIN_CALIBRATION_SAMPLES} clear results), at most **{LEARNING_PICKS_PER_DAY} 🧪 learning pick a day** if nothing else qualifies\n"
-        f"- Every result includes taxes, charges and slippage")
+if auto_refresh and st_autorefresh:
+    st_autorefresh(interval=15*60*1000, key="easy_autorefresh")
 
-with st.sidebar.expander("🏖️ Market holidays"):
-    ups = upcoming_holidays(5)
-    if ups:
-        for d_, name_ in ups:
-            st.write(f"**{datetime.strptime(d_, '%Y-%m-%d').strftime('%a %d %b %Y')}** — {name_}")
-    else:
-        st.caption("NSE's holiday list isn't reachable right now. The app still skips holidays by checking whether the Nifty has a price for today.")
+now = ist_now()
+st.write(f"**NSE:** {'Open' if market_open else 'Closed'} | **India time:** {now:%d %b %Y, %H:%M} IST")
+cap = get_portfolio_capacity()
+cols = st.columns(4)
+cols[0].metric("Maximum budget", "₹10,00,000")
+cols[1].metric("Shares reserved", inr(cap["equity_inr"]))
+cols[2].metric("Options reserved", inr(cap["option_inr"]))
+cols[3].metric("Still available", inr(cap["remaining_inr"]))
+if not cap["ok"]:
+    st.info(cap["reason"])
+if not ANNOUNCEMENTS_AVAILABLE:
+    st.info("Corporate filing module is missing. Treat news-based assessments as incomplete.")
 
-loop_tick = 0
-if auto_mode and st_autorefresh:
-    loop_tick = st_autorefresh(interval=refresh_interval_sec * 1000, key="nse_unified_autorefresh")
+page_summary, page_shares, page_options, page_learning = st.tabs([
+    "🏠 Simple overview", "🏢 Share ideas", "📜 Calls & puts", "🧠 Learning & history"])
 
-is_new_loop_tick = ("last_loop_tick" not in st.session_state) or (loop_tick != st.session_state["last_loop_tick"])
-if is_new_loop_tick:
-    audit_and_reconcile_all_trades()
-    st.session_state["last_loop_tick"] = loop_tick
-    st.session_state["force_refresh"] = True
+manual_update = False
+with page_summary:
+    st.write("**CONSIDER** = passes checks, **WATCH** = uncertain, **AVOID** = fails critical checks. None guarantees a profitable result.")
+    st.caption("CE = Call (price going up). PE = Put (price going down). Bought options can lose their whole premium.")
+    st.subheader("Paper portfolio")
+    open_eq = get_active_positions_df()
+    open_opt = load_options_journal_df()
+    if not open_opt.empty:
+        open_opt = open_opt[open_opt["status"].apply(classify_outcome)=="ACTIVE"]
+    st.write(f"**Open paper positions:** {len(open_eq)} share ideas + {len(open_opt)} option ideas")
+    st.write(f"**Estimated share stop-loss exposure:** {inr(cap['risk_inr'])} of {inr(MAX_OPEN_RISK_INR)} allowed")
+    if not open_eq.empty:
+        with st.expander(f"View {len(open_eq)} open share ideas"):
+            st.write("**Shares being followed**")
+            st.dataframe(open_eq[["ticker","entry_price","latest_price","target_price","stop_loss","capital_allocated","pnl_pct","status"]]
+                         .rename(columns={"ticker":"Share", "entry_price":"Entry ₹", "latest_price":"Last ₹",
+                                 "target_price":"Target ₹", "stop_loss":"Stop ₹", "capital_allocated":"Reserved ₹",
+                                 "pnl_pct":"Paper P/L %","status":"State"}),hide_index=True,use_container_width=True)
+    if not open_opt.empty:
+        with st.expander(f"View {len(open_opt)} open call/put ideas"):
+            st.dataframe(open_opt[["option_contract","entry_premium","current_option_price","total_capital","pnl_pct","status"]]
+                        .rename(columns={"option_contract":"Contract","entry_premium":"Paper entry ₹",
+                                         "current_option_price":"Last quoted ₹", "total_capital":"Reserved ₹",
+                                         "pnl_pct":"Paper P/L %","status":"State"}),hide_index=True,use_container_width=True)
+    st.caption("Paper profits/losses are approximations and may not reflect actual execution or fees.")
 
-with st.sidebar.expander("🩺 System health"):
-    try:
-        prices_ok = not fetch_cached_history("^NSEI", period="5d", interval="1d").empty
-    except Exception:
-        prices_ok = False
-    st.write(f"{'🟢' if prices_ok else '🔴'} Share prices {'arriving' if prices_ok else 'not arriving'}")
-    st.write(f"{'🟢' if supabase else '🔴'} Online backup {'connected' if supabase else 'not connected'}")
-    st.write(f"{'🟢' if get_ml_model() is not None else '🔴'} AI model {'loaded' if get_ml_model() is not None else 'missing'}")
-    st.write(f"{'🟢' if ANNOUNCEMENTS_AVAILABLE else '⚪'} News check {'available' if ANNOUNCEMENTS_AVAILABLE else 'module not found'}")
-    st.write(f"🕒 Last price check: {st.session_state.get('last_price_check', '-')}")
-    _ub = get_nse_http_box().get("universe")
-    if _ub:
-        st.write(f"{'🟢' if _ub[3] else '🟠'} Share list: {len(_ub[1]):,} shares — {_ub[2]}")
-    _ib = get_nse_http_box().get("industries")
-    if _ib:
-        st.write(f"{'🟢' if _ib[1] else '🟠'} Sector labels: {len(_ib[1]):,} shares labelled by NSE" + ("" if _ib[1] else " (not reachable — unknown shares go in 'Other')"))
-    jc, hi_ = journal_counts(), st.session_state.get("hydrate_info", {})
-    st.write(f"📒 Journal: {jc['total']} share trades — {jc['open']} open, {jc['closed']} finished")
-    try:
-        _oj = load_options_journal_df()
-        _oo = int((_oj["status"].apply(classify_outcome) == "ACTIVE").sum()) if not _oj.empty else 0
-        st.write(f"📜 Options: {len(_oj)} ideas — {_oo} open, {len(_oj) - _oo} finished")
-    except Exception:
-        pass
-    if supabase:
-        st.write(f"☁️ Backup: {hi_.get('remote', 0)} trades online ({hi_.get('remote_active', 0)} open) · restored {hi_.get('restored', 0)} · skipped {hi_.get('bad_rows', 0)}")
-    if not st_autorefresh:
-        st.caption("Auto-refresh library not installed — use “Find new picks / refresh” to update.")
-
-if "retrain_notice" in st.session_state:
-    st.sidebar.success(st.session_state["retrain_notice"])
-if "ml_model_source" in st.session_state:
-    st.sidebar.caption(f"🤖 AI version in use: **{st.session_state['ml_model_source']}**")
-if "db_error" in st.session_state:
-    st.sidebar.error(f"⚠️ Online backup problem: {st.session_state['db_error']}")
-if st.session_state.get("pending_cloud_sync"):
-    st.sidebar.warning(f"⏳ {len(st.session_state['pending_cloud_sync'])} update(s) waiting to be saved online.")
-
-if st.sidebar.button("🚪 Log Out", width="stretch"):
-    st.query_params.clear()
-    st.session_state["password_correct"] = False
-    st.rerun()
-
-# ==============================================================================
-# 15. PAGE LAYOUT: HERO (filled later), TABS, THEN THE SCAN INSIDE THE BOARD TAB
-# ==============================================================================
-hero_box = st.container()
-tab_board, tab_results, tab_learn, tab_options = st.tabs(["📋 My Board", "📈 Results", "🧠 What the AI Learned", "🎲 Options"])
-
-if "dispatched_orders" not in st.session_state:
-    st.session_state["dispatched_orders"] = set()
-
-with tab_board:
-    h1, h2 = st.columns([4, 1.3])
-    with h1:
-        sec_title("📋", "Your board", "ready to buy → running → finished")
-    with h2:
-        re_scan = st.button("🔄 Find new picks / refresh", width="stretch", type="primary")
-
-    todays_df = get_todays_logged_equities()
-    quota_filled = len(todays_df) >= MAX_DAILY_EQUITY_TRADES
-    pulse_stale = (time.time() - float(st.session_state.get("scan_epoch", 0.0))) > PULSE_REFRESH_SEC
-    need_scan = re_scan or "scan_results" not in st.session_state or (
-        st.session_state.get("force_refresh", False) and (not quota_filled or pulse_stale))
-    if need_scan:
-        st.session_state["force_refresh"] = False
-        with st.spinner("Checking every NSE share and your open trades (the first check of the day takes a minute or two)..."):
-            if re_scan:
-                hydrate_duckdb_from_supabase()
-                audit_and_reconcile_all_trades()
-            res_df, has_cleared = run_predictions()
-            st.session_state["scan_results"] = res_df
-            st.session_state["has_cleared"] = has_cleared
-            st.session_state["scan_ts"] = ist_now().strftime("%H:%M:%S")
-            st.session_state["scan_epoch"] = time.time()
-    st.session_state["force_refresh"] = False
-
-if is_new_loop_tick:
-    st.session_state["last_audit_str"] = ist_now().strftime("%d %b %H:%M")
-
-# ==============================================================================
-# 16. OPTIONS IDEA + DATA LOAD (after the scan, so anything just bought is included)
-# ==============================================================================
-opt_signal = generate_daily_options_alpha()
-
-df_eq, df_opt = pd.DataFrame(), pd.DataFrame()
-with DB_LOCK:
-    _con = duckdb.connect(DB_PATH, read_only=True)
-    try:
-        df_eq = _con.execute("SELECT * FROM trade_journal WHERE ticker NOT LIKE '%.L' ORDER BY date_str DESC, ticker ASC").df()
-        df_opt = _con.execute("SELECT * FROM daily_options_journal ORDER BY date_key DESC").df()
-    except Exception:
-        pass
-    finally:
-        _con.close()
-
-perf_eq_df = prep_perf_frame(df_eq, "capital_allocated")
-perf_opt_df = prep_perf_frame(df_opt, "total_capital", is_option=True)
-perf = compute_performance(perf_eq_df)
-perf_o = compute_performance(perf_opt_df)
-active_opt = df_opt[df_opt["status"].apply(classify_outcome) == "ACTIVE"].copy() if not df_opt.empty else pd.DataFrame()
-opt_open_unreal = float((pd.to_numeric(active_opt["total_capital"], errors="coerce").fillna(0) * pd.to_numeric(active_opt["pnl_pct"], errors="coerce").fillna(0) / 100.0).sum()) if not active_opt.empty else 0.0
-opt_learn = options_learning(df_opt)
-active_eq = df_eq[df_eq["status"].apply(classify_outcome) == "ACTIVE"].copy() if not df_eq.empty else pd.DataFrame()
-active_cap = float(active_eq["capital_allocated"].sum()) if not active_eq.empty else 0.0
-open_unreal = float((active_eq["capital_allocated"] * active_eq["pnl_pct"] / 100.0).sum()) if not active_eq.empty else 0.0
-be_prot = int(sum(is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"])) for _, r in active_eq.iterrows())) if not active_eq.empty else 0
-open_unreal_all = open_unreal + opt_open_unreal
-n_open_all = len(active_eq) + len(active_opt)
-
-def open_split_text() -> str:
-    """'3 shares · 1 option' — the same wording wherever open trades are counted."""
-    parts = [f"{len(active_eq)} share{'s' if len(active_eq) != 1 else ''}"]
-    if len(active_opt):
-        parts.append(f"{len(active_opt)} option{'s' if len(active_opt) != 1 else ''}")
-    return " · ".join(parts)
-
-closed_all = load_closed_trades_df()
-todays_df = get_todays_logged_equities()
-cap_state = get_portfolio_capacity()
-macro = get_indian_cross_asset_macro()
-stress = is_market_stress(macro)
-
-# ---------- hero ----------
-def macro_chip(label, v, suffix="%"):
-    cls = "up" if v >= 0 else "down"
-    return f'<span class="chip {cls}">{esc(label)} {"▲" if v >= 0 else "▼"} {v:+.1f}{suffix}</span>'
-
-if not state["trading_day"]:
-    mkt_chip = f'<span class="chip warn">🏖️ {esc(state["reason"])}</span>'
-elif market_is_open:
-    mkt_chip = '<span class="chip up">NSE OPEN</span>'
-else:
-    mkt_chip = f'<span class="chip down">NSE CLOSED · opens {esc(next_open_text())}</span>'
-if not state["trading_day"]:
-    mkt_chip += f'<span class="chip">Next open: {esc(next_open_text())}</span>'
-feed_chip = '<span class="chip down">⚠️ Price feed problem</span>' if st.session_state.get("price_feed_problem") else ""
-stress_chip = '<span class="chip down">⛔ Buying paused — market under stress</span>' if stress else ""
-_ps = st.session_state.get("scan_stats", {}) or {}
-if _ps.get("scanned"):
-    _bp = _ps.get("uptrend", 0) / max(1, _ps["scanned"]) * 100.0
-    pulse_chip = f'<span class="chip {"up" if _bp >= 50 else "down"}">🔭 {_ps["scanned"]:,} shares checked · {_bp:.0f}% rising</span>'
-else:
-    pulse_chip = ""
-with hero_box:
-    st.markdown(_collapse(f"""
-    <div class="hero">
-      <h1>⚡ Autonomous AI Quant Terminal — NSE</h1>
-      <div class="sub">An AI that picks Indian shares and practises trading them with pretend money — so you can see honestly whether it works.</div>
-      <div class="chips">{mkt_chip}
-        <span class="chip {'up' if supabase else 'down'}">{'☁️ Saved online' if supabase else '☁️ Not saved online'}</span>
-        {macro_chip('Nifty (5 days)', macro['nifty_5d'])}{macro_chip('USD/INR', macro['usdinr_5d'])}{macro_chip('Brent oil', macro['brent_5d'])}
-        <span class="chip {'down' if macro['vix_level'] >= STRESS_VIX else ''}">India VIX {macro['vix_level']}</span>
-        {stress_chip}{feed_chip}
-        {pulse_chip}
-        <span class="chip">Last price check {esc(st.session_state.get('last_price_check', '-'))}</span>
-      </div>
-    </div>"""), unsafe_allow_html=True)
-    if n_open_all:
-        story = f"<b>{n_open_all} trade{'s' if n_open_all != 1 else ''} running</b> ({open_split_text()}, {inr(open_unreal_all)} so far)."
-    else:
-        story = "<b>Nothing running right now.</b>"
-    if perf["n"]:
-        story += f" <b>{perf['n']} share trade{'s' if perf['n'] != 1 else ''} finished</b>, {perf['wins']} hit their goal, {inr(perf['net_inr'])} after all costs."
-    else:
-        story += " No share trade has finished yet, so there are no results to judge."
-    if perf_o["n"]:
-        story += f" Options: {perf_o['n']} finished, {inr(perf_o['net_inr'])} (kept separate)."
-    callout("good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else "info"), "📍", story)
-    with st.expander("💡 New here? 30-second guide"):
-        st.markdown(
-            "- This app **pretends to buy** Indian shares, about **₹25,000 each**. It's practice — no real money is used and nothing is sent to a broker.\n"
-            "- Every time it checks, it looks at **every share listed on the NSE**, throws out the ones that are hard to trade or risky, and only buys the very best.\n"
-            "- Every pick has a **Goal** (sell for a profit) and a **Safety exit** (sell to limit the loss).\n"
-            "- When a trade gets about two-thirds of the way to its goal, the safety exit moves up so it **can't lose money** any more.\n"
-            "- **AI confidence** is how sure the AI is that the goal is hit before the safety exit. It's a guide, not a promise.\n"
-            "- Every profit/loss number is **after STT, stamp duty, exchange charges, depository fee, broker fee and slippage**.\n"
-            "- The NSE is closed on weekends and public holidays — the app knows and does nothing on those days.\n"
-            "- A trade closes after **7 days** if neither the goal nor the safety exit is reached.")
-
-# ==============================================================================
-# 17. TAB: MY BOARD
-# ==============================================================================
-with tab_board:
-    if "flash" in st.session_state:
-        st.info(st.session_state.pop("flash"))
-    if not state["trading_day"]:
-        callout("warn", "🏖️", f"<b>The NSE is closed today ({esc(state['reason'])}).</b> Nothing will be bought, and open trades keep the last trading day's prices. Next open: {esc(next_open_text())}.")
-    elif stress:
-        callout("bad", "⛔", "<b>Buying is paused.</b> The Nifty has fallen sharply this week or India VIX is very high. Picks are shown for information only.")
-    elif not cap_state["ok"]:
-        callout("warn", "🧯", f"<b>{esc(cap_state['reason'])}.</b> New buying resumes when some trades close.")
-    elif not is_entry_window_open():
-        callout("info", "🕗", "The market isn't in its buying window (09:30–15:00 IST, trading days). Picks are a watch-list, so every purchase is made at a real price.")
-
-    hi_ = st.session_state.get("hydrate_info", {})
-    if supabase and (hi_.get("remote_active", 0) > len(active_eq) or hi_.get("bad_rows", 0)):
-        callout("warn", "☁️", f"<b>The online backup lists {hi_.get('remote_active', 0)} open share trade(s), but {len(active_eq)} show here.</b> "
-                              f"{hi_.get('bad_rows', 0)} backup row(s) were unreadable ({esc(hi_.get('first_error', '') or 'none')}). Press “Find new picks / refresh” to retry. "
-                              "(Trades that already closed here legitimately differ from an older backup.)")
-    stats = st.session_state.get("scan_stats", {})
-    if stats.get("error"):
-        callout("bad", "🛑", esc(stats["error"]))
-    elif stats:
-        st.caption(f"Last check {st.session_state.get('scan_ts', '-')} (took {stats.get('seconds', 0):.0f}s): {stats.get('scanned', 0):,} tradable shares checked out of "
-                   f"{stats.get('listed', 0):,} on the NSE · {stats.get('deep', 0)} finalists · bought {stats.get('logged', 0)} automatically · "
-                   f"{len(todays_df)} of {MAX_DAILY_EQUITY_TRADES} picks used today")
-        if stats.get("priced", 0) and not stats.get("scanned", 0):
-            callout("warn", "🔎", f"<b>None of the {stats.get('priced', 0):,} shares with prices could be checked.</b> Why: {stats.get('illiquid', 0):,} too thinly traded or too cheap · "
-                                  f"{stats.get('wild', 0):,} stuck at a price limit or too jumpy · {stats.get('no_data', 0):,} with too little usable history · "
-                                  f"{stats.get('errors', 0):,} errors. Nothing is guessed.")
-        if stats.get("listed", 0) >= 100 and stats.get("priced", 0) < stats["listed"] * 0.5:
-            callout("warn", "📡", f"<b>Prices arrived for only {stats.get('priced', 0):,} of {stats['listed']:,} shares.</b> The price service may be busy. "
-                                  "Nothing is guessed: shares without prices are simply skipped, and the next check tries again.")
-        elif stats.get("partial"):
-            callout("info", "⏳", "<b>Some shares' prices were still downloading</b> when the time limit was reached. They'll be included in the next check.")
-        if stats.get("source") and "today" not in str(stats.get("source")):
-            callout("warn", "📃", f"<b>Share list:</b> {esc(stats['source'])}.")
-
-    c_buy, c_run, c_done = st.columns([1.15, 1.05, 0.95])
-
-    with c_buy:
-        df_res = st.session_state.get("scan_results", pd.DataFrame())
-        held_now = set(clean_sym_name(t) for t in (active_eq["ticker"].tolist() if not active_eq.empty else []))
-        picks = df_res[(df_res["Qualified"] == True) & (~df_res["Ticker"].isin(held_now))].head(5) if not df_res.empty else pd.DataFrame()
-        col_header("buy", "🔍 Ready to buy", len(picks))
-        if len(todays_df) >= MAX_DAILY_EQUITY_TRADES:
-            empty_box(f"All {MAX_DAILY_EQUITY_TRADES} picks for today are used. This stops over-trading.")
-        elif picks.empty:
-            _ss = st.session_state.get("scan_stats", {}) or {}
-            _bought = set(clean_sym_name(t) for t in (todays_df["ticker"].tolist() if not todays_df.empty else []))
-            _conf_bought = [t for t in (df_res[df_res["Qualified"] == True]["Ticker"].tolist() if (not df_res.empty and "Qualified" in df_res.columns) else []) if t in _bought]
-            if _conf_bought:
-                empty_box(f"✅ Bought today: {', '.join(_conf_bought)} — they passed every check and are in Running. No other share passes every check right now.")
-            elif _ss.get("learning_mode"):
-                empty_box(f"No share is expected to make money after costs right now. While the AI is still learning ({_ss.get('decided', 0)} of "
-                          f"{MIN_CALIBRATION_SAMPLES} clear results), it buys at most {LEARNING_PICKS_PER_DAY} 🧪 learning pick a day during buying hours so it keeps improving.")
-            else:
-                empty_box("Nothing is expected to make money after costs right now. Doing nothing is a valid choice.")
+with page_shares:
+    st.subheader("Which shares look promising?")
+    st.caption("Analyses all NSE normal-series shares in rotating scans, including inexpensive, mid-cap and high-price shares. A missing AI model pauses share scoring.")
+    rescan_shares = st.button("Refresh NSE share research", key="refresh_shares", type="primary")
+    if rescan_shares or "simple_share_results" not in st.session_state or (auto_refresh and time.time()-st.session_state.get("simple_share_epoch",0)>900):
+        with st.spinner("Checking the NSE share universe and the saved AI model..."):
+            audit_and_reconcile_all_trades()
+            shares, cleared = run_predictions()
+            st.session_state["simple_share_results"] = shares
+            st.session_state["simple_share_epoch"] = time.time()
+            st.session_state["last_update_ist"] = ist_now().strftime('%d %b %H:%M IST')
+    shares = st.session_state.get("simple_share_results",pd.DataFrame())
+    scan = st.session_state.get("scan_stats",{})
+    if scan.get("error"):
+        st.error(scan["error"])
+    if scan.get("source"):
+        st.caption(f"Universe: {scan.get('listed',0):,} shares. Source: {scan['source']}.")
+    if scan.get("partial"):
+        st.warning("The current scan did not finish the complete universe. Results only cover the symbols checked so far.")
+    if isinstance(shares,pd.DataFrame) and not shares.empty:
+        shares = shares.copy()
+        shares["Decision"] = shares.apply(lambda r:"CONSIDER" if r["Qualified"] else "AVOID" if "Bad news" in r["Rejection Reason"] or "risk" in r["Rejection Reason"].lower() else "WATCH",axis=1)
+        choice = st.segmented_control("Show", ["CONSIDER","WATCH","AVOID","ALL"],default="CONSIDER", key="share_decision_filter")
+        view = shares if choice=="ALL" else shares[shares["Decision"]==choice]
+        if view.empty:
+            st.info("Nothing passes this group right now. No trade is better than an unqualified trade.")
         else:
-            today_key = ist_now().strftime('%Y-%m-%d')
-            for _, row in picks.iterrows():
-                st.markdown(signal_card_html(row), unsafe_allow_html=True)
-                token = hashlib.sha256(f"{row['Ticker']}_{today_key}".encode()).hexdigest()[:12]
-                if st.button(f"🚀 Buy {row['Ticker']} (paper trade)", key=f"buy_{token}", width="stretch", disabled=token in st.session_state["dispatched_orders"]):
-                    ok = log_equity_signal_safely(row.to_dict(), enforce_sector_cap=True)
-                    if ok:
-                        st.session_state["dispatched_orders"].add(token)
-                        st.session_state["flash"] = f"✅ Paper-bought {row['Ticker']}. Nothing was sent to a broker."
-                    else:
-                        st.session_state["flash"] = f"⚠️ Couldn't buy {row['Ticker']}: {st.session_state.get('last_log_reason', 'a safety rule blocked it')}."
-                    st.rerun()
+            for _, item in view.head(5).iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**{esc(item['Ticker'])}** — {esc(item['Decision'])} · ₹{float(item['Price (₹)']):,.2f}")
+                    st.write(f"**Reason:** {item['Rejection Reason']}")
+                    st.caption(f"Target ₹{float(item['Target (₹)']):,.2f} · Stop ₹{float(item['Stop Loss (₹)']):,.2f} · Paper allocation {item['Total Cost (₹)']}")
+            if len(view)>5:
+                st.caption(f"Showing 5 of {len(view)} ideas.")
+            with st.expander("See full share research table"):
+                display_cols=["Ticker","Sector","Decision","Price (₹)","Expected value","Adjusted Score","Target (₹)","Stop Loss (₹)","Total Cost (₹)","Rejection Reason"]
+                st.dataframe(view[display_cols].rename(columns={"Ticker":"Share","Expected value":"Modelled EV %",
+                    "Adjusted Score":"Model-based score","Rejection Reason":"Why"}),hide_index=True,use_container_width=True)
+            st.caption("Model scores and expected value are estimates, not guaranteed win rates.")
+    else:
+        st.info("No share candidates yet. The scanner will not invent recommendations when the trained model or price data is unavailable.")
 
-    with c_run:
-        col_header("run", "🟢 Running", len(active_eq) + len(active_opt))
-        if active_eq.empty and active_opt.empty:
-            empty_box("No open trades.")
+with page_options:
+    st.subheader("Calls (CE) and Puts (PE) — what to consider and avoid")
+    st.write("**CE = bullish (up). PE = bearish (down).** Only buying options is analysed; no uncovered option selling.")
+    st.caption("Live NSE contract quotes and current lot-size files are required for a CONSIDER rating. Historical/model prices are NOT valid buying quotes.")
+    rescan_options = st.button("Refresh calls and puts", type="primary", key="refresh_options")
+    if rescan_options or "option_candidates" not in st.session_state or (auto_refresh and time.time()-st.session_state.get("options_epoch",0)>900):
+        with st.spinner("Checking real NSE stock-option chains; calls and puts are rated separately..."):
+            st.session_state["option_candidates"] = scan_option_candidates()
+            st.session_state["options_epoch"] = time.time()
+            st.session_state["last_update_ist"] = ist_now().strftime('%d %b %H:%M IST')
+    options = st.session_state.get("option_candidates",pd.DataFrame())
+    st.caption(st.session_state.get("option_scan_note","Option scan not run yet."))
+    if isinstance(options,pd.DataFrame) and not options.empty:
+        opt_filter = st.segmented_control("Decision",["CONSIDER","WATCH","AVOID","ALL"],default="CONSIDER",key="option_decision_filter")
+        kind_filter = st.segmented_control("Contract",["BOTH","CE","PE"],default="BOTH",key="option_kind_filter")
+        filtered = options if opt_filter=="ALL" else options[options["Decision"]==opt_filter]
+        filtered = filtered if kind_filter=="BOTH" else filtered[filtered["Type"]==kind_filter]
+        if filtered.empty:
+            st.info("No contracts in this category in the latest checked batch. It is okay to buy nothing.")
         else:
-            if len(active_opt):
-                st.caption(f"{open_split_text()} — option results are kept separate (🎲 Options tab)")
-            for _, r in (active_eq.sort_values("pnl_pct", ascending=False).head(12).iterrows() if not active_eq.empty else []):
-                st.markdown(mini_trade_html(r["ticker"], get_trade_sector(r["ticker"], r["features_json"]), float(r["entry_price"]), float(r["target_price"]),
-                                            float(r["stop_loss"]), float(r["latest_price"]), float(r["pnl_pct"]),
-                                            is_stop_breakeven_protected(float(r["entry_price"]), float(r["stop_loss"])), r["shares"],
-                                            is_learning_trade(r["features_json"])), unsafe_allow_html=True)
-            if len(active_eq) > 12:
-                st.caption(f"Showing 12 of {len(active_eq)} share trades.")
-            for _, o in (active_opt.iterrows() if not active_opt.empty else []):
-                st.markdown(option_mini_html(o), unsafe_allow_html=True)
-            st.caption("Dot = current price · green side = nearer the goal · 🛡️ = can no longer lose · 🧪 = learning pick")
-
-    with c_done:
-        col_header("done", "🏁 Finished", len(perf_eq_df) + len(perf_opt_df))
-        fin_rows = []
-        for _, r in (perf_eq_df.iterrows() if not perf_eq_df.empty else []):
-            fin_rows.append((r["exit_date"], ("🧪 " if is_learning_trade(r["features_json"]) else "") + str(r["ticker"]), r["status"], float(r["pnl_pct"]), f"closed {r['exit_date']}"))
-        for _, r in (perf_opt_df.iterrows() if not perf_opt_df.empty else []):
-            fin_rows.append((r["exit_date"], "📜 " + option_short_name(r["option_contract"]), r["status"], float(r["pnl_pct"]), f"option · closed {r['exit_date']}"))
-        fin_rows.sort(key=lambda x: str(x[0]), reverse=True)
-        if not fin_rows:
-            empty_box("Finished trades appear here.")
-        else:
-            if len(perf_opt_df):
-                st.caption(f"{len(perf_eq_df)} share trades · {len(perf_opt_df)} option ideas")
-            for _, tk, stt, pp, when in fin_rows[:8]:
-                st.markdown(finished_row_html(tk, stt, pp, when), unsafe_allow_html=True)
-
-    if stats.get("scanned"):
-        sec_title("🌡️", "Market pulse", "the whole NSE, from this check")
-        n_sc = int(stats.get("scanned", 0))
-        up_pct = stats.get("uptrend", 0) / max(1, n_sc) * 100.0
-        n20 = float(stats.get("nifty_20d", 0.0) or 0.0)
-        score_cards([
-            ("Shares on the NSE", f"{stats.get('listed', 0):,}", "every normal (EQ) share", "", ""),
-            ("Easy to trade", f"{n_sc:,}", f"{stats.get('illiquid', 0):,} too thinly traded · {stats.get('wild', 0):,} too risky", "", ""),
-            ("Market mood", f"{up_pct:.0f}% rising", breadth_word(up_pct), "good" if up_pct >= 55 else ("bad" if up_pct < 40 else ""), "pos" if up_pct >= 50 else "neg"),
-            ("Nifty, last 20 days", f"{n20:+.1f}%", "the market as a whole", "good" if n20 > 0 else ("bad" if n20 < 0 else ""), "pos" if n20 >= 0 else "neg"),
-        ])
-        p1, p2 = st.columns([1.1, 1])
-        with p1:
-            st.markdown("**How today's picks were found**")
-            healthy = max(0, int(stats.get("uptrend", 0)) - int(stats.get("overbought", 0)) - int(stats.get("quiet", 0)))
-            st.markdown(funnel_html([
-                ("All NSE shares", stats.get("listed", 0)),
-                ("Prices available", stats.get("priced", 0)),
-                ("Easy & safe to trade", n_sc),
-                ("Going up (uptrend)", stats.get("uptrend", 0)),
-                ("Not overheated, normal volume", healthy),
-                ("Scored by the AI", stats.get("candidates", 0)),
-                ("Best scores, fully checked", stats.get("deep", 0)),
-                ("Passed every check", stats.get("qualified", 0)),
-            ]), unsafe_allow_html=True)
-            st.caption(f"{stats.get('held', 0)} rising shares were left out because you already own them, sold them in the last {COOLDOWN_CALENDAR_DAYS} days, or their sector is full.")
-        with p2:
-            st.markdown("**How much of the market is rising**")
-            st.markdown(gauge_html(up_pct), unsafe_allow_html=True)
-            st.caption("Share of easy-to-trade NSE shares that are above their 20-day average with steady momentum. Picks work better when most of the market is rising.")
-            heat = sector_heat_html(stats.get("sector_breadth", {}) or {})
-            if heat:
-                st.markdown("**Strongest sectors right now**")
-                st.markdown(heat, unsafe_allow_html=True)
-        if stats.get("leaders"):
-            st.markdown("**Beating the Nifty most over 20 days** · for information, not buy tips")
-            st.markdown(leaders_html(stats["leaders"]), unsafe_allow_html=True)
-
-    sec_exp = get_active_sector_exposure()
-    if sec_exp:
-        with st.expander("📊 Open trades by sector"):
-            chart_sector(sec_exp)
-    if not df_res.empty:
-        with st.expander(f"🔍 The {len(df_res)} finalists — and why each did or didn't pass"):
-            diag = df_res.rename(columns={"Ticker": "Stock", "AI Win Confidence": "AI score", "Rejection Reason": "Result", "Adjusted Score": "Final score"})
-            cols_ = ["Stock", "Sector", "Price (₹)", "Expected Return", "Final score", "Vs Nifty (20d)", "Easy to trade (₹cr/day)", "Qualified", "Result"]
-            st.dataframe(diag[[c for c in cols_ if c in diag.columns]], width="stretch", hide_index=True)
-
-# ==============================================================================
-# 18. TAB: RESULTS
-# ==============================================================================
-with tab_results:
-    n_ = perf["n"]
-    if n_ == 0:
-        sec_title("📈", "Results")
-        score_cards([("Share profit/loss", "₹0", "no finished share trades yet", "", ""), ("Win rate", "–", "needs finished share trades", "", ""),
-                     ("Finished share trades", "0", (f"+ {len(perf_opt_df)} option idea{'s' if len(perf_opt_df) != 1 else ''} → 🎲 Options tab" if len(perf_opt_df) else "come back soon"), "", ""),
-                     ("Open right now", str(n_open_all), f"{open_split_text()} · {inr(open_unreal_all)} so far", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), "")])
-        callout("info", "⏳", "<b>No share trade has finished yet.</b> Once the first ones reach their goal or safety exit, your honest results appear here."
-                + (" Option results are on the 🎲 Options tab." if len(perf_opt_df) or len(active_opt) else ""))
+            for _,r in filtered.head(4).iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**{esc(r['Stock'])} {esc(r['Type'])} • {esc(r['Decision'])}** — {esc(r['Expiry'])}, strike ₹{float(r['Strike (₹)']):,.2f}")
+                    cc=st.columns(3)
+                    cc[0].metric("One lot's premium",inr(r["Cost (₹)"]))
+                    cc[1].metric("Breakeven at expiry",inr(r["Breakeven at expiry (₹)"],2))
+                    cc[2].metric("Maximum premium loss",inr(r["Maximum premium loss (₹)"]))
+                    st.write(f"**Why:** {r['Why']}")
+                    with st.expander("Contract details and risk checks"):
+                        st.caption(f"Share ₹{r['Share price (₹)']:,.2f} • bid ₹{r['Sell premium (₹)']:,.2f} / ask ₹{r['Buy premium (₹)']:,.2f} • {int(r['Lot'])} units • {r['Days left']} days left • 5-day move {r['5-day share move (%)']:+.1f}% • spread {r['Spread (%)']:.1f}% • OI {r['Open interest']:,} • IV {r['IV (%)']:.1f}% vs historical {r['Historical volatility (%)']:.1f}%")
+            if len(filtered)>4:
+                st.caption(f"Showing 4 of {len(filtered)} matching contracts")
+        with st.expander("All researched option contracts in a simple table"):
+            cols=["Stock","Type","Decision","Expiry","Strike (₹)","Buy premium (₹)","Lot","Cost (₹)","Breakeven at expiry (₹)","Maximum premium loss (₹)","Why"]
+            st.dataframe(options[cols],hide_index=True,use_container_width=True)
     else:
-        exp_, net = perf["expectancy_pct"], perf["net_inr"]
-        sec_title("📈", "Results", "finished share trades, after all costs")
-        score_cards([
-            ("Share profit/loss", inr(net), f"{inr(perf['expectancy_inr'])} per trade on average", "good" if net > 0 else ("bad" if net < 0 else ""), "pos" if net > 0 else ("neg" if net < 0 else "")),
-            ("Win rate", f"{perf['target_hit_rate']:.0f}%", f"{perf['wins']} won · {perf['losses']} lost · {perf['be']} saved · {perf['expired']} timed out", "", ""),
-            ("Finished share trades", str(n_), f"likely win rate {perf['ci_low']:.0f}–{perf['ci_high']:.0f}%" + (f" · + {len(perf_opt_df)} option idea{'s' if len(perf_opt_df) != 1 else ''} → 🎲 Options" if len(perf_opt_df) else ""), "", ""),
-            ("Open right now", str(n_open_all), f"{open_split_text()} · {inr(open_unreal_all)} so far · 🛡️ {be_prot} can't lose", "good" if open_unreal_all > 0 else ("bad" if open_unreal_all < 0 else ""), ""),
-        ])
-        _lp = perf_eq_df["features_json"].apply(is_learning_trade) if "features_json" in perf_eq_df.columns else pd.Series(False, index=perf_eq_df.index)
-        if _lp.any():
-            _l, _c = perf_eq_df[_lp], perf_eq_df[~_lp]
-            callout("info", "🧪", f"<b>Learning picks vs confident picks.</b> {len(_l)} learning pick{'s' if len(_l) != 1 else ''} finished: average <b>{_l['pnl_pct'].mean():+.2f}%</b>, "
-                                  f"{int((_l['outcome'] == 'WIN').sum())} hit the goal. " + (f"{len(_c)} confident pick{'s' if len(_c) != 1 else ''}: average <b>{_c['pnl_pct'].mean():+.2f}%</b>, "
-                                  f"{int((_c['outcome'] == 'WIN').sum())} hit the goal." if len(_c) else "No confident picks have finished yet.")
-                                  + " Learning picks exist so the AI keeps learning; judge the app mainly on confident picks.")
-        if n_ < 30:
-            callout("warn", "⏳", f"<b>Too early to judge.</b> Only {n_} trades have finished. Results this early can be pure luck.")
-        elif exp_ > 0.3:
-            callout("good", "✅", f"<b>Looking positive.</b> On average each trade made <b>{exp_:+.2f}%</b> after costs ({n_} trades).")
-        elif exp_ > -0.3:
-            callout("info", "➖", f"<b>Roughly break-even.</b> On average <b>{exp_:+.2f}%</b> per trade after costs ({n_} trades).")
-        else:
-            callout("bad", "⚠️", f"<b>Losing money after costs.</b> On average <b>{exp_:+.2f}%</b> per trade ({n_} trades). Don't use real money.")
-        ch1, ch2 = st.columns([3, 2])
-        with ch1:
-            chart_cumulative(perf_eq_df, "Your running profit/loss (₹) — going up is good", key="cum_shares")
-        with ch2:
-            chart_outcomes(perf, key="outcomes_shares")
-
-        sec_title("✨", "Highlights")
-        best_i, worst_i = perf_eq_df["pnl_pct"].idxmax(), perf_eq_df["pnl_pct"].idxmin()
-        sk_n, sk_win = current_streak(perf_eq_df)
-        dh = [(b - a).days for a, b in zip(perf_eq_df["entry_date"], perf_eq_df["exit_date"]) if a is not None and b is not None]
-        s1, s2, s3, s4 = st.columns(4)
-        with s1:
-            stat_card("🏆 Best trade", f"{perf_eq_df.loc[best_i, 'ticker']} {perf_eq_df.loc[best_i, 'pnl_pct']:+.1f}%", "after costs")
-        with s2:
-            stat_card("📉 Worst trade", f"{perf_eq_df.loc[worst_i, 'ticker']} {perf_eq_df.loc[worst_i, 'pnl_pct']:+.1f}%", "after costs")
-        with s3:
-            stat_card("🔥 Current streak", f"{sk_n} {'profitable' if sk_win else 'unprofitable'}" if sk_n else "–", "trades in a row")
-        with s4:
-            stat_card("⏱️ Typical hold", f"{np.mean(dh):.1f} days" if dh else "–", "buy to sell")
-
-        nifty_s = get_nifty_close_series()
-        first_d = perf_eq_df["entry_date"].dropna().min()
-        nifty_since = nifty_return_between(nifty_s, first_d, ist_now().date()) if first_d else None
-        excess = [float(r["pnl_pct"]) - x for _, r in perf_eq_df.iterrows() for x in [nifty_return_between(nifty_s, r["entry_date"], r["exit_date"])] if x is not None]
-        if nifty_since is not None:
-            ex_ = float(np.mean(excess)) if excess else None
-            beat = ("" if ex_ is None else (f" On the same days, your trades <b>beat the market by {ex_:.2f}%</b> per trade on average." if ex_ >= 0
-                                            else f" On the same days, your trades <b>trailed the market by {abs(ex_):.2f}%</b> per trade on average."))
-            callout("info", "🇮🇳", f"<b>Compared with the market:</b> the Nifty 50 moved <b>{nifty_since:+.2f}%</b> since your first trade.{beat}")
-        with st.expander("🔍 More detail"):
-            b1, b2, b3, b4 = st.columns(4)
-            b1.metric("Average winning trade", inr(perf["avg_win"]))
-            b2.metric("Average losing trade", inr(perf["avg_loss"]))
-            b3.metric("Money won ÷ money lost", f"{perf['profit_factor']:.2f}" if perf["profit_factor"] is not None else "no losses yet")
-            b4.metric("Biggest drop from a peak", inr(perf["max_dd"]))
-            chart_hist(perf_eq_df)
-            sg = sector_stats(perf_eq_df)
-            if not sg.empty:
-                st.dataframe(sg.rename(columns={"n": "Trades", "avg": "Average %", "win_rate": "Win rate %"})[["Sector", "Trades", "Average %", "Win rate %"]].round(1)
-                             .sort_values("Average %", ascending=False), width="stretch", hide_index=True)
-
-    sec_title("🔎", "All trades")
-    master = []
-    if not df_eq.empty:
-        d = df_eq.copy()
-        d["Sector"] = d.apply(lambda x: get_trade_sector(x["ticker"], x["features_json"]), axis=1)
-        d["Type"] = d["features_json"].apply(lambda f: "Share (🧪 learning pick)" if is_learning_trade(f) else "Share")
-        d["_o"] = d["status"].apply(classify_outcome)
-        d["Result"] = d.apply(lambda x: friendly_status(x["status"], is_stop_breakeven_protected(float(x["entry_price"]), float(x["stop_loss"]))), axis=1)
-        master.append(d.rename(columns={"date_str": "Date", "ticker": "Stock", "entry_price": "Bought at (₹)", "target_price": "Goal (₹)", "stop_loss": "Safety exit (₹)",
-                                        "latest_price": "Price now (₹)", "pnl_pct": "Profit/Loss (%)", "last_audited": "Last checked"}))
-    if not df_opt.empty:
-        d = df_opt.copy()
-        d["Type"] = d["option_contract"].apply(lambda c: "Option (live quote)" if is_live_option(c) else "Option (model price)")
-        d["Sector"] = d["share_name"].apply(get_ticker_sector)
-        d["_o"] = d["status"].apply(classify_outcome)
-        d["Result"] = d["status"].apply(friendly_status)
-        master.append(d.rename(columns={"date_key": "Date", "option_contract": "Stock", "entry_premium": "Bought at (₹)", "current_option_price": "Price now (₹)",
-                                        "target_premium": "Goal (₹)", "stop_loss_premium": "Safety exit (₹)", "pnl_pct": "Profit/Loss (%)", "last_audited": "Last checked"}))
-    if master:
-        keep = ["Date", "Stock", "Sector", "Type", "Bought at (₹)", "Goal (₹)", "Safety exit (₹)", "Price now (₹)", "Profit/Loss (%)", "Result", "Last checked", "_o"]
-        mdf = pd.concat([m[[c for c in keep if c in m.columns]] for m in master], ignore_index=True).sort_values("Date", ascending=False, kind="stable").reset_index(drop=True)
-        f1, f2, f3, f4 = st.columns(4)
-        lmap = {"Open": "ACTIVE", "Won": "WIN", "Lost": "LOSS", "Saved (no loss)": "BE", "Closed after 7 days": "EXPIRED"}
-        ch_status = f1.multiselect("Result", list(lmap.keys()), default=list(lmap.keys()))
-        t_opts = sorted(mdf["Type"].unique())
-        ch_types = f2.multiselect("Type", t_opts, default=t_opts)
-        s_opts = sorted(mdf["Sector"].astype(str).unique())
-        ch_sectors = f3.multiselect("Sector", s_opts, default=s_opts)
-        search = f4.text_input("Search a stock", "")
-        view = mdf[mdf["_o"].isin({lmap[s] for s in ch_status}) & mdf["Type"].isin(ch_types) & mdf["Sector"].astype(str).isin(ch_sectors)]
-        if search.strip():
-            view = view[view["Stock"].astype(str).str.contains(search.strip(), case=False, na=False)]
-        view = view.drop(columns=["_o"])
-        st.caption(f"Showing **{len(view)}** of {len(mdf)}. Share prices in ₹. Click a column heading to sort.")
-        st.dataframe(style_ledger(view), width="stretch", hide_index=True)
-        st.download_button("⬇️ Download as spreadsheet (CSV)", view.to_csv(index=False).encode("utf-8"), "my_trades.csv", "text/csv")
+        st.info("No validated option quotes in this batch. No synthetic option buy signals will be generated.")
+    # Backward-compatible option paper journal; create at most one new signal/day.
+    idea = generate_daily_options_alpha()
+    if idea:
+        st.success("Best daily option opportunity is logged as a **paper idea** (no broker purchase).")
+        st.write(f"**{idea['option_contract']}** | recorded entry ₹{idea['entry_premium']:,.2f} | paper capital {inr(idea['total_capital'])}")
     else:
-        st.info("No trades yet.")
+        st.caption("No option idea logged today — the engine is allowed to do nothing.")
+    st.caption("**Risks:** option premiums can go to zero. Near expiry, gap moves, IV collapse and physical settlement may cause outsized losses or obligations. Do not treat stop prices as guaranteed.")
 
-# ==============================================================================
-# 19. TAB: WHAT THE AI LEARNED
-# ==============================================================================
-with tab_learn:
-    n_ = perf["n"]
-    decided_n = int(perf_eq_df["outcome"].isin(["WIN", "LOSS"]).sum()) if not perf_eq_df.empty else 0
-    level = "🌱 Rookie" if n_ < 30 else ("📚 Learning" if n_ < 100 else "🎓 Experienced")
-    sec_title("🧠", "What the AI has learned", "in plain English")
-    st.markdown(_collapse(
-        f'<div class="stat"><div class="l">Experience level</div><div class="v">{level} — {n_} finished trades</div>'
-        f'<div class="meter"><div style="width:{min(100.0, decided_n / MIN_SETTLED_TO_RETRAIN * 100.0):.0f}%"></div></div>'
-        f'<div class="sub2">{decided_n} of {MIN_SETTLED_TO_RETRAIN} clear win/loss trades needed before the AI may consider upgrading itself.</div></div>'), unsafe_allow_html=True)
-    if n_ == 0:
-        callout("info", "🌱", "<b>The AI hasn't finished any trades yet</b>, so it has nothing to learn from. After a few trades close you'll see lessons, strengths and weak spots here.")
+with page_learning:
+    st.subheader("What the AI has actually learned")
+    history = load_closed_trades_df()
+    if history.empty:
+        st.info("No finished share records available yet. Model performance cannot be measured.")
     else:
-        sec_title("💬", "What I've noticed")
-        ins = build_insights(perf_eq_df)
-        for line in (ins or ["Not enough trades yet to spot patterns."]):
-            st.markdown(f"- {line}")
-        sec_title("📰", "Latest lessons", "most recent finished trades")
-        for _, r in perf_eq_df.tail(5).iloc[::-1].iterrows():
-            o_ = classify_outcome(r["status"])
-            lesson = {"WIN": "Small confidence boost for this stock for a while.", "LOSS": "More cautious about this stock for a while.",
-                      "BE": "The safety exit protected the money. No change.", "EXPIRED": "Timed out — nothing learned."}.get(o_, "")
-            st.markdown(_collapse(f'<div class="lesson"><b>{esc(r["ticker"])}</b> · {esc(friendly_status(r["status"]))} · '
-                                  f'<b class="{"pos" if r["pnl_pct"] >= 0 else "neg"}">{float(r["pnl_pct"]):+.1f}%</b><br><span class="sub2">{esc(lesson)}</span></div>'), unsafe_allow_html=True)
-        sec_title("🏭", "Where it's working and where it isn't", "by sector (3+ trades)")
-        sg = sector_stats(perf_eq_df)
-        sg3 = sg[sg["n"] >= 3] if not sg.empty else sg
-        lc, rc = st.columns(2)
-        with lc:
-            st.markdown("**✅ Working well**")
-            good = sg3[sg3["avg"] > 0].sort_values("avg", ascending=False).head(5) if not sg3.empty else sg3
-            if len(good):
-                st.markdown(hbars_html([(r["Sector"], float(r["avg"]), f"{r['avg']:+.1f}% · {int(r['n'])} trades") for _, r in good.iterrows()]), unsafe_allow_html=True)
-            else:
-                st.caption("No sector has a clear profit yet.")
-        with rc:
-            st.markdown("**⚠️ Struggling**")
-            bad = sg3[sg3["avg"] < 0].sort_values("avg").head(5) if not sg3.empty else sg3
-            if len(bad):
-                st.markdown(hbars_html([(r["Sector"], float(r["avg"]), f"{r['avg']:+.1f}% · {int(r['n'])} trades") for _, r in bad.iterrows()]), unsafe_allow_html=True)
-            else:
-                st.caption("No sector is clearly losing (or not enough trades yet).")
-        sec_title("📈", "Is it getting better?", "win rate of the last 10 trades")
-        chart_rolling(perf_eq_df, 10)
-        sec_title("🧷", "Stocks it remembers", "lessons fade by half every 30 days")
-        careful, liked = compute_memory(closed_all)
-        m1, m2 = st.columns(2)
-        with m1:
-            st.markdown("**🚧 Extra careful with**")
-            if careful:
-                st.markdown(hbars_html([(t, -float(p), f"-{p} pts · ~{d}d left") for t, p, d in careful[:6]]), unsafe_allow_html=True)
-            else:
-                st.caption("None right now.")
-        with m2:
-            st.markdown("**👍 Slightly more confident about**")
-            if liked:
-                st.markdown(hbars_html([(t, float(p), f"+{p} pts · ~{d}d left") for t, p, d in liked[:6]]), unsafe_allow_html=True)
-            else:
-                st.caption("None right now.")
-
-    sec_title("🎚️", "Can you trust its confidence number?")
-    cal_rows = calibration_rows(closed_all)
-    if len(cal_rows) >= 10:
-        said, actual = float(np.mean([c for c, _ in cal_rows])), float(np.mean([h for _, h in cal_rows]) * 100.0)
-        kind = "warn" if actual < said - 8 else "good"
-        verdict = "it has been overconfident" if actual < said - 8 else ("it has been a little modest" if actual > said + 8 else "its confidence is a fair guide")
-        callout(kind, "🎚️", f"On average the AI said it was <b>{said:.0f}% sure</b> and was right <b>{actual:.0f}%</b> of the time — {verdict}.")
-        chart_calibration(cal_rows)
+        finished = history[history["status"].apply(classify_outcome).isin(["WIN","LOSS","EXPIRED","BE"])].copy()
+        n = len(finished)
+        wins = sum(finished["status"].apply(classify_outcome)=="WIN")
+        st.write(f"**Completed share ideas:** {n:,} • Target reached: {wins:,} • Other outcomes: {n-wins:,}")
+        st.write(f"**Average recorded net P/L:** {finished['pnl_pct'].mean():+.2f}%" if n else "No finished results")
+        st.caption("These are outcomes from this paper journal, not verified broker fills or an independent out-of-sample backtest.")
+        cal = st.session_state.get("cal_info",{})
+        if cal:
+            st.write("Model calibration:",cal.get("mode","Unknown"))
+        state_raw = get_meta("retrain_state","{}")
+        try:
+            train_state = json.loads(state_raw)
+        except (TypeError,ValueError):
+            train_state = {}
+        st.write("**Last retraining attempt:**",train_state.get("last_attempt_date","Not yet eligible"))
+        st.write("**Latest model promotion:**",train_state.get("last_promoted","Not yet"))
+        st.caption(f"Re-train when there are at least {MIN_SETTLED_TO_RETRAIN} labelled cases, then after each {RETRAIN_STEP_INTERVAL} new cases. Keep the current model unless a challenger passes later-period testing.")
+        with st.expander("See past share trades"):
+            st.dataframe(finished[["ticker","date_str","status","entry_price","pnl_pct","capital_allocated"]]
+                         .rename(columns={"ticker":"Share","date_str":"Date","status":"Result",
+                                 "entry_price":"Entry ₹","pnl_pct":"Paper P/L %","capital_allocated":"Reserved ₹"}).tail(100),
+                         hide_index=True,use_container_width=True)
+    options_history = load_options_journal_df()
+    st.subheader("How the option research has performed")
+    feedback = option_paper_feedback()
+    if feedback:
+        for direction in ("CE","PE"):
+            v = feedback.get(direction)
+            if v:
+                st.write(f"**{direction} (live-quoted paper records):** {v['n']} finished, "
+                         f"{v['profitable']:.0%} profitable, average {v['mean']:+.1f}%")
     else:
-        st.info("This appears once at least 10 trades have clearly won or lost.")
+        st.caption("There are no completed live-quoted option samples yet; direction labels rely on transparent rules, not a trained options model.")
+    st.subheader("Saved option research and paper outcomes")
+    if not options_history.empty:
+        with st.expander("See past option ideas"):
+            st.dataframe(options_history[["date_key","option_contract","status","total_capital","pnl_pct"]]
+                         .rename(columns={"date_key":"Date","option_contract":"Call/put contract",
+                                          "status":"Result","total_capital":"Premium ₹","pnl_pct":"Paper P/L %"}).tail(100),
+                         hide_index=True,use_container_width=True)
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH,read_only=True)
+        try:
+            saved = con.execute("SELECT date_key,symbol,side,decision,reason,checked_at FROM option_watchlist ORDER BY checked_at DESC LIMIT 100").df()
+        finally:
+            con.close()
+    if not saved.empty:
+        st.caption("Past options research is saved separately, including rejected opportunities.")
+        with st.expander("See previous call/put reviews"):
+            st.dataframe(saved,hide_index=True,use_container_width=True)
+    st.info("For genuine years-long unattended operation, run a separately scheduled worker with monitoring, model/data updates, exchange contract changes, encrypted backups and alerts. A browser-based Streamlit refresh alone cannot provide that guarantee.")
 
-    sec_title("🔧", "The AI itself")
-    try:
-        rstate = json.loads(get_meta("retrain_state", "{}") or "{}")
-    except Exception:
-        rstate = {}
-    cal = st.session_state.get("cal_info")
-    st.markdown(
-        f"- **Version in use:** {st.session_state.get('ml_model_source', 'not loaded yet')}\n"
-        f"- **Last upgrade:** {rstate.get('last_promoted', 'never — still the original')}\n"
-        f"- **Upgrade rule:** only after {MIN_SETTLED_TO_RETRAIN}+ clear win/loss trades, and only if the new version tests better. Your original model file is never overwritten."
-        + (f"\n- **Confidence tuning:** {cal['mode']}." if cal else "")
-        + "\n- **Options:** this AI learns from share trades only. Options have their own separate learner — see the 🎲 Options tab.")
-    with st.expander("How the AI picks a share"):
-        st.markdown(
-            "1. Downloads prices for **every share on the NSE** (normal 'EQ' series), skipping ones that are thinly traded, under ₹10, stuck at their price limit or extremely jumpy.\n"
-            "2. Keeps shares in a steady uptrend that aren't overheated and are trading normally.\n"
-            f"3. The AI model scores how likely each is to reach its goal before its safety exit; the best {MAX_DEEP_CHECKS} become finalists.\n"
-            "4. Finalists get a **fresh price**, and their score is corrected using your real results, then nudged by past lessons, the market and the news check.\n"
-            "5. Shares with bad news (SEBI notices, pledges, defaults and similar) are blocked.\n"
-            f"6. A share is bought only if it's in an uptrend, trading normally, has at least **{MIN_NET_RETURN_PCT:.1f}% possible profit after costs**, and is "
-            "**expected to make money after all costs** — its chance of reaching the goal (as corrected by your real results) must beat the break-even chance for that trade.\n"
-            f"7. While it has fewer than {MIN_CALIBRATION_SAMPLES} clear results, if nothing qualifies it takes at most **{LEARNING_PICKS_PER_DAY} 🧪 learning pick a day** "
-            "(the best-ranked share that passes every safety check), so it can't get stuck learning nothing. Learning picks are marked everywhere and shown separately in Results.")
-
-# ==============================================================================
-# 20. TAB: OPTIONS
-# ==============================================================================
-with tab_options:
-    sec_title("🎲", "Options idea of the day", "paper trading")
-    st.caption(f"One call-option idea a day under {inr(OPTION_BUDGET_INR)}. Nothing is bought for real, and it is **not** counted in your share results.")
-    if opt_signal:
-        live_src = is_live_option(opt_signal["option_contract"])
-        with st.container(border=True):
-            st.markdown(f'<span class="tag {"good" if live_src else "warn"}">{"Live NSE quote" if live_src else "Estimated price — live quote unavailable"}</span>', unsafe_allow_html=True)
-            o1, o2, o3 = st.columns(3)
-            with o1:
-                st.metric("Idea", option_short_name(opt_signal["option_contract"]), help="A 'CE' (call) option gains value if the share price rises.")
-                st.markdown(f"Share price when picked: **₹{float(opt_signal['underlying_spot']):,.2f}**")
-            with o2:
-                st.metric("Sell price now", f"₹{float(opt_signal['current_option_price']):.2f}", f"{float(opt_signal['pnl_pct']):+.2f}% vs cost (₹{float(opt_signal['entry_premium']):.2f})")
-                st.markdown(f"Expected wobble: **{opt_signal['implied_vol']}%** a year")
-            with o3:
-                st.metric("Cost to buy", inr(opt_signal["total_capital"]), f"{int(float(opt_signal['lot_size']))} shares in one lot", delta_color="off")
-                st.markdown(f"Trend strength: **{opt_signal['ai_confidence']}** (not a chance of winning)")
-            m1, m2, m3 = st.columns(3)
-            m1.info(f"🎯 Goal: ₹{float(opt_signal['target_premium']):.2f} (+{(OPTION_TARGET_MULT - 1) * 100:.0f}%)")
-            m2.warning(f"🛑 Safety exit: ₹{float(opt_signal['stop_loss_premium']):.2f} (-{(1 - OPTION_STOP_MULT) * 100:.0f}%)")
-            m3.success(f"Status: **{friendly_status(opt_signal['status'])}**")
-            if not live_src:
-                st.caption("The price comes from a maths formula (Black-Scholes) because NSE's live quote wasn't available. It is only an estimate.")
-    else:
-        st.info(st.session_state.get("opt_note") or "No option idea today.")
-    if not state["trading_day"]:
-        st.caption(f"NSE is closed today ({state['reason']}), so no new idea is created.")
-
-    # ---------- scoreboard ----------
-    sec_title("📊", "Options scoreboard", "finished option ideas, kept apart from your share results")
-    if perf_o["n"] == 0:
-        score_cards([("Options profit/loss", "₹0", "no finished ideas yet", "", ""), ("Win rate", "–", "needs finished ideas", "", ""),
-                     ("Finished ideas", "0", "one idea a day at most", "", ""), ("Open right now", str(len(active_opt)), f"{inr(opt_open_unreal)} so far", "", "")])
-        callout("info", "⏳", "<b>No option idea has finished yet.</b> Each one closes at its goal, its safety exit, or after 7 days.")
-    else:
-        net_o = perf_o["net_inr"]
-        score_cards([
-            ("Options profit/loss", inr(net_o), f"{inr(perf_o['expectancy_inr'])} per idea on average", "good" if net_o > 0 else ("bad" if net_o < 0 else ""), "pos" if net_o > 0 else ("neg" if net_o < 0 else "")),
-            ("Win rate", f"{perf_o['target_hit_rate']:.0f}%", f"{perf_o['wins']} won · {perf_o['losses']} lost · {perf_o['expired']} timed out", "", ""),
-            ("Finished ideas", str(perf_o["n"]), f"likely win rate {perf_o['ci_low']:.0f}–{perf_o['ci_high']:.0f}%", "", ""),
-            ("Open right now", str(len(active_opt)), f"{inr(opt_open_unreal)} so far", "good" if opt_open_unreal > 0 else ("bad" if opt_open_unreal < 0 else ""), ""),
-        ])
-        if perf_o["n"] < 20:
-            callout("warn", "⏳", f"<b>Too early to judge.</b> Only {perf_o['n']} option idea{'s have' if perf_o['n'] != 1 else ' has'} finished. Options swing a lot, so early results are mostly luck.")
-        oc1, oc2 = st.columns([3, 2])
-        with oc1:
-            chart_cumulative(perf_opt_df, "Options running profit/loss (₹)", key="cum_options")
-        with oc2:
-            chart_outcomes(perf_o, title="How your option ideas ended", key="outcomes_options")
-        lv, md_ = opt_learn.get("live"), opt_learn.get("model")
-        if lv or md_:
-            q1, q2 = st.columns(2)
-            with q1:
-                stat_card("📡 Ideas with a live NSE price", f"{lv['avg']:+.1f}% average" if lv else "none yet",
-                          f"{lv['n']} finished · {lv['win_rate']:.0f}% won" if lv else "NSE's quote wasn't reachable for any idea so far")
-            with q2:
-                stat_card("🧮 Ideas with an estimated price", f"{md_['avg']:+.1f}% average" if md_ else "none yet",
-                          f"{md_['n']} finished · {md_['win_rate']:.0f}% won · results are estimates too" if md_ else "every idea so far had a live quote")
-
-    # ---------- open options ----------
-    sec_title("🟢", "Open option ideas", f"{len(active_opt)} running")
-    if active_opt.empty:
-        empty_box("No option ideas are open right now.")
-    else:
-        oc = st.columns(min(3, len(active_opt)))
-        for i_, (_, o) in enumerate(active_opt.iterrows()):
-            with oc[i_ % len(oc)]:
-                st.markdown(option_mini_html(o), unsafe_allow_html=True)
-
-    # ---------- the options learner ----------
-    sec_title("🧠", "What the options learner has learned", "separate from the share AI")
-    rn = int(opt_learn.get("recent_n", 0))
-    st.markdown(_collapse(
-        f'<div class="stat"><div class="l">Options experience</div><div class="v">{opt_learn["n"]} finished idea{"s" if opt_learn["n"] != 1 else ""}</div>'
-        f'<div class="meter"><div style="width:{min(100.0, rn / OPT_LEARN_MIN_TRADES * 100.0):.0f}%"></div></div>'
-        f'<div class="sub2">{min(rn, OPT_LEARN_MIN_TRADES)} of {OPT_LEARN_MIN_TRADES} recent ideas (last {OPT_LEARN_WINDOW_DAYS} days) needed before it may become pickier. '
-        f'Until then only the “rest a share after a loss” rule is used.</div></div>'), unsafe_allow_html=True)
-    rules = []
-    if opt_learn["rest"]:
-        rules.append("🚧 <b>Taking a break from:</b> " + ", ".join(f"{esc(k)} (~{v} day{'s' if v != 1 else ''} left)" for k, v in sorted(opt_learn["rest"].items(), key=lambda x: -x[1]))
-                     + " — their recent options lost money. The break fades by itself.")
-    if opt_learn["bar"] > 60.0:
-        rise = trend_bar_to_rise(opt_learn["bar"])
-        rise_txt = f"a 5-day rise of at least <b>{rise:+.1f}%</b>" if rise > 0 else f"trend strength {opt_learn['bar']:.0f}+"
-        rules.append(f"📈 <b>Pickier:</b> recent ideas lost <b>{opt_learn['wavg']:+.1f}%</b> on average, so it now needs {rise_txt} before it picks a share.")
-    elif opt_learn["ready"]:
-        rules.append(f"✅ <b>Normal pickiness:</b> recent ideas made <b>{opt_learn['wavg']:+.1f}%</b> on average, so it isn't adding extra filters.")
-    if opt_learn["live_only"]:
-        rules.append("📡 <b>Real prices only:</b> ideas priced with the maths formula have been losing, so it now only takes ideas with a real NSE quote.")
-    if rules:
-        for r_ in rules:
-            callout("info", "🧠", r_)
-    else:
-        callout("info", "🌱", "<b>No rules in force yet.</b> It hasn't seen enough finished option ideas to change anything.")
-    if opt_learn.get("by_share"):
-        bs = sorted(((k, v) for k, v in opt_learn["by_share"].items() if v), key=lambda x: -x[1]["avg"])
-        st.markdown(hbars_html([(k, float(v["avg"]), f"{v['avg']:+.1f}% · {v['n']} idea{'s' if v['n'] != 1 else ''}") for k, v in bs[:9]]), unsafe_allow_html=True)
-        st.caption("Average result of finished option ideas, per share.")
-
-    # ---------- every option idea ----------
-    if not df_opt.empty:
-        sec_title("📜", "Every option idea")
-        od = df_opt.copy()
-        od["Price source"] = od["option_contract"].apply(lambda c: "Live NSE quote" if is_live_option(c) else "Estimated")
-        od["Contract"] = od["option_contract"].apply(option_short_name)
-        od["Result"] = od["status"].apply(friendly_status)
-        od = od.rename(columns={"date_key": "Date", "entry_premium": "Bought at (₹)", "current_option_price": "Price now (₹)", "target_premium": "Goal (₹)",
-                                "stop_loss_premium": "Safety exit (₹)", "pnl_pct": "Profit/Loss (%)", "ai_confidence": "Trend strength", "last_audited": "Last checked"})
-        ocols = ["Date", "Contract", "Price source", "Bought at (₹)", "Goal (₹)", "Safety exit (₹)", "Price now (₹)", "Profit/Loss (%)", "Trend strength", "Result", "Last checked"]
-        st.dataframe(style_ledger(od[[c for c in ocols if c in od.columns]]), width="stretch", hide_index=True)
-
-    with st.expander("How the options idea works"):
-        st.markdown(
-            "- It looks at the biggest F&O shares and picks the one with the strongest 5-day climb (skipping any with bad news or a recent trade).\n"
-            "- The contract is a **call about 2% above the share price**, expiring on the **last Tuesday of the month** (NSE's stock-option expiry day).\n"
-            "- If NSE gives a real buy/sell quote with a tight gap and real trading, that's used. Otherwise a maths-formula price is used and clearly labelled.\n"
-            "- You \"buy\" at the higher asking price and are valued at the lower selling price, so every trade starts slightly down.\n"
-            f"- Goal +{(OPTION_TARGET_MULT - 1) * 100:.0f}%, safety exit -{(1 - OPTION_STOP_MULT) * 100:.0f}%, and it closes after {MAX_HOLD_CALENDAR_DAYS} days anyway.\n"
-            "- **The options learner** only learns from finished option ideas and only changes the options idea — never the share AI. "
-            "It rests a share after a recent option loss, gets pickier about the 5-day climb if recent ideas lose on average, and can insist on real NSE prices. "
-            f"Its stricter rules only look at the last {OPT_LEARN_WINDOW_DAYS} days, so they lift by themselves and get re-tested.\n"
-            "- Lot sizes come from a built-in table. **NSE changes them from time to time — please check them against NSE's current list.**")
-
-st.markdown('<div class="disc">Practice tool using pretend money. Not investment advice. Past results don’t predict future results.</div>', unsafe_allow_html=True)
+st.caption("NSE data may be delayed or unavailable. This research application does not connect to any broker, place orders or guarantee returns.")
