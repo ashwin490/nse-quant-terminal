@@ -133,3 +133,36 @@ python -m unittest discover -s tests -v
 The startup reconciler protects the local DuckDB schema only. It does not alter
 the remote Supabase PostgreSQL schema. A separate, reviewed server migration is
 required if you change the Supabase tables.
+
+## Version 4: colourful dashboard + recovery of missing history
+
+### Appearance
+- Brighter light theme, modern responsive cards, friendly colours, clear `CONSIDER` / `WATCH` / `AVOID` tags.
+- Four simple tabs: **Overview**, **Stocks**, **Calls & puts**, **History & learning**.
+- Searchable stock ideas and contracts; detailed figures are hidden until needed. **No price graphs.**
+- The main screen only shows important capital totals and active paper positions. History is on its own tab.
+
+### Why historical records might appear missing
+Your DuckDB history file is **ignored by Git** on purpose, and a Streamlit Community Cloud instance has an **ephemeral local filesystem**. A brand-new Cloud deployment cannot automatically see a `.duckdb` file sitting only on your PC. A schema upgrade also cannot create historical records that were never available on the server. The app can only recover records actually present in an old backup or in your configured Supabase tables.
+
+**How to recover:**
+1. Open **History & learning → Recover previous data**.
+2. If the old app used Supabase, set `SUPABASE_URL` and `SUPABASE_KEY` in the **Streamlit Cloud app Secrets**; click **Restore history from Supabase**. Check counts and any errors.
+3. Alternatively, find your old project's **`market_data.duckdb`** or a historical `backups/*.duckdb` on your PC, and upload it using **Or choose your old DuckDB file** → **Merge my old history**. The import validates the backup, upgrades a temporary copy to the supported schema, snapshots the current DB, and inserts **only missing journal IDs**. It never intentionally overwrites an existing journal row. The displayed history then includes open, finished, and legacy `UNKNOWN` statuses (older UI hid some of these).
+4. Use **Prepare downloadable DuckDB backup** and save the `.duckdb` file somewhere safe outside Streamlit Cloud. If Supabase is configured, you may also **Sync up to 200 historical rows** to its *legacy* `predictions` and `options_journal` tables (best-effort; verify result). The research review `option_watchlist` is **not** synced to Supabase by that action.
+5. Keep your original `models/lgbm_stock_ranker.pkl` and any later upgraded model files separately: the history database does not contain those model binaries.
+
+**Data cannot be recreated:** If your historical data never existed in Supabase, you have no local database backup, and the previous Streamlit Cloud instance has already been reset, no software update can restore those lost rows. Avoid uploading passwords, Supabase keys, or your local `secrets.toml` to the dashboard or Git.
+
+### Deployment files
+Copy **`app.py`, `schema_migrations.py`, `history_recovery.py`, `dashboard_theme.py`, `quant_guardrails.py`, `health_check.py`, `requirements.txt`, `.streamlit/config.toml`** and the tests from this package into your existing repo. Do **not** replace your existing `market_data.duckdb`, `models/`, or `.streamlit/secrets.toml`. Add files and push to Git, but verify `.gitignore` excludes your secrets and data.
+
+```powershell
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+git add app.py schema_migrations.py history_recovery.py dashboard_theme.py quant_guardrails.py health_check.py requirements.txt README.md .streamlit/config.toml tests/
+git commit -m "Redesign NSE dashboard and add non-destructive history recovery"
+git push origin HEAD
+```
+
+Some DuckDB integration tests may be skipped if DuckDB is not installed in the environment that runs tests. Verify them locally. Also test with copies of your real historical data before publishing.
