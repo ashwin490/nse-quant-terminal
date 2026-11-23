@@ -76,6 +76,11 @@ def review_long_option(*, kind: str, spot: float, strike: float, bid: float, ask
         reasons.append("One lot exceeds the ₹50,000 option limit, ₹2 lakh options pool or remaining capital")
     if days_left < 8:
         reasons.append("Expiry is too close; rapid time decay/physical settlement risk")
+    if days_left > 65:
+        reasons.append("Expiry is outside the supported holding-risk window")
+    if (not math.isfinite(iv_pct) or iv_pct <= 0 or
+            not math.isfinite(realized_vol_pct) or realized_vol_pct <= 0):
+        reasons.append("Implied or historical volatility is unavailable/invalid")
     if open_interest < 100:
         reasons.append("Open interest is too low")
     if spread > 7:

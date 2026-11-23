@@ -1,55 +1,76 @@
 """Read-only diagnostics for NSE stock and option scans.
 
-Never fabricates quotes, contract availability, or paper positions.  The UI
-can distinguish a batch *selected* from actual NSE option-chain responses.
+HTTP 200, a valid JSON payload, a fresh chain, and usable CE/PE quotes are
+separate events.  None is silently reported as a successful prediction.
 """
 from __future__ import annotations
 
 
 def new_option_scan_health(selected: int = 0, universe: int = 0) -> dict:
-    return {
-        "selected": max(0, int(selected)),
-        "universe": max(0, int(universe)),
-        "price_histories": 0,
-        "directional": 0,
-        "chains_received": 0,
-        "fresh_chains": 0,
-        "expiry_matches": 0,
-        "missing_lots": 0,
-        "contract_reviews": 0,
-        "consider": 0,
-        "watch": 0,
-        "avoid": 0,
-        "http_status_counts": {},
-    }
+    counters = (
+        'underlyings_attempted', 'price_histories', 'directional',
+        'contract_info_received', 'chains_received', 'v3_rows_received',
+        'legacy_rows_received', 'expiry_matches', 'no_supported_expiry_lot',
+        'empty_expiry_rows', 'fresh_chains', 'stale_or_untimed', 'chain_rows',
+        'spot_disagreements', 'missing_underlying_spot', 'strikes_examined', 'missing_nearby_strikes',
+        'missing_bid_ask', 'valid_bid_ask', 'contract_reviews',
+        'guardrail_rejections', 'consider', 'watch', 'avoid',
+        'time_budget_reached', 'rate_limited', 'missing_lots',
+    )
+    result = {name: 0 for name in counters}
+    result.update(selected=max(0, int(selected)), universe=max(0, int(universe)), http_status_counts={})
+    return result
 
 
 def option_scan_summary(stats: dict) -> str:
     n = lambda k: max(0, int(stats.get(k, 0)))
-    base = (f"{n('selected')} of {n('universe')} F&O underlyings selected for this rotating batch · "
-            f"{n('price_histories')} with price history · "
-            f"{n('directional')} passed movement checks · "
-            f"{n('chains_received')} option chains received · "
+    base = (f"{n('underlyings_attempted')}/{n('selected')} selected from {n('universe')} F&O shares actually attempted · "
+            f"{n('directional')} direction-qualified · "
+            f"{n('contract_info_received')} expiry-info responses · "
+            f"{n('v3_rows_received')} v3 chains with matching strikes · "
+            f"{n('legacy_rows_received')} legacy chains with matching strikes · "
             f"{n('fresh_chains')} fresh chains · "
-            f"{n('contract_reviews')} CE/PE contract reviews.")
+            f"{n('strikes_examined')} nearby CE/PE strikes · "
+            f"{n('valid_bid_ask')} valid bid/ask quotes · "
+            f"{n('contract_reviews')} risk reviews. ")
+    extra = ''
+    if n('time_budget_reached'):
+        extra += 'Scan time budget reached; remaining selected symbols were NOT checked. '
+    if n('rate_limited'):
+        extra += 'NSE returned HTTP 429 (rate limited); additional requests were stopped. '
     if n('contract_reviews'):
-        return (base + f" Outcomes: {n('consider')} CONSIDER, "
-                f"{n('watch')} WATCH, {n('avoid')} AVOID.")
-    if n('directional') == 0:
-        return base + " None of the selected shares passed the movement screen; this is not a scan of all contracts."
-    if n('chains_received') == 0:
-        return base + " NSE option chains were unavailable; no valid contract decision can be made."
-    if n('fresh_chains') == 0:
-        return base + " Exchange responses did not contain verified fresh quotes."
-    if n('expiry_matches') == 0:
-        return base + " No supported contracts were found with a verified 8–65 day expiry."
-    return base + " No contract passed the required strike, expiry and lot-size checks."
+        extra += (f"Best-per-side outcomes: {n('consider')} CONSIDER · "
+                  f"{n('watch')} WATCH · {n('avoid')} AVOID. ")
+    elif n('directional') == 0:
+        extra += 'No underlyings passed the directional movement screen. '
+    elif n('chains_received') == 0:
+        extra += 'No NSE chains with usable expiry rows; inspect endpoint responses. '
+    elif n('fresh_chains') == 0:
+        extra += 'Quote timestamps were stale/missing or not confirmed current. '
+    elif n('valid_bid_ask') == 0:
+        extra += 'The selected nearby strikes had no verifiable positive bid/ask. '
+    elif n('contract_reviews') == 0:
+        extra += 'No contract passed the minimum checks needed for a review. '
+    rejects = (
+        ('no_supported_expiry_lot', 'No matching allowed expiry and verified month lot'),
+        ('empty_expiry_rows', 'Empty requested-expiry rows'),
+        ('stale_or_untimed', 'Stale or timestamp-free chain'),
+        ('spot_disagreements', 'Underlying quote/history disagreement >10%'),
+        ('missing_underlying_spot', 'No current exchange underlying spot'),
+        ('missing_nearby_strikes', 'No nearby CE/PE strike'),
+        ('missing_bid_ask', 'Missing/crossed bid-ask or empty displayed depth'),
+        ('guardrail_rejections', 'Failed liquidity/cost/other risk guardrails'),
+    )
+    active = [f'{label}: {n(key)}' for key, label in rejects if n(key)]
+    if active:
+        extra += 'Diagnostics — ' + '; '.join(active) + '.'
+    return base + extra
 
 
 def option_http_note(stats: dict) -> str:
-    """Show status counters but never secrets, HTTP URLs or raw responses."""
-    codes = stats.get("http_status_counts") or {}
+    """Show endpoint/status counters but never secrets, raw URLs or responses."""
+    codes = stats.get('http_status_counts') or {}
     if not codes:
-        return ""
+        return ''
     parts = [f"{str(code)}: {int(count)}" for code, count in sorted(codes.items(), key=lambda p: str(p[0]))]
-    return "NSE option-chain request results (HTTP status / request error): " + ", ".join(parts)
+    return 'NSE option-chain requests (endpoint and HTTP/error status): ' + ', '.join(parts)

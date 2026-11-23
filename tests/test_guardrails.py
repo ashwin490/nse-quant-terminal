@@ -61,5 +61,10 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(example(equity_exposure=995_000).decision,"AVOID")
     def test_wide_volatility(self):
         self.assertEqual(example(iv_pct=60,realized_vol_pct=15).decision,"AVOID")
+    def test_zero_volatility_is_not_a_valid_prediction(self):
+        self.assertEqual(example(iv_pct=0).decision,"AVOID")
+        self.assertEqual(example(realized_vol_pct=0).decision,"AVOID")
+    def test_far_expiry_outside_risk_window(self):
+        self.assertEqual(example(days_left=120).decision,"AVOID")
 
 if __name__=='__main__': unittest.main()

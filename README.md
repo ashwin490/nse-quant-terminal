@@ -326,3 +326,7 @@ target. Previously these valid positions were falsely flagged as unavailable
 minute-price data. Stop-first ambiguity and missing-candle safeguards remain.
 This release does not repair actual incomplete exchange feeds, restore missing
 cloud option records, or guarantee a broker-like fill.
+
+## 2026-11-23: Version 10.6 options scanner repair
+
+Version 10.6 includes `nse_option_chain.py`, which reads real NSE `option-chain-contract-info` expiry metadata and tries expiry-scoped `option-chain-v3` data before the older legacy endpoint. Both CE and PE are evaluated across up to seven eligible nearby strikes, using verified exchange bid/ask prices and current exchange timestamps. Existing option budget and guardrails remain active. Quotes are rechecked immediately before any new *paper-only* option journal entry. If the market-feed access, chain rows, quote timestamp, expiry-specific lot, or price/liquidity checks fail, a candidate is withheld rather than modelled as a tradable premium. See `UPDATE_V10_6.md` for all diagnostics and rollout limitations.

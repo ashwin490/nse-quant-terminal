@@ -15,6 +15,8 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from intraday_exit import scan_intraday_minutes
+from nse_option_chain import (expiry_labels, supported_expiries, matching_rows, nearby_strikes,
+    exact_contract, bid_ask, quote_is_fresh, underlying_value, exchange_timestamp)
 from reconciliation_policy import preserve_local_row, closed_record_conflict
 from datetime import datetime, time as dtime, timedelta
 import random
@@ -1575,7 +1577,7 @@ def _nse_get_json(url: str):
                 pass
             box["session"], box["ts"] = s, now
         s = box["session"]
-    is_option_chain = "/api/option-chain-equities" in url
+    is_option_chain = "/api/option-chain" in url
     try:
         r = s.get(url, timeout=6)
         if is_option_chain:
@@ -1657,41 +1659,105 @@ def upcoming_holidays(n: int = 4) -> list:
     today = ist_now().date().isoformat()
     return [(d, name) for d, name in sorted(get_nse_holidays().items()) if d >= today][:n]
 
-def get_nse_option_quote(symbol: str, expiry_dt: datetime, strike: float, side: str = "CE"):
-    """Live CE or PE bid / ask. Unavailable is None; estimates are never tradable."""
-    if side not in ("CE", "PE"):
-        return None
-    data = _nse_get_json("https://www.nseindia.com/api/option-chain-equities?symbol=" +
-                         urllib.parse.quote(clean_sym_name(symbol), safe=""))
-    if not data or not _quote_age_is_valid(data):
-        return None
-    expiry_str = expiry_dt.strftime("%d-%b-%Y")
-    for item in (data.get("records") or {}).get("data", []):
+def _track_option_request(health: dict | None, endpoint: str) -> None:
+    if health is None:
+        return
+    status = str(st.session_state.get("_nse_option_http_status", "not-requested"))
+    key = f"{endpoint} {status}"
+    counts = health["http_status_counts"]
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _exchange_equity_option_chain(symbol: str, expiry_label: str | None = None,
+                                  lots_for_symbol: dict | None = None,
+                                  health: dict | None = None):
+    """Prefer exchange expiry-discovery + v3, then try legacy as a fallback.
+
+    Returns (raw chain, exact expiry, days remaining, lot). The returned data may
+    be stale; the caller must independently require exchange timestamp freshness.
+    Invalid/missing quotes are NEVER backfilled by a theoretical model.
+    """
+    name = clean_sym_name(symbol)
+    quoted = urllib.parse.quote(name, safe="")
+    today = ist_now().date()
+    old_url = "https://www.nseindia.com/api/option-chain-equities?symbol=" + quoted
+    legacy = None
+    if not expiry_label:
+        info = _nse_get_json("https://www.nseindia.com/api/option-chain-contract-info?symbol=" + quoted)
+        _track_option_request(health, "contract-info")
+        if health is not None and expiry_labels(info):
+            health["contract_info_received"] += 1
+        available = supported_expiries(info, lots_for_symbol or {}, today)
+        if not available:
+            legacy = _nse_get_json(old_url)
+            _track_option_request(health, "legacy")
+            if not isinstance(legacy, dict):
+                return None
+            available = supported_expiries(legacy, lots_for_symbol or {}, today)
+        if not available:
+            if health is not None:
+                health["no_supported_expiry_lot"] += 1
+            return None
+        expiry_label, days_left, lot = available[0]
+    else:
         try:
-            if item.get("expiryDate") != expiry_str or float(item.get("strikePrice", 0)) != float(strike):
-                continue
-            q = item.get(side) or {}
-            bid = _num(q.get("bidprice") or q.get("bidPrice"))
-            ask = _num(q.get("askPrice") or q.get("askprice"))
-            if 0 < bid <= ask:
-                return {"bid":bid, "ask":ask, "oi":_num(q.get("openInterest")),
-                        "iv":_num(q.get("impliedVolatility")),
-                        "spread_pct":round(200*(ask-bid)/(ask+bid),2)}
-        except (ValueError, TypeError):
-            continue
+            days_left = (datetime.strptime(expiry_label, '%d-%b-%Y').date() - today).days
+        except (TypeError, ValueError):
+            return None
+        lot = 0
+    if health is not None:
+        health["expiry_matches"] += 1
+    url = ("https://www.nseindia.com/api/option-chain-v3?type=Equity&symbol=" + quoted +
+           "&expiry=" + urllib.parse.quote(expiry_label, safe=""))
+    v3 = _nse_get_json(url)
+    _track_option_request(health, "v3")
+    if isinstance(v3, dict) and matching_rows(v3, expiry_label):
+        if health is not None:
+            health["v3_rows_received"] += 1
+        # A stale v3 response must not suppress a potentially fresher legacy response.
+        if quote_is_fresh(v3, ist_now()):
+            return v3, expiry_label, days_left, lot
+    if legacy is None:
+        legacy = _nse_get_json(old_url)
+        _track_option_request(health, "legacy")
+    if isinstance(legacy, dict) and matching_rows(legacy, expiry_label):
+        if health is not None:
+            health["legacy_rows_received"] += 1
+        if quote_is_fresh(legacy, ist_now()):
+            return legacy, expiry_label, days_left, lot
+    # Keep a stale result for diagnostic counters, not for buyable paper contracts.
+    if isinstance(v3, dict) and matching_rows(v3, expiry_label):
+        return v3, expiry_label, days_left, lot
+    if isinstance(legacy, dict) and matching_rows(legacy, expiry_label):
+        return legacy, expiry_label, days_left, lot
+    if health is not None:
+        health["empty_expiry_rows"] += 1
     return None
 
 
+def get_nse_option_quote(symbol: str, expiry_dt: datetime, strike: float, side: str = "CE"):
+    """Refresh the EXACT exchange CE/PE contract; no model-price substitutions."""
+    if side not in ("CE", "PE"):
+        return None
+    chain_result = _exchange_equity_option_chain(symbol, expiry_dt.strftime("%d-%b-%Y"))
+    if not chain_result:
+        return None
+    chain, expiry_str, _, _ = chain_result
+    if not _quote_age_is_valid(chain):
+        return None
+    leg = exact_contract(matching_rows(chain, expiry_str), side, strike)
+    if not leg:
+        return None
+    bid, ask = bid_ask(leg)
+    if bid <= 0 or ask <= 0:
+        return None
+    return {"bid":bid, "ask":ask, "oi":_num(leg.get("openInterest")),
+            "iv":_num(leg.get("impliedVolatility")),
+            "spread_pct":round(200*(ask-bid)/(ask+bid),2)}
+
+
 def _quote_age_is_valid(chain: dict) -> bool:
-    timestamp = (chain.get("records") or {}).get("timestamp")
-    if not timestamp:
-        return False
-    try:
-        ts = datetime.strptime(str(timestamp), "%d-%b-%Y %H:%M:%S")
-        age = (ist_now().replace(tzinfo=None) - ts).total_seconds() / 60
-        return -5 <= age <= 15
-    except (ValueError, TypeError):
-        return False
+    return quote_is_fresh(chain, ist_now())
 
 
 def parse_nse_lot_file(csv_content: str) -> dict:
@@ -1736,20 +1802,25 @@ def option_paper_feedback() -> dict:
 
 
 def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
-    """Rotate through the NSE F&O universe in batches; analyse BOTH CE and PE.
+    """Review nearby exchange-listed CE AND PE strikes with exact live NSE quotes.
 
-    Current real quote and confirmed actual NSE lot size are necessary for CONSIDER.
-    Scan outputs are saved to option_watchlist for long-running audit history.
+    The most suitable validated candidate of each type is shown per underlying.
+    Expanded diagnostics distinguish API access from real bid/ask contract reviews.
+    Quoted contract rows never depend on theoretical option premiums.
     """
     from scan_health import new_option_scan_health, option_scan_summary
+    started = time.monotonic()
     now = ist_now()
-    st.session_state["option_scan_health"] = new_option_scan_health()
+    # Keep the last MARKET-HOURS diagnostics when a browser refresh occurs after
+    # 15:00. Never mistake an outside-window refresh for a successful option scan.
     if not is_entry_window_open():
+        st.session_state.setdefault("option_scan_health", new_option_scan_health())
         st.session_state["option_scan_note"] = (
             "NSE is outside the verified entry window. New CE/PE ratings are paused until "
-            "a fresh market-hours option chain is available. Your historical options remain below."
-        )
+            "a fresh market-hours option chain is available. Your historical options remain below.")
         return pd.DataFrame()
+    st.session_state["option_scan_health"] = new_option_scan_health()
+    st.session_state.pop("opt_note", None)
     lots = _current_nse_lots()
     if not lots:
         st.session_state["option_scan_note"] = "Cannot verify NSE lot sizes; option trade recommendations paused."
@@ -1761,29 +1832,39 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
     if not coverage["plausible"]:
         st.session_state["option_scan_note"] = (
             "⚠️ Incomplete F&O data: " + coverage["problem"] +
-            " No complete-market option scan or buyable signal is claimed."
-        )
+            " No complete-market option scan or buyable signal is claimed.")
         return pd.DataFrame()
     syms = coverage["matched_symbols"]
     batch = max(1, min(max_underlyings, len(syms)))
-    bucket_count = math.ceil(len(syms)/batch)
-    bucket = (now.date().toordinal() + now.hour//2) % bucket_count
-    selected = syms[bucket*batch:(bucket+1)*batch]
+    # Cursor advances by the ACTUAL number attempted. If a request time limit
+    # interrupts the batch, the unvisited names are considered next refresh.
+    cursor = int(st.session_state.get("option_scan_cursor", now.date().toordinal()*17)) % len(syms)
+    selected = [syms[(cursor+i) % len(syms)] for i in range(batch)]
     health = new_option_scan_health(len(selected), len(syms))
     prefetch_histories([t+".NS" for t in selected], "3mo", workers=6, ttl=SWEEP_TTL_SEC, time_budget=70)
     eq_used, opt_used = get_open_exposures()
-    reviews = []
     feedback = option_paper_feedback()
+    reviews = []
     for name in selected:
+        # On an NSE rate limit, stop requesting more data rather than hammering
+        # public endpoints. Retain the same cursor position for unvisited names.
+        if any(str(key).endswith(' 429') for key in health['http_status_counts']):
+            health['rate_limited'] = 1
+            break
+        # Avoid a long series of NSE timeouts blocking an entire Streamlit session.
+        if time.monotonic() - started > 150:
+            health["time_budget_reached"] = 1
+            break
+        health["underlyings_attempted"] += 1
         h = get_history_fast(name+".NS", "3mo")
         if h.empty or len(h)<35:
             continue
         health["price_histories"] += 1
         c = h["Close"].astype(float)
-        spot = float(c.iloc[-1])
-        if not math.isfinite(spot) or spot <= 0:
+        historical_spot = float(c.iloc[-1])
+        if not math.isfinite(historical_spot) or historical_spot <= 0:
             continue
-        change5 = (spot/float(c.iloc[-6])-1)*100
+        change5 = (historical_spot/float(c.iloc[-6])-1)*100
         log_returns = np.log(c/c.shift(1)).dropna().tail(20)
         rv = float(log_returns.std()*np.sqrt(252)*100) if len(log_returns)>=15 else 0
         diff = c.diff().tail(14)
@@ -1793,70 +1874,83 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
         if abs(change5)<0.6:
             continue
         health["directional"] += 1
-        # Record the outcome of each exchange request without storing URLs or cookies.
-        st.session_state["_nse_option_http_status"] = "unavailable"
-        chain = _nse_get_json("https://www.nseindia.com/api/option-chain-equities?symbol=" + urllib.parse.quote(name,safe=""))
-        status = str(st.session_state.get("_nse_option_http_status", "unavailable"))
-        http_counts = health["http_status_counts"]
-        http_counts[status] = http_counts.get(status, 0) + 1
-        if not isinstance(chain,dict):
+        fetched = _exchange_equity_option_chain(name, lots_for_symbol=lots[name], health=health)
+        if not fetched:
             continue
+        chain, expiry_label, days_left, lot = fetched
         health["chains_received"] += 1
         quote_fresh = is_entry_window_open() and _quote_age_is_valid(chain)
-        if quote_fresh:
-            health["fresh_chains"] += 1
-        try:
-            dates = [(datetime.strptime(x,"%d-%b-%Y"),x) for x in (chain.get("records") or {}).get("expiryDates", [])]
-        except (TypeError,ValueError):
+        if not quote_fresh:
+            health["stale_or_untimed"] += 1
             continue
-        valid_dates = [(d,label) for d,label in dates if 8 <= (d.date()-now.date()).days <= 65]
-        if not valid_dates:
+        health["fresh_chains"] += 1
+        series = matching_rows(chain, expiry_label)
+        if not series:
+            health["empty_expiry_rows"] += 1
             continue
-        health["expiry_matches"] += 1
-        expiry, expiry_label = min(valid_dates,key=lambda x:x[0])
-        days_left = (expiry.date()-now.date()).days
-        series = [r for r in (chain.get("records") or {}).get("data",[]) if r.get("expiryDate")==expiry_label]
-        blocked = evaluate_nse_filing_nlp(name).get("is_blocked",False)
+        health["chain_rows"] += len(series)
+        spot = underlying_value(chain)
+        if not spot:
+            health["missing_underlying_spot"] += 1
+            continue  # a Yahoo daily close is not a verified live NSE underlying quote
+        if abs(spot-historical_spot)/historical_spot > 0.10:
+            health["spot_disagreements"] += 1
+            continue  # history and exchange cannot be reconciled confidently
+        blocked = evaluate_nse_filing_nlp(name).get("is_blocked", False)
         for side in ("CE", "PE"):
-            contracts = [x for x in series if isinstance(x.get(side),dict) and _num(x.get("strikePrice"))>0]
-            if not contracts:
+            close_strikes = nearby_strikes(series, side, spot)
+            if not close_strikes:
+                health["missing_nearby_strikes"] += 1
                 continue
-            aim = spot * (1.01 if side=="CE" else 0.99)
-            contract = min(contracts,key=lambda x:abs(float(x["strikePrice"])-aim))
-            strike = float(contract["strikePrice"])
-            data = contract[side]
-            bid = _num(data.get("bidprice") or data.get("bidPrice"))
-            ask = _num(data.get("askPrice") or data.get("askprice"))
-            oi = _num(data.get("openInterest"))
-            iv = _num(data.get("impliedVolatility"))
-            expiry_month = expiry.strftime("%b-%y").upper()
-            lot = int(lots[name].get(expiry_month, 0))
-            if lot <= 0:
-                health["missing_lots"] += 1
-                continue  # never substitute a different expiry's contract size
-            result = review_long_option(kind=side,spot=spot,strike=strike,bid=bid,ask=ask,
-                lot_size=lot,days_left=days_left,open_interest=oi,iv_pct=iv,realized_vol_pct=rv,
-                ret_5d_pct=change5,rsi=rsi,recent_filing_risk=blocked,
-                equity_exposure=eq_used,option_exposure=opt_used,quote_fresh=quote_fresh)
+            choices = []
+            for contract in close_strikes:
+                health["strikes_examined"] += 1
+                strike = float(contract["strikePrice"])
+                data = contract[side]
+                bid, ask = bid_ask(data)
+                if not (0 < bid <= ask):
+                    health["missing_bid_ask"] += 1
+                    continue
+                health["valid_bid_ask"] += 1
+                oi = _num(data.get("openInterest"))
+                iv = _num(data.get("impliedVolatility"))
+                result = review_long_option(kind=side, spot=spot, strike=strike, bid=bid, ask=ask,
+                    lot_size=lot, days_left=days_left, open_interest=oi, iv_pct=iv,
+                    realized_vol_pct=rv, ret_5d_pct=change5, rsi=rsi,
+                    recent_filing_risk=blocked, equity_exposure=eq_used,
+                    option_exposure=opt_used, quote_fresh=quote_fresh)
+                health["contract_reviews"] += 1
+                if result.decision == 'AVOID':
+                    health["guardrail_rejections"] += 1
+                # Prefer tradable risk-checked near-ATM strikes over a single unquoted OTM strike.
+                rank = {"CONSIDER":2,"WATCH":1,"AVOID":0}[result.decision]
+                choices.append((rank, -result.spread_pct, -abs(strike-spot)/spot, oi,
+                                strike, data, bid, ask, oi, iv, result))
+            if not choices:
+                continue
+            best = max(choices, key=lambda a:a[:4])
+            _,_,_,_,strike,data,bid,ask,oi,iv,result = best
             decision, why = result.decision, result.reason
             history = feedback.get(side, {})
-            # Only real-quoted paper samples, enough observations, and clear persistent losses.
-            # Pause new optimistic labels; retained data and rules are not erased.
-            if decision == "CONSIDER" and history.get("n",0) >= 12 and history["mean"] < -10 and history["profitable"] < 0.45:
+            if (decision == "CONSIDER" and history.get("n",0) >= 12 and
+                    history["mean"] < -10 and history["profitable"] < 0.45):
                 decision = "WATCH"
                 why = (f"Historical live-quote {side} paper ideas have averaged {history['mean']:+.1f}% "
                        f"over {history['n']} finished samples; require better validation")
-            health["contract_reviews"] += 1
             health[decision.lower()] = health.get(decision.lower(), 0) + 1
             score = (100 if decision=="CONSIDER" else 50 if decision=="WATCH" else 0) + abs(change5)-result.spread_pct/3
+            expiry_dt = datetime.strptime(expiry_label, '%d-%b-%Y')
             reviews.append({"Stock":name,"Type":side,"Direction":"Up" if side=="CE" else "Down",
-                "Decision":decision,"Why":why,"Expiry":expiry.strftime('%d %b %Y'),
+                "Decision":decision,"Why":why,"Expiry":expiry_dt.strftime('%d %b %Y'),
                 "Days left":days_left,"Strike (₹)":strike,"Share price (₹)":round(spot,2),
                 "Buy premium (₹)":ask,"Sell premium (₹)":bid,"Lot":lot,"Cost (₹)":result.cost_inr,
-                "Maximum premium loss (₹)":result.max_loss_inr,"Breakeven at expiry (₹)":result.breakeven_spot,
+                "Maximum premium loss (₹)":result.max_loss_inr,
+                "Breakeven at expiry (₹)":result.breakeven_spot,
                 "Spread (%)":result.spread_pct,"Open interest":int(oi),"IV (%)":iv,
                 "Historical volatility (%)":round(rv,1),"5-day share move (%)":round(change5,2),
+                "RSI":round(rsi,1),
                 "Score":round(score,2),"Fresh quote":quote_fresh,
+                "Exchange quote at":exchange_timestamp(chain).strftime('%Y-%m-%d %H:%M:%S'),
                 "Checked at":now.strftime('%Y-%m-%d %H:%M:%S')})
     df = pd.DataFrame(reviews)
     if not df.empty:
@@ -1874,6 +1968,7 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
                         r["5-day share move (%)"],r["Checked at"]])
             finally:
                 con.close()
+    st.session_state["option_scan_cursor"] = (cursor + health["underlyings_attempted"]) % len(syms)
     st.session_state["option_scan_health"] = health
     st.session_state["option_scan_note"] = option_scan_summary(health)
     return df
@@ -1906,20 +2001,53 @@ def generate_daily_options_alpha() -> dict:
     if choices.empty:
         return {}
     best=choices.iloc[0]
-    eq_used,opt_used=get_open_exposures()
-    if not can_allocate_option(float(best["Cost (₹)"]),eq_used,opt_used):
+    if any(field not in best.index for field in ("RSI", "Checked at", "Historical volatility (%)", "5-day share move (%)")):
+        st.session_state["opt_note"] = "Pre-upgrade CE/PE shortlist lacks entry features; rescan before new paper entry."
         return {}
-    now=ist_now(); expiry=datetime.strptime(best["Expiry"],'%d %b %Y')
+    now=ist_now()
+    try:
+        last_checked = datetime.strptime(str(best["Checked at"]), '%Y-%m-%d %H:%M:%S')
+        seconds_old = (now.replace(tzinfo=None)-last_checked).total_seconds()
+    except (ValueError, TypeError, KeyError):
+        seconds_old = 99999
+    if not -60 <= seconds_old <= 300:
+        st.session_state["opt_note"] = "An old CE/PE shortlist cannot create a new paper position; rescan quotes."
+        return {}
+    expiry = datetime.strptime(best["Expiry"], '%d %b %Y')
+    # A previous 15-minute scan is NEVER an executable entry quote. Re-fetch the
+    # exact expiry, side and strike and re-apply conservative risk rules.
+    quote = get_nse_option_quote(str(best["Stock"]), expiry, float(best["Strike (₹)"]), str(best["Type"]))
+    if not quote:
+        st.session_state["opt_note"] = "Fresh quote for shortlisted CE/PE contract unavailable; paper entry skipped."
+        return {}
+    old_ask = float(best["Buy premium (₹)"])
+    if old_ask <= 0 or abs(quote["ask"]-old_ask)/old_ask > 0.15:
+        st.session_state["opt_note"] = "Option premium changed more than 15% since the scan; rescan before paper entry."
+        return {}
+    eq_used,opt_used=get_open_exposures()
+    refreshed_review = review_long_option(
+        kind=str(best["Type"]), spot=float(best["Share price (₹)"]),
+        strike=float(best["Strike (₹)"]), bid=quote["bid"], ask=quote["ask"],
+        lot_size=int(best["Lot"]), days_left=(expiry.date()-now.date()).days,
+        open_interest=quote["oi"], iv_pct=quote["iv"],
+        realized_vol_pct=float(best["Historical volatility (%)"]),
+        ret_5d_pct=float(best["5-day share move (%)"]), rsi=float(best["RSI"]),
+        recent_filing_risk=evaluate_nse_filing_nlp(str(best["Stock"])).get("is_blocked", False),
+        equity_exposure=eq_used, option_exposure=opt_used, quote_fresh=True)
+    if refreshed_review.decision != "CONSIDER" or not can_allocate_option(refreshed_review.cost_inr,eq_used,opt_used):
+        st.session_state["opt_note"] = "Fresh option quote failed risk/liquidity review; paper entry skipped."
+        return {}
+    bid, ask = quote["bid"], quote["ask"]
     sig={"date_key":date_key,"timestamp":now.strftime('%Y-%m-%d %H:%M:%S'),
         "share_name":best["Stock"],"option_contract":f"{best['Stock']} {expiry.strftime('%d %b %Y').upper()} {best['Strike (₹)']:g} {best['Type']} (live quote)",
-        "strike_price":float(best["Strike (₹)"]),"expiry_days":int(best["Days left"]),
+        "strike_price":float(best["Strike (₹)"]),"expiry_days":(expiry.date()-now.date()).days,
         "underlying_spot":float(best["Share price (₹)"]),"lot_size":int(best["Lot"]),
-        "entry_premium":float(best["Buy premium (₹)"]),"current_option_price":float(best["Sell premium (₹)"]),
-        "target_premium":round(float(best["Buy premium (₹)"])*OPTION_TARGET_MULT,2),
-        "stop_loss_premium":round(float(best["Buy premium (₹)"])*OPTION_STOP_MULT,2),
-        "total_capital":float(best["Cost (₹)"]),"ai_confidence":round(min(100.0,float(best["Score"])),1),
-        "implied_vol":float(best["IV (%)"]),"status":"ACTIVE",
-        "pnl_pct":round(100*(float(best["Sell premium (₹)"])/float(best["Buy premium (₹)"])-1),2),
+        "entry_premium":ask,"current_option_price":bid,
+        "target_premium":round(ask*OPTION_TARGET_MULT,2),
+        "stop_loss_premium":round(ask*OPTION_STOP_MULT,2),
+        "total_capital":refreshed_review.cost_inr,"ai_confidence":round(min(100.0,float(best["Score"])),1),
+        "implied_vol":quote["iv"],"status":"ACTIVE",
+        "pnl_pct":round(100*(bid/ask-1),2),
         "last_audited":now.strftime('%Y-%m-%d %H:%M:%S')}
     with DB_LOCK:
         con=duckdb.connect(DB_PATH,read_only=False)
@@ -3737,7 +3865,15 @@ with page_preds:
                      f"Maximum long-option premium risk: **{short_money(r['Maximum premium loss (₹)'])}**.")
             st.caption('Premium target/stop are research exit guidelines, not guaranteed executions. Long stock options may have physical settlement obligations; review broker and expiry rules.')
     if product_filter in ('All','Calls (CE)','Puts (PE)') and opt_view.empty:
-        st.info('No verified CE/PE contracts for the current filters. The app will not present a theoretical option premium as a tradable quote.')
+        if not option_results.empty and decision_filter == 'CONSIDER':
+            held = option_results if product_filter == 'All' else option_results[option_results['Type']==('CE' if product_filter=='Calls (CE)' else 'PE')]
+            st.info(f'No CE/PE contracts passed the CONSIDER rules. {len(held)} quoted contracts have ' 
+                    'WATCH/AVOID outcomes; select Research signal → ALL to inspect the reasons. ' 
+                    'No theoretical option premium is shown as an exchange quote.')
+        else:
+            st.info('No verified CE/PE contracts for the current filters. The app will not present a theoretical option premium as a tradable quote.')
+    if st.session_state.get('opt_note'):
+        st.caption('CE/PE paper entry: ' + str(st.session_state['opt_note']))
 
     with st.expander('🩺 Scan quality / full candidate list'):
         if not share_results.empty:
