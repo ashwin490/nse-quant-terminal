@@ -15,6 +15,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from intraday_exit import scan_intraday_minutes
+from reconciliation_policy import preserve_local_row, closed_record_conflict
 from datetime import datetime, time as dtime, timedelta
 import random
 import shutil
@@ -848,7 +849,7 @@ def _norm_status(raw) -> str:
 def hydrate_duckdb_from_supabase():
     """Restore trades from the online backup. Each row is handled on its own, so ONE unreadable old row can never
     stop the newer rows (usually your open trades) from loading. Newer local data is never overwritten."""
-    info = {"remote": 0, "remote_options": 0, "remote_active": 0, "restored": 0, "kept_local": 0, "bad_rows": 0, "first_error": ""}
+    info = {"remote": 0, "remote_options": 0, "remote_active": 0, "restored": 0, "kept_local": 0, "closed_conflicts": 0, "bad_rows": 0, "first_error": ""}
     st.session_state["hydrate_info"] = info
     if not supabase:
         return
@@ -889,16 +890,27 @@ def hydrate_duckdb_from_supabase():
                     loc = local_eq.get(trade_id)
                     if loc:
                         l_status, l_ts = str(loc[1]), str(loc[2] or "")
+                        # Finalised local trades are immutable: cloud `last_checked`
+                        # is NOT an exact execution timestamp. Never rewrite a
+                        # closed trade or its exit time because the cloud has a
+                        # newer audit/checkpoint time. Preserve local evidence.
                         closed_vs_active = (l_status != "ACTIVE" and remote_status == "ACTIVE")
-                        local_newer = bool(l_ts) and (not remote_ts or l_ts >= remote_ts)
-                        if closed_vs_active or local_newer:
+                        if preserve_local_row(l_status, remote_status, l_ts, remote_ts):
                             info["kept_local"] += 1
                             if closed_vs_active:
                                 cloud_update("predictions", {"ticker": loc[3], "predicted_date": loc[4]},
                                              {"status": l_status, "stop_loss": _num(loc[5]), "latest_price": _num(loc[6]),
                                               "pnl_pct": _num(loc[7]), "last_checked": l_ts}, "Re-push Closed Trade")
+                            elif closed_record_conflict(l_status, remote_status, l_ts, remote_ts):
+                                info["closed_conflicts"] += 1
                             continue
                     last_check = normalize_ts_str(r.get('last_checked'), f"{pred_date} 15:30:00")
+                    # Supabase's historic `last_checked` reflects the last
+                    # audit, not necessarily the time a target/stop was hit.
+                    # Preserve that provenance for any imported closed trade.
+                    imported_features = _parse_features(r.get('features_json'))
+                    if remote_status != "ACTIVE" and not imported_features.get('exit_timestamp_source'):
+                        imported_features['exit_timestamp_source'] = 'cloud_last_checked_estimate'
                     entry = _num(r.get('entry_price'))
                     tgt, stp = _num(r.get('target_price')), _num(r.get('stop_loss'))
                     if remote_status == "ACTIVE" and (entry <= 0 or tgt <= 0 or stp <= 0 or tgt <= stp):
@@ -917,7 +929,7 @@ def hydrate_duckdb_from_supabase():
                         VALUES (?, ?, ?, ?, 'EQUITY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, [trade_id, last_check, pred_date, ticker_val, entry, tgt, stp,
                           shares_n, cap, remote_status, latest, _num(r.get('pnl_pct')), exit_p,
-                          (last_check if remote_status != "ACTIVE" else None), last_check, json.dumps(_parse_features(r.get('features_json')))])
+                          (last_check if remote_status != "ACTIVE" else None), last_check, json.dumps(imported_features)])
                     info["restored"] += 1
                 except Exception as e:
                     bad(e)
@@ -930,10 +942,12 @@ def hydrate_duckdb_from_supabase():
                     loc = local_opt.get(date_k)
                     if loc:
                         l_status, l_ts = str(loc[1]), str(loc[2] or "")
-                        if (l_status != "ACTIVE" and remote_status == "ACTIVE") or (l_ts and (not remote_ts or l_ts >= remote_ts)):
+                        if preserve_local_row(l_status, remote_status, l_ts, remote_ts):
                             if l_status != "ACTIVE" and remote_status == "ACTIVE":
                                 cloud_update("options_journal", {"date_key": date_k},
                                              {"status": l_status, "current_option_price": _num(loc[3]), "pnl_pct": _num(loc[4]), "last_audited": l_ts}, "Re-push Closed Option")
+                            elif closed_record_conflict(l_status, remote_status, l_ts, remote_ts):
+                                info["closed_conflicts"] += 1
                             continue
                     ts_str = normalize_ts_str(o.get('timestamp'), f"{date_k} 15:30:00")
                     aud_str = normalize_ts_str(o.get('last_audited') or o.get('timestamp'), ts_str)
@@ -957,6 +971,8 @@ def hydrate_duckdb_from_supabase():
             con.close()
     if info["bad_rows"]:
         record_db_error("Restore from cloud", Exception(f"{info['bad_rows']} backup row(s) were unreadable and skipped ({info['first_error']})"))
+    if info["closed_conflicts"]:
+        st.session_state["history_close_conflicts"] = info["closed_conflicts"]
 
 if "hydrated_once" not in st.session_state:
     hydrate_duckdb_from_supabase()
@@ -3346,7 +3362,7 @@ import tempfile
 from premium_dark import (
     THEMES as DARK_THEMES, theme_css as dark_theme_css, hero as dark_hero,
     stats as dark_stats, header as dark_header, note as dark_note,
-    signal_card as dark_card,
+    signal_card as dark_card, learning_tile as dark_learning_tile,
 )
 from forecast_timeline import estimate_target_timeline, completed_bars_only
 from learning_insights import (
@@ -3354,6 +3370,8 @@ from learning_insights import (
 )
 from history_recovery import merge_history_database, snapshot_database, count_history
 from scan_health import option_http_note
+from portfolio_overview import portfolio_open_snapshot
+from learning_tiles import build_learning_tile
 
 
 def read_full_paper_ledger() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -3570,16 +3588,31 @@ except Exception as error:
     journal_eq = journal_opt = journal_reviews = pd.DataFrame()
     st.error(f'Could not load complete paper history ({type(error).__name__}). Check Manage app → Logs; no missing rows are assumed closed.')
 
-active_options = (journal_opt[journal_opt['status'].apply(classify_outcome)=='ACTIVE']
-                  if not journal_opt.empty else pd.DataFrame())
+open_summary = portfolio_open_snapshot(journal_eq, journal_opt)
 used = cap['equity_inr'] + cap['option_inr']
+option_details = (f"{open_summary['shares']} shares · {open_summary['calls']} CE · "
+                  f"{open_summary['puts']} PE" +
+                  (f" · {open_summary['other_options']} unclassified" if open_summary['other_options'] else ''))
+if open_summary['missing_count']:
+    pnl_value = f"{short_money(open_summary['paper_pnl_inr'], 0)} partial"
+    pnl_note = (f"Only {open_summary['valued_count']}/{open_summary['open_total']} open positions priced; "
+                "not a verified total")
+elif open_summary['open_total'] == 0:
+    pnl_value = short_money(0, 0)
+    pnl_note = 'No open positions · excludes closed trades'
+else:
+    pnl_value = ('+' if open_summary['paper_pnl_inr'] > 0 else '-' if open_summary['paper_pnl_inr'] < 0 else '') + short_money(abs(open_summary['paper_pnl_inr']), 0)
+    pnl_note = 'Last recorded paper marks · unrealised, not live fills'
 st.markdown(dark_stats([
-    ('Paper budget','₹10,00,000','Shared cap across stocks, CE and PE'),
-    ('Allocated',short_money(used,0),f"{cap['open']} open stocks · {len(active_options)} options"),
+    ('Open positions',str(open_summary['open_total']),option_details),
+    ('Open paper P/L',pnl_value,pnl_note),
+    ('Allocated',short_money(used,0),'Across all active shares, CE and PE'),
     ('Unallocated',short_money(cap['remaining_inr'],0) if integrity['verified_count'] else 'Unverified',
-     'Not necessarily available to deploy'),
-    ('Learning data',str(len(journal_eq)),f"{len(journal_opt)} historical options; keep backups"),
+     'Not necessarily deployable · ₹10 lakh combined cap'),
 ]), unsafe_allow_html=True)
+if open_summary['missing_count']:
+    st.warning(f"Paper P/L is incomplete: {open_summary['missing_count']} open records have no reliable latest price, "
+               "allocation or marked return. The displayed total excludes them.")
 
 if not integrity['verified_count']:
     st.markdown(dark_note('History integrity is not verified. New paper entries are paused until older records are restored. The figures may be incomplete.',True),unsafe_allow_html=True)
@@ -3727,7 +3760,9 @@ with page_preds:
             st.warning('NSE corporate filings module is unavailable. News checks are incomplete; treat technical CONSIDER scores cautiously.')
 
 with page_learning:
-    st.markdown(dark_header('What the AI can learn','Individual stock results · verified observations, not invented explanations'),unsafe_allow_html=True)
+    st.markdown(dark_header('AI Learning — one trade at a time',
+        'Individual results, observations and tests the model could learn from · no graphs'),
+        unsafe_allow_html=True)
     if journal_eq.empty:
         st.info('No stock training history is available locally. Check the Ledger recovery tools.')
     else:
@@ -3737,57 +3772,51 @@ with page_learning:
             train_state = json.loads(state_raw or '{}')
         except (ValueError,TypeError):
             train_state = {}
-        st.markdown(dark_stats([
-            ('Recorded outcomes',str(totals['finished']),'Confirmed closes; some are unsuitable for training'),
-            ('Decided win rate',f"{totals['win_rate']:.1f}%" if totals['win_rate'] is not None else '—',
-             f"{totals['decided']} journal wins or losses, not model accuracy"),
-            ('Feature snapshots',str(totals['potential_training']),'Potential cases; not guaranteed eligible'),
-            ('Model last promoted',str(train_state.get('last_promoted','Not yet')),'Only after later-period challenger validation'),
-        ]),unsafe_allow_html=True)
-        st.markdown(dark_note('An observed winning or losing trade does not prove the AI changed its model. Per-stock patterns below are descriptions of the journal. Actual training and upgrades are tracked separately.'),unsafe_allow_html=True)
+        st.caption(f"{totals['finished']} completed recorded outcomes · "
+                   f"{totals['potential_training']} possible entry-feature examples (not all validated) · "
+                   f"Last model promotion: {train_state.get('last_promoted','None recorded')}")
+        st.caption('Each tile is based on one journal record. It explains a possible future test, not a proven reason for a win/loss or an automatic model update.')
         sym_counts = journal_eq['ticker'].fillna('').astype(str).value_counts()
         ordered = [name for name in sym_counts.index if name.strip()]
-        pick1,pick2 = st.columns([1.5,1])
-        with pick1:
-            selected_stock = st.selectbox('Choose a stock to inspect', ordered, key='dark_learning_stock')
-        with pick2:
-            learn_filter = st.selectbox('Show outcomes', ['ALL','WIN','LOSS','ACTIVE','OTHER'],key='dark_learning_filter')
-        only = journal_eq[journal_eq['ticker'].astype(str)==selected_stock].copy()
-        stock_stats = stock_history_summary(only)
-        st.markdown(dark_stats([
-            ('Trades recorded',str(stock_stats['total']),f"{stock_stats['open']} still open"),
-            ('Wins / losses',f"{stock_stats['wins']} / {stock_stats['losses']}",'Other exits shown in the ledger'),
-            ('Average closed result',f"{stock_stats['avg_pnl']:+.2f}%" if stock_stats['avg_pnl'] is not None else '—','Historical paper results only'),
-            ('Potential training rows',str(stock_stats['potential_training']),'Requires full validation'),
-        ]),unsafe_allow_html=True)
-        st.markdown(dark_header(f'Observations from {selected_stock}','Simple explanations · no causal claims'),unsafe_allow_html=True)
-        for line in stock_evidence(only):
-            st.markdown('• '+line)
-        st.markdown(dark_header('Individual trade lessons','Actual recorded outcomes, including failures'),unsafe_allow_html=True)
-        filtered = only if learn_filter=='ALL' else only[only['status'].apply(
-            lambda x: classify_outcome(x)==learn_filter if learn_filter!='OTHER' else classify_outcome(x) not in ('WIN','LOSS','ACTIVE'))]
-        for _, row in filtered.head(20).iterrows():
-            rec = row.to_dict()
-            obs = describe_trade(rec)
-            pnl = obs['pnl']
-            pnl_label = f'{pnl:+.2f}%' if pnl is not None and math.isfinite(pnl) else 'P/L unknown'
-            name = f"{str(rec.get('date_str',''))[:10]} · {obs['outcome']} · {pnl_label}"
-            with st.expander(name,expanded=False):
-                st.write(obs['observation'])
-                st.caption(obs['conditions'])
-                st.write('**How it can help future research:** '+obs['training_note'])
-                st.write('**Earlier timeline versus outcome:** '+forecast_review(rec))
-                entry,target,stop = _num(rec.get('entry_price')),_num(rec.get('target_price')),_num(rec.get('stop_loss'))
-                st.caption(f"Entry {short_money(entry)} · Target {short_money(target)} · Stop {short_money(stop)} "
-                           f"· Holding period {obs['days_held'] if obs['days_held'] is not None else 'unknown'} calendar days")
-        if len(filtered)>20:
-            st.caption(f'Showing 20 of {len(filtered)} events for this symbol. Full history is in Trade Ledger.')
-        with st.expander('🧠 Model training details'):
-            st.write(f'Current minimum: **{MIN_SETTLED_TO_RETRAIN}** suitable, validated share outcomes. '
-                     f"Next attempts after roughly **{RETRAIN_STEP_INTERVAL}** additional eligible cases.")
-            st.write('Last retraining attempt:',train_state.get('last_attempt_date','Not eligible yet'))
-            st.write('Last challenger promotion:',train_state.get('last_promoted','None recorded'))
-            st.caption('Old snapshots are never silently rewritten to look better. Without saved entry features or historical forecasts, some legacy records cannot support training or timeline evaluation.')
+        if ordered:
+            pick1,pick2,pick3 = st.columns([1.6,1,1])
+            with pick1:
+                selected_stock = st.selectbox('Choose a stock to inspect', ordered, key='dark_learning_stock')
+            with pick2:
+                learn_filter = st.selectbox('Show outcomes', ['ALL','WIN','LOSS','ACTIVE','OTHER'], key='dark_learning_filter')
+            with pick3:
+                learning_limit = st.selectbox('Learning cards', [5,10,20,50], index=0, key='dark_learning_count')
+            only = journal_eq[journal_eq['ticker'].astype(str)==selected_stock].copy()
+            filtered = only if learn_filter=='ALL' else only[only['status'].apply(
+                lambda x: classify_outcome(x)==learn_filter if learn_filter!='OTHER' else classify_outcome(x) not in ('WIN','LOSS','ACTIVE'))]
+            st.markdown(dark_header(f'Observations for {selected_stock}',
+                f'{len(filtered)} recorded trade events · newest first'), unsafe_allow_html=True)
+            if filtered.empty:
+                st.info('No events match your selection. Choose another outcome filter.')
+            else:
+                records = filtered.head(learning_limit).to_dict('records')
+                cards = [dark_learning_tile(build_learning_tile(rec)) for rec in records]
+                st.markdown('<div class="learning-tiles">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+                if len(filtered) > learning_limit:
+                    st.caption(f'Showing {learning_limit} of {len(filtered)} events. Increase Learning cards to see more.')
+                with st.expander('Exact prices, saved forecasts and dates for these trades'):
+                    for n, rec in enumerate(records):
+                        obs = describe_trade(rec)
+                        st.markdown(f"**{str(rec.get('date_str') or '')[:10]} · {obs['outcome']}**")
+                        st.caption(f"Entry {short_money(rec.get('entry_price'))} · "
+                                   f"Target {short_money(rec.get('target_price'))} · "
+                                   f"Stop {short_money(rec.get('stop_loss'))} · "
+                                   f"Held {obs['days_held'] if obs['days_held'] is not None else 'unknown'} calendar days")
+                        st.caption('Original forecast: ' + forecast_review(rec))
+                        if n < len(records)-1:
+                            st.divider()
+        with st.expander('🧠 Model training status and validation'):
+            st.write(f'Minimum: **{MIN_SETTLED_TO_RETRAIN}** suitable, validated share outcomes. '
+                     f'Next retraining attempts after roughly **{RETRAIN_STEP_INTERVAL}** additional eligible cases.')
+            st.write('Last retraining attempt:', train_state.get('last_attempt_date','Not eligible yet'))
+            st.write('Last challenger promotion:', train_state.get('last_promoted','None recorded'))
+            st.caption('One paper trade does not prove which factor caused its result. Missing original features or forecasts are not recreated. '
+                       'A replacement model is promoted only after time-ordered validation against the existing model.')
 
 with page_ledger:
     st.markdown(dark_header('Trade ledger','All paper stocks, calls and puts · open and closed'),unsafe_allow_html=True)
@@ -3863,6 +3892,10 @@ with page_ledger:
             f"check saw {_int(cloud_info.get('remote_options')):,}. This may reflect an unsynced "
             "idea or an older cloud snapshot. Export a backup and verify cloud sync before a restart."
         )
+    if st.session_state.get('history_close_conflicts'):
+        st.info(f"Cloud and local timestamps/statuses differ on "
+                f"{st.session_state['history_close_conflicts']} closed record(s). "
+                "Local completed outcomes were preserved; verify the original execution times from the ledger or source backups.")
     render_history_recovery()
     st.caption('No broker orders. Stop-loss fills and estimated model targets are uncertain. Streamlit session auto-refresh is NOT an unattended 10-year service.')
 

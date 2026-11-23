@@ -71,6 +71,21 @@ h1,h2,h3 {font-family:'Outfit','DM Sans',sans-serif;letter-spacing:-.025em;color
 .pane-note {border:1px solid #2e3d56;background:#172339;color:#cad8ec;padding:12px 14px;border-radius:11px;font-size:12px;margin:9px 0;}
 .pane-note.warn {border-color:#755b39;background:#2c251d;color:#ffd5a0;}
 .learning-event {background:#131d2b;border:1px solid #2a354a;border-radius:11px;padding:12px 15px;margin:8px 0;}
+.learning-tiles {display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:13px;margin:13px 0 20px;align-items:stretch;}
+.learning-tile {background:linear-gradient(142deg,#1b2539 0%,#101827 100%);border:1px solid #34415a;border-radius:17px;padding:17px 19px;position:relative;overflow:hidden;box-shadow:0 7px 23px rgba(0,0,0,.10);}
+.learning-tile:before{content:'';height:3px;position:absolute;left:0;right:0;top:0;background:linear-gradient(90deg,#8f93ac,#4d728c);}
+.learning-tile.win:before{background:linear-gradient(90deg,#16d3a6,#69ecc4);}.learning-tile.loss:before{background:linear-gradient(90deg,#fb7185,#fbbf78);}
+.learning-tile.active:before{background:linear-gradient(90deg,#61b9ff,#a98bff);}
+.lt-top{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;}
+.lt-date{font-size:12px;font-weight:650;color:#b2c3dd;}.lt-pill{font-size:10px;font-weight:800;letter-spacing:.05em;background:#26364c;color:#d7e6ff;padding:6px 9px;border-radius:100px;}
+.learning-tile.win .lt-pill{background:#124332;color:#81f1c4;}.learning-tile.loss .lt-pill{background:#472b34;color:#ffa0ad;}.learning-tile.active .lt-pill{background:#20375b;color:#91c9ff;}
+.lt-head{display:flex;gap:10px;align-items:baseline;margin-top:11px;flex-wrap:wrap;}.lt-head h4{font:750 17px 'Outfit',sans-serif;color:#fff;margin:0;}.lt-result{font-size:15px;font-weight:800;color:#e4f2ff;margin-left:auto;}
+.learning-tile.win .lt-result{color:#62efb6}.learning-tile.loss .lt-result{color:#ffa0ad}
+.lt-label{color:#91aaca;font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:800;margin-top:13px;}
+.lt-text{font-size:12.5px;line-height:1.55;color:#d4e0f3;margin-top:5px;overflow-wrap:anywhere;}
+.lt-context{background:#121d31;border:1px solid #2c3c57;border-radius:9px;padding:9px 11px;margin-top:13px;color:#a9bfdc;font-size:11.5px;line-height:1.4;}
+.lt-footer{margin-top:12px;font-size:11px;color:#a3b7d0;}
+
 .learning-event b {color:#f1f5ff}.learning-event p {color:#a3b5ce;line-height:1.6;font-size:12px;}
 .ledger-caption {color:#91a2bd;font-size:12px;}
 @media(max-width:960px) {.dash-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.sig-items{grid-template-columns:repeat(2,minmax(0,1fr))}.block-container{padding:1.1rem 1rem 3rem;}}
@@ -123,3 +138,31 @@ def signal_card(name: str, decision: str, meta: str, fields: list[tuple[str,str]
             f'<span class="sig-name">{escape(name)}</span><span class="sig-pill {tone}">{escape(decision)}</span>'
             f'<span class="sig-meta">{escape(meta)}</span></div><div class="sig-items">{cells}</div>'
             + timing_html + f'<div class="sig-reason">{escape(reason)}</div></div>')
+
+
+def learning_tile(event: dict) -> str:
+    """Escaped, graph-free, per-trade learning observation tile."""
+    status = str(event.get('status') or 'UNKNOWN').upper()
+    tone = {'WIN':'win', 'LOSS':'loss', 'ACTIVE':'active'}.get(status, 'neutral')
+    label = {'WIN':'TARGET / WIN','LOSS':'STOP / LOSS','ACTIVE':'OPEN / PENDING',
+             'BE':'BREAK-EVEN','EXPIRED':'TIME EXIT'}.get(status,'UNCLASSIFIED')
+    pnl = event.get('pnl')
+    try:
+        import math
+        value = float(pnl)
+        pnl_text = f'{value:+.2f}%' if math.isfinite(value) else 'P/L unavailable'
+    except (TypeError,ValueError):
+        pnl_text = 'P/L unavailable'
+    return (
+        f'<article class="learning-tile {tone}">'
+        '<div class="lt-top">'
+        f'<span class="lt-date">{escape(event.get("date") or "Unknown date")}</span>'
+        f'<span class="lt-pill">{escape(label)}</span></div>'
+        f'<div class="lt-head"><h4>{escape(event.get("symbol") or "Share")}</h4>'
+        f'<span class="lt-result">{escape(pnl_text)}</span></div>'
+        f'<div class="lt-label">What happened</div><div class="lt-text">{escape(event.get("observation") or "No verified observation")}</div>'
+        f'<div class="lt-label">What the AI can test next</div><div class="lt-text">{escape(event.get("next_test") or "Insufficient evidence")}</div>'
+        f'<div class="lt-context">At entry: {escape(event.get("entry_context") or "Indicators unavailable")}</div>'
+        f'<div class="lt-footer">{("Possible evaluation example · validation required" if event.get("training_candidate") else "Not currently a validated training example")}</div>'
+        '</article>'
+    )
