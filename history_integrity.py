@@ -7,23 +7,26 @@ from __future__ import annotations
 
 
 def history_state(local_shares: int, expected_minimum: int, cloud_configured: bool,
-                  cloud_shares: int | None = None, cloud_failed: bool = False) -> dict:
+                  cloud_shares: int | None = None, cloud_failed: bool = False,
+                  record_label: str = "share") -> dict:
+    noun = "options" if record_label == "option" else "shares"
+    label = "option" if record_label == "option" else "share"
     local = max(int(local_shares), 0)
     minimum = max(int(expected_minimum), 0)
     missing = max(0, minimum - local)
     verified = missing == 0
     if verified:
-        reason = "Local historical share count meets the configured baseline."
+        reason = f"Local historical {label} count meets the configured baseline."
     elif not cloud_configured:
-        reason = "Prior share records are missing locally and no Supabase backup is configured."
+        reason = f"Prior {label} records are missing locally and no Supabase backup is configured."
     elif cloud_failed:
-        reason = "Historical records are missing and the cloud restore returned an error."
+        reason = f"Historical {label} records are missing and the cloud restore returned an error."
     elif cloud_shares is not None and cloud_shares == 0:
-        reason = "Historical records are missing and the configured Supabase source returned no shares."
+        reason = f"Historical {label} records are missing and the configured Supabase source returned no {noun}."
     elif cloud_shares is not None and cloud_shares < minimum:
-        reason = "Supabase currently contains fewer share records than the configured history baseline."
+        reason = f"Supabase currently contains fewer {label} records than the configured history baseline."
     else:
-        reason = "Historical records are missing locally; retry cloud restoration and inspect recovery totals."
+        reason = f"Historical {label} records are missing locally; retry cloud restoration and inspect recovery totals."
     return {
         "verified_count": verified,
         "local": local,

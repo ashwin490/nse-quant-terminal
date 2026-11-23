@@ -14,6 +14,7 @@ import io
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from intraday_exit import scan_intraday_minutes
 from datetime import datetime, time as dtime, timedelta
 import random
 import shutil
@@ -38,8 +39,8 @@ warnings.filterwarnings("ignore")
 
 # set_page_config must be the first Streamlit command that renders anything
 st.set_page_config(
-    page_title="NSE AI • Bright Research Desk",
-    page_icon="✨",
+    page_title="NSE AI • Dark Research Terminal",
+    page_icon="✦",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -66,9 +67,11 @@ MAX_OPEN_POSITIONS = 10
 MAX_OPEN_RISK_INR = 30000.0
 COOLDOWN_CALENDAR_DAYS = 3
 HALF_LIFE_DAYS = 30.0
-# Baseline from the previously displayed 20 active share records. Not a fabrication of records.
-# Configure HISTORY_EXPECTED_MIN_SHARES=0 only after explicitly accepting a fresh start.
-HISTORY_EXPECTED_MIN_SHARES = 20
+# Latest user's historical baseline: 106 total share rows and 21 option rows.
+# These are floor checks, NOT reconstructed data. Explicitly set the matching
+# Streamlit Secrets setting to 0 only after knowingly accepting a fresh start.
+HISTORY_EXPECTED_MIN_SHARES = 106
+HISTORY_EXPECTED_MIN_OPTIONS = 21
 # ---- Whole-market scan (every NSE share in the EQ series) ----
 SCAN_WORKERS = 12                      # parallel price downloads
 SCAN_TIME_BUDGET_SEC = 240             # stop downloading after this long; the rest is checked next time
@@ -594,19 +597,47 @@ def journal_counts() -> dict:
             con.close()
 
 def get_history_integrity() -> dict:
-    """Do not mark a newly empty local file as restored, or spend missing paper capital."""
+    """Block new paper allocations when *either* previous journal looks incomplete.
+
+    This is a count floor based on the user's known displayed history, not proof
+    of data correctness. It never deletes, reconstructs, or rewrites old rows.
+    """
     try:
-        local_count = journal_counts()["total"]
+        local_shares = journal_counts()["total"]
     except Exception:
-        local_count = 0
+        local_shares = 0
+    try:
+        with DB_LOCK:
+            con = duckdb.connect(DB_PATH, read_only=True)
+            try:
+                local_options = int(con.execute("SELECT COUNT(*) FROM daily_options_journal").fetchone()[0])
+            finally:
+                con.close()
+    except Exception:
+        local_options = 0
     cloud_info = st.session_state.get("hydrate_info") or {}
-    return history_state(
-        local_count,
-        HISTORY_EXPECTED_MIN_SHARES,
+    shares = history_state(
+        local_shares, HISTORY_EXPECTED_MIN_SHARES,
         cloud_configured=bool(supabase),
         cloud_shares=cloud_info.get("remote") if supabase and cloud_info else None,
         cloud_failed=bool(cloud_info.get("fetch_failed", False)),
     )
+    options = history_state(
+        local_options, HISTORY_EXPECTED_MIN_OPTIONS,
+        cloud_configured=bool(supabase),
+        cloud_shares=cloud_info.get("remote_options") if supabase and cloud_info else None,
+        cloud_failed=bool(cloud_info.get("fetch_failed", False)),
+        record_label="option",
+    )
+    return {
+        **shares,
+        "verified_count": shares["verified_count"] and options["verified_count"],
+        "allow_new_paper_entries": shares["allow_new_paper_entries"] and options["allow_new_paper_entries"],
+        "reason": " ".join(x["reason"] for x in (shares, options) if not x["verified_count"]),
+        "local_options": options["local"],
+        "minimum_options": options["minimum"],
+        "missing_options": options["missing"],
+    }
 
 def get_meta(key: str, default=None):
     with DB_LOCK:
@@ -673,7 +704,11 @@ from history_integrity import history_state
 try:
     HISTORY_EXPECTED_MIN_SHARES = max(0, int(_secret("HISTORY_EXPECTED_MIN_SHARES", str(HISTORY_EXPECTED_MIN_SHARES))))
 except ValueError:
-    HISTORY_EXPECTED_MIN_SHARES = 20
+    HISTORY_EXPECTED_MIN_SHARES = 106
+try:
+    HISTORY_EXPECTED_MIN_OPTIONS = max(0, int(_secret("HISTORY_EXPECTED_MIN_OPTIONS", str(HISTORY_EXPECTED_MIN_OPTIONS))))
+except ValueError:
+    HISTORY_EXPECTED_MIN_OPTIONS = 21
 
 def check_password() -> bool:
     if st.session_state.get("password_correct"):
@@ -1524,12 +1559,26 @@ def _nse_get_json(url: str):
                 pass
             box["session"], box["ts"] = s, now
         s = box["session"]
+    is_option_chain = "/api/option-chain-equities" in url
     try:
         r = s.get(url, timeout=6)
+        if is_option_chain:
+            st.session_state["_nse_option_http_status"] = str(r.status_code)
         if r.status_code == 200:
-            return r.json()
+            try:
+                return r.json()
+            except (ValueError, TypeError):
+                if is_option_chain:
+                    st.session_state["_nse_option_http_status"] = "invalid-json"
+    except requests.Timeout:
+        if is_option_chain:
+            st.session_state["_nse_option_http_status"] = "timeout"
+    except requests.RequestException:
+        if is_option_chain:
+            st.session_state["_nse_option_http_status"] = "network-error"
     except Exception:
-        pass
+        if is_option_chain:
+            st.session_state["_nse_option_http_status"] = "unexpected-error"
     return None
 
 # ---------- public-holiday awareness ----------
@@ -1676,7 +1725,9 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
     Current real quote and confirmed actual NSE lot size are necessary for CONSIDER.
     Scan outputs are saved to option_watchlist for long-running audit history.
     """
+    from scan_health import new_option_scan_health, option_scan_summary
     now = ist_now()
+    st.session_state["option_scan_health"] = new_option_scan_health()
     if not is_entry_window_open():
         st.session_state["option_scan_note"] = (
             "NSE is outside the verified entry window. New CE/PE ratings are paused until "
@@ -1702,6 +1753,7 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
     bucket_count = math.ceil(len(syms)/batch)
     bucket = (now.date().toordinal() + now.hour//2) % bucket_count
     selected = syms[bucket*batch:(bucket+1)*batch]
+    health = new_option_scan_health(len(selected), len(syms))
     prefetch_histories([t+".NS" for t in selected], "3mo", workers=6, ttl=SWEEP_TTL_SEC, time_budget=70)
     eq_used, opt_used = get_open_exposures()
     reviews = []
@@ -1710,6 +1762,7 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
         h = get_history_fast(name+".NS", "3mo")
         if h.empty or len(h)<35:
             continue
+        health["price_histories"] += 1
         c = h["Close"].astype(float)
         spot = float(c.iloc[-1])
         if not math.isfinite(spot) or spot <= 0:
@@ -1723,10 +1776,19 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
         rsi = 100-100/(1+up/max(1e-6, down))
         if abs(change5)<0.6:
             continue
+        health["directional"] += 1
+        # Record the outcome of each exchange request without storing URLs or cookies.
+        st.session_state["_nse_option_http_status"] = "unavailable"
         chain = _nse_get_json("https://www.nseindia.com/api/option-chain-equities?symbol=" + urllib.parse.quote(name,safe=""))
+        status = str(st.session_state.get("_nse_option_http_status", "unavailable"))
+        http_counts = health["http_status_counts"]
+        http_counts[status] = http_counts.get(status, 0) + 1
         if not isinstance(chain,dict):
             continue
+        health["chains_received"] += 1
         quote_fresh = is_entry_window_open() and _quote_age_is_valid(chain)
+        if quote_fresh:
+            health["fresh_chains"] += 1
         try:
             dates = [(datetime.strptime(x,"%d-%b-%Y"),x) for x in (chain.get("records") or {}).get("expiryDates", [])]
         except (TypeError,ValueError):
@@ -1734,6 +1796,7 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
         valid_dates = [(d,label) for d,label in dates if 8 <= (d.date()-now.date()).days <= 65]
         if not valid_dates:
             continue
+        health["expiry_matches"] += 1
         expiry, expiry_label = min(valid_dates,key=lambda x:x[0])
         days_left = (expiry.date()-now.date()).days
         series = [r for r in (chain.get("records") or {}).get("data",[]) if r.get("expiryDate")==expiry_label]
@@ -1753,6 +1816,7 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
             expiry_month = expiry.strftime("%b-%y").upper()
             lot = int(lots[name].get(expiry_month, 0))
             if lot <= 0:
+                health["missing_lots"] += 1
                 continue  # never substitute a different expiry's contract size
             result = review_long_option(kind=side,spot=spot,strike=strike,bid=bid,ask=ask,
                 lot_size=lot,days_left=days_left,open_interest=oi,iv_pct=iv,realized_vol_pct=rv,
@@ -1766,6 +1830,8 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
                 decision = "WATCH"
                 why = (f"Historical live-quote {side} paper ideas have averaged {history['mean']:+.1f}% "
                        f"over {history['n']} finished samples; require better validation")
+            health["contract_reviews"] += 1
+            health[decision.lower()] = health.get(decision.lower(), 0) + 1
             score = (100 if decision=="CONSIDER" else 50 if decision=="WATCH" else 0) + abs(change5)-result.spread_pct/3
             reviews.append({"Stock":name,"Type":side,"Direction":"Up" if side=="CE" else "Down",
                 "Decision":decision,"Why":why,"Expiry":expiry.strftime('%d %b %Y'),
@@ -1792,7 +1858,8 @@ def scan_option_candidates(max_underlyings: int = 35) -> pd.DataFrame:
                         r["5-day share move (%)"],r["Checked at"]])
             finally:
                 con.close()
-    st.session_state["option_scan_note"] = f"Reviewed {len(selected)} of {len(syms)} exchange-listed F&O shares in this rotating batch."
+    st.session_state["option_scan_health"] = health
+    st.session_state["option_scan_note"] = option_scan_summary(health)
     return df
 
 
@@ -2001,21 +2068,10 @@ def trend_bar_to_rise(bar: float) -> float:
 
 NO_DATA_GRACE_DAYS = 3
 
-def close_stale_trade(tr, now_str: str):
-    """A share with NO prices at all while the market feed works (delisted or suspended): after its 7-day hold plus a few
-    days' grace, close it at the last price we saw, clearly labelled, so it can't block a slot forever."""
-    last = _num(tr.get("latest_price"), _num(tr.get("entry_price")))
-    pnl = _num(tr.get("pnl_pct"))
-    status = "⏱️ EXPIRED (NO PRICE DATA)"
-    with DB_LOCK:
-        con = duckdb.connect(DB_PATH, read_only=False)
-        try:
-            con.execute("UPDATE trade_journal SET status = ?, exit_price = ?, exit_timestamp = ?, last_audited = ? WHERE trade_id = ?",
-                        [status, last, now_str, now_str, tr["trade_id"]])
-        finally:
-            con.close()
-    cloud_update("predictions", {"ticker": tr["ticker"], "predicted_date": tr["date_str"]},
-                 {"status": status, "latest_price": last, "pnl_pct": pnl, "last_checked": now_str}, "Close Stale Trade")
+# Missing market prices must not generate a simulated sale at the last known
+# quote: this would release paper capital without observing an actual exit.
+# Keep the trade ACTIVE and show a data-quality warning until reliable data
+# arrives or a separate reconciliation process can verify its outcome.
 
 # ==============================================================================
 # 9. AUDIT ENGINE (BAR-BY-BAR, GAP-AWARE, STOP-FIRST, HONEST FILLS)
@@ -2025,6 +2081,8 @@ def audit_and_reconcile_all_trades():
     now_str = now_ist.strftime('%Y-%m-%d %H:%M:%S')
     today_date = now_ist.date()
     st.session_state["price_feed_problem"] = False
+    st.session_state["intraday_feed_problem"] = False
+    st.session_state["intraday_feed_missing_tickers"] = []
     flush_pending_cloud_sync()
 
     with DB_LOCK:
@@ -2038,20 +2096,14 @@ def audit_and_reconcile_all_trades():
             con.close()
 
     got_any_price = False
-    feed_ok = None
     for _, tr in (active_trades.iterrows() if not active_trades.empty else []):
         tkr = str(tr["ticker"]).strip()
         try:
             h = fetch_cached_history(normalize_ticker_for_yf(tkr), period="1mo", interval="1d")
             if h.empty:
-                if feed_ok is None:
-                    feed_ok = not fetch_cached_history("^NSEI", period="5d", interval="1d").empty
-                entry_dt0 = _to_date(tr["date_str"])
-                if feed_ok and entry_dt0 and (today_date - entry_dt0).days >= MAX_HOLD_CALENDAR_DAYS + NO_DATA_GRACE_DAYS:
-                    close_stale_trade(tr, now_str)                     # share stopped trading (e.g. delisted): close at last known price
-                else:
-                    st.session_state["price_feed_problem"] = True
-                continue                                       # do NOT pretend we checked
+                st.session_state["price_feed_problem"] = True
+                st.session_state["intraday_feed_missing_tickers"].append(tkr)
+                continue  # never auto-close a position using an old price
             got_any_price = True
             dates = _bar_dates(h)
             entry, target, stop = float(tr["entry_price"]), float(tr["target_price"]), float(tr["stop_loss"])
@@ -2065,6 +2117,7 @@ def audit_and_reconcile_all_trades():
             start_after = max(entry_dt, _to_date(tr.get("last_audited")) or entry_dt)
 
             new_status, exit_price, exit_ts = "ACTIVE", 0.0, None
+            features = _parse_features(tr.get('features_json'))
             curr = float(h["Close"].iloc[-1])
 
             # 1) completed days we haven't looked at yet (covers days the app was asleep)
@@ -2086,31 +2139,81 @@ def audit_and_reconcile_all_trades():
                     exit_ts = f"{d} 15:30:00"
                     break
 
-            # 2) today's live bar (entry-day guard: pre-entry highs/lows never count)
+            # 2) today's intraday minute path: a brief target or stop touch must
+            # not be lost just because the market returned inside the range by
+            # the next 15-minute dashboard refresh. The *first observed* event
+            # wins; same-minute double touches use the conservative stop-first
+            # rule. Missing minute candles => do NOT claim a verified exit.
+            intraday_uncertain = False
             if new_status == "ACTIVE" and dates and dates[-1] == today_date:
-                last = h.iloc[-1]
-                curr = float(last["Close"])
-                day_high, day_low = float(last["High"]), float(last["Low"])
-                same_day = (entry_dt == today_date)
-                if target_dist > 0 and stop < be_floor:
-                    ratchet_hit = (curr >= be_trigger) if same_day else (curr >= be_trigger or day_high >= be_trigger)
-                    if ratchet_hit and curr > be_floor:        # never ratchet above where the price actually is
-                        stop = be_floor
-                is_be = is_stop_breakeven_protected(entry, stop)
-                hit_target = (curr >= target) if same_day else (curr >= target or day_high >= target)
-                hit_stop = (curr <= stop) if (same_day or is_be) else (curr <= stop or day_low <= stop)
-                if hit_stop:                                   # stop wins ties (conservative)
-                    fill = curr if curr <= stop else stop
-                    new_status, exit_price = classify_stop_exit(entry, stop, fill, friction), fill
-                elif hit_target:
-                    new_status, exit_price = "🎯 WIN (TARGET HIT)", target
+                row_now = h.iloc[-1]
+                curr = float(row_now["Close"])
+                try:
+                    entry_ts = pd.Timestamp(str(tr.get("timestamp") or "").replace("T", " "))
+                    if pd.isna(entry_ts):
+                        raise ValueError('missing entry timestamp')
+                    audit_ts = pd.Timestamp(str(tr.get("last_audited") or "").replace("T", " "))
+                    if pd.isna(audit_ts):
+                        audit_ts = entry_ts
+                    start_today = pd.Timestamp(f"{today_date} 09:15:00")
+                    features = _parse_features(tr.get("features_json"))
+                    base_stop = features.get('initial_stop_price')
+                    if entry_dt == today_date:
+                        # For NEW trades replay from exact entry time using the
+                        # original stop (previous audits may have ratcheted it).
+                        # For restored/legacy trades with unknown original stop,
+                        # only inspect since last audit to prevent false exits.
+                        if base_stop is not None and _num(base_stop) > 0:
+                            from_ts = entry_ts
+                            minute_stop = float(base_stop)
+                        else:
+                            from_ts = max(entry_ts, audit_ts)
+                            minute_stop = stop
+                    else:
+                        from_ts = max(start_today, audit_ts) if audit_ts.date() == today_date else start_today
+                        minute_stop = stop
+                    minute_data = fetch_cached_history(normalize_ticker_for_yf(tkr), period='1d', interval='1m')
+                    check = scan_intraday_minutes(minute_data, entry=entry, target=target,
+                        stop=minute_stop, from_time=from_ts, as_of=now_ist,
+                        be_floor=be_floor, be_trigger=be_trigger)
+                    if check.covered:
+                        stop = check.new_stop
+                        if check.outcome == 'WIN':
+                            new_status, exit_price, exit_ts = '🎯 WIN (TARGET HIT)', check.fill, check.touched_at
+                        elif check.outcome == 'STOP':
+                            new_status, exit_price, exit_ts = classify_stop_exit(entry,stop,check.fill,friction), check.fill, check.touched_at
+                        if check.outcome:
+                            features['intraday_exit_source'] = 'Yahoo 1-minute OHLC (paper estimate)'
+                            features['intraday_exit_note'] = check.note
+                            features['intraday_same_minute_ambiguous'] = bool(check.ambiguous)
+                    else:
+                        intraday_uncertain = True
+                        st.session_state["intraday_feed_problem"] = True
+                        st.session_state["intraday_feed_missing_tickers"].append(tkr)
+                except Exception as exc:
+                    intraday_uncertain = True
+                    st.session_state["intraday_feed_problem"] = True
+                    st.session_state["intraday_feed_missing_tickers"].append(tkr)
+                    logging.warning('Intraday paper reconciliation unavailable for %s: %s',tkr,type(exc).__name__)
+
+            # The partial daily candle's high/low includes pre-entry values and
+            # cannot establish which barrier came first. Never turn that into a
+            # guaranteed intraday exit if the minute path was unavailable.
 
             # 3) time exit
-            if new_status == "ACTIVE" and (today_date - entry_dt).days >= MAX_HOLD_CALENDAR_DAYS:
+            # Never invent an exit at a stale closing price merely because
+            # the calendar timer expired; wait for a real session price.
+            if (new_status == "ACTIVE" and (today_date - entry_dt).days >= MAX_HOLD_CALENDAR_DAYS
+                    and dates and dates[-1] == today_date and not intraday_uncertain):
                 new_status, exit_price = "⏱️ EXPIRED (TIME EXIT)", curr
 
             mark = exit_price if new_status != "ACTIVE" else curr
             pnl = calc_net_equity_pnl_pct(entry, mark, friction)
+            # Keep the old intraday checkpoint if today's feed failed, so the
+            # next successful check can still recover a temporary price touch.
+            audit_watermark = (str(tr.get('last_audited') or now_str)
+                               if intraday_uncertain and new_status == 'ACTIVE' else now_str)
+            updated_features = json.dumps(features)
             with DB_LOCK:
                 con = duckdb.connect(DB_PATH, read_only=False)
                 try:
@@ -2118,13 +2221,15 @@ def audit_and_reconcile_all_trades():
                         UPDATE trade_journal
                         SET latest_price = ?, stop_loss = ?, pnl_pct = ?, status = ?, exit_price = ?,
                             exit_timestamp = CASE WHEN ? != 'ACTIVE' THEN ? ELSE exit_timestamp END,
-                            last_audited = ?
+                            last_audited = ?, features_json = ?
                         WHERE trade_id = ?
-                    """, [mark, stop, pnl, new_status, exit_price, new_status, exit_ts or now_str, now_str, tr["trade_id"]])
+                    """, [mark, stop, pnl, new_status, exit_price, new_status, exit_ts or now_str,
+                           audit_watermark, updated_features, tr["trade_id"]])
                 finally:
                     con.close()
             cloud_update("predictions", {"ticker": tkr, "predicted_date": tr["date_str"]},
-                         {"status": new_status, "stop_loss": stop, "latest_price": mark, "pnl_pct": pnl, "last_checked": now_str}, "Audit Equity")
+                         {"status": new_status, "stop_loss": stop, "latest_price": mark, "pnl_pct": pnl,
+                          "last_checked": audit_watermark, "features_json": json.loads(updated_features)}, "Audit Equity")
         except Exception:
             continue
 
@@ -2282,7 +2387,8 @@ def log_equity_signal_safely(sig: dict, enforce_sector_cap: bool = True) -> bool
     if enforce_sector_cap and get_active_sector_exposure().get(sector, 0) >= sector_cap(sector):
         return fail(f"You already hold the maximum in {sector}")
 
-    f_dict = sig.get('FeaturesDict', {})
+    f_dict = dict(sig.get('FeaturesDict') or {})
+    f_dict.setdefault('initial_stop_price', float(sig['Stop Loss (₹)']))
     f_json_str = json.dumps(f_dict)
     init_net_pnl = -get_trade_friction_pct(f_json_str)
     logged_local = False
@@ -2624,9 +2730,38 @@ def run_predictions():
             elif ev_pct <= MIN_EV_PCT:
                 reason = f"Not worth it after costs: needs a {be_pct:.0f}% chance of reaching the goal, the AI estimates {final_score:.0f}% (worth {ev_pct:+.2f}% on average)"
             else:
-                reason = f"Passed every check (needs {be_pct:.0f}%, AI estimates {final_score:.0f}%)"
+                reason = (f"Available price/model checks passed; filings NOT verified "
+                          f"(needs {be_pct:.0f}%, model estimate {final_score:.0f}%)" if not ANNOUNCEMENTS_AVAILABLE
+                          else f"Passed configured checks (needs {be_pct:.0f}%, model estimates {final_score:.0f}%)")
+
+            # Save an honest, entry-time target-vs-stop timeline with NEW paper trades.
+            # Never infer historical forecasts for legacy trades after their exits.
+            try:
+                from forecast_timeline import estimate_target_timeline, completed_bars_only
+                study_bars = completed_bars_only(
+                    get_history_fast(f"{clean_sym}.NS", period="6mo"), ist_now().date(), market_open)
+                timeline_study = estimate_target_timeline(
+                    study_bars, live_price, target, stop, max_sessions=5)
+                saved_timeline = {
+                    "label": timeline_study.label,
+                    "horizon_sessions": timeline_study.horizon_sessions,
+                    "trials": timeline_study.trials,
+                    "target_hits": timeline_study.target_hits,
+                    "stop_hits": timeline_study.stop_hits,
+                    "typical_sessions": timeline_study.typical_sessions,
+                    "historical_target_rate_pct": timeline_study.target_rate_pct,
+                    "credible": timeline_study.credible,
+                    "recorded_ist": ist_now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "method": "completed_ohlc_stop_first_v1",
+                }
+            except Exception:
+                # A missing timeline must never create a made-up estimate or
+                # interfere with the existing share scan and risk decisions.
+                saved_timeline = {"label": "Insufficient history", "credible": False,
+                                  "horizon_sessions": 5, "method": "unavailable"}
 
             snapshot = {
+                "timeline_at_entry": saved_timeline,
                 "raw_features": raw_feature_map, "atr_pct": atr_pct, "raw_prob": round(raw_prob, 4), "base_ml_conf": base_conf,
                 "learner_delta": learner["delta"], "macro_delta": macro_delta, "nlp_delta": nlp["delta"], "sector": sector,
                 "friction_pct": friction, "avg_turnover_inr": round(avg_turnover, 0), "entry_bar": str(dates[-1]), "final_score": final_score,
@@ -3204,512 +3339,517 @@ def select_top_option_ideas(df: pd.DataFrame, limit_each: int = 2) -> pd.DataFra
 
 
 # ==============================================================================
-# 14. BRIGHT, INTERACTIVE, GRAPH-FREE DASHBOARD + HISTORY RECOVERY
+# 14. PREMIUM DARK RESEARCH WORKSPACE — THREE VIEWS, NO CHARTS
 # ==============================================================================
-from dashboard_theme import theme_css, THEMES, hero as ui_hero, kpis as ui_kpis, item_card as ui_card, intro as ui_intro, status_strip as ui_status_strip
-from history_recovery import merge_history_database, snapshot_database, count_history
-import tempfile
 import logging
+import tempfile
+from premium_dark import (
+    THEMES as DARK_THEMES, theme_css as dark_theme_css, hero as dark_hero,
+    stats as dark_stats, header as dark_header, note as dark_note,
+    signal_card as dark_card,
+)
+from forecast_timeline import estimate_target_timeline, completed_bars_only
+from learning_insights import (
+    describe_trade, stock_evidence, stock_history_summary, is_training_ready, forecast_review,
+)
+from history_recovery import merge_history_database, snapshot_database, count_history
+from scan_health import option_http_note
 
-# The theme selector uses only vetted CSS palettes and never modifies trade data.
+
+def read_full_paper_ledger() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Read one coherent local snapshot of history; errors must never look like zero trades."""
+    with DB_LOCK:
+        con = duckdb.connect(DB_PATH, read_only=True)
+        try:
+            a = con.execute("SELECT * FROM trade_journal ORDER BY date_str DESC NULLS LAST, timestamp DESC NULLS LAST").df()
+            b = con.execute("SELECT * FROM daily_options_journal ORDER BY date_key DESC NULLS LAST").df()
+            c = con.execute("SELECT * FROM option_watchlist ORDER BY checked_at DESC NULLS LAST").df()
+            return a, b, c
+        finally:
+            con.close()
+
+
+def stock_timeline(symbol: str, entry: float, target: float, stop: float, sessions: int):
+    """Only completed bars, cached historical data; not a trained time-to-target AI."""
+    sym = normalize_ticker_for_yf(symbol)
+    history = get_history_fast(sym, '6mo')
+    return estimate_target_timeline(
+        completed_bars_only(history, ist_now().date(), is_nse_market_open()),
+        entry, target, stop, max_sessions=sessions,
+    )
+
+
+def labelled_decision(row) -> str:
+    if bool(row.get('Qualified', False)):
+        return 'CONSIDER'
+    reason = str(row.get('Rejection Reason', '')).lower()
+    if any(w in reason for w in ('bad news', 'risk', 'filing', 'not verified', 'blocked')):
+        return 'AVOID'
+    return 'WATCH'
+
+
+def ranked_shares(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows is None or rows.empty:
+        return pd.DataFrame()
+    df = rows.copy()
+    df['Decision'] = df.apply(labelled_decision, axis=1)
+    df['_order'] = df['Decision'].map({'CONSIDER':0,'WATCH':1,'AVOID':2}).fillna(3)
+    df['_ev'] = pd.to_numeric(df['Expected value'],errors='coerce').fillna(-1e6)
+    df['_score'] = pd.to_numeric(df['Adjusted Score'],errors='coerce').fillna(-1e6)
+    return df.sort_values(['_order','_ev','_score'], ascending=[True,False,False])
+
+
+def option_sort(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows is None or rows.empty:
+        return pd.DataFrame()
+    df = rows.copy()
+    df['_order'] = df['Decision'].map({'CONSIDER':0,'WATCH':1,'AVOID':2}).fillna(3)
+    df['_liquidity'] = pd.to_numeric(df['Open interest'],errors='coerce').fillna(0)
+    df['_spread'] = pd.to_numeric(df['Spread (%)'],errors='coerce').fillna(1e6)
+    return df.sort_values(['_order','_spread','_liquidity'], ascending=[True,True,False])
+
+
+def short_money(n, d=2) -> str:
+    try:
+        v = float(n)
+        return f'₹{v:,.{d}f}' if math.isfinite(v) else '—'
+    except (TypeError,ValueError):
+        return '—'
+
+
+def render_history_recovery() -> None:
+    """Move the original history repair workflow into the Ledger without data loss."""
+    with st.expander('🛠️ Backup and recover history', expanded=False):
+        st.caption('Keep the original Supabase project and your local DuckDB backups. An upload MERGES IDs; it never deliberately resets the journal.')
+        if supabase:
+            if st.button('☁️ Retry restoring from Supabase', key='dark_cloud_restore', use_container_width=True):
+                with st.spinner('Comparing cloud and local paper history...'):
+                    hydrate_duckdb_from_supabase()
+                st.rerun()
+            hi = st.session_state.get('hydrate_info',{})
+            st.caption(f"Last cloud check: {hi.get('remote',0)} share rows, {hi.get('remote_options',0)} option rows, "
+                       f"{hi.get('restored',0)} share rows restored, {hi.get('bad_rows',0)} skipped")
+            if st.button('📤 Sync up to 200 missing records to Supabase', key='dark_cloud_sync', use_container_width=True):
+                with st.spinner('Uploading only rows absent from cloud...'):
+                    result = sync_local_history_to_supabase(200, st.session_state.get('history_sync_offset',0))
+                st.session_state['history_sync_offset'] = result['next_offset'] if result['more_to_check'] else 0
+                if result['failed']:
+                    st.error(f"Sync incomplete: {result['failed']} failed. Check app logs. No existing remote rows were deliberately overwritten.")
+                else:
+                    st.success(f"Added {result['shares_inserted']} share and {result['options_inserted']} option records; "
+                               f"{result['already_remote']} were already in cloud.")
+                if result['more_to_check']:
+                    st.info('More local records remain to check. Click Sync again to continue.')
+        else:
+            st.warning('Supabase is not configured on this deployment. Restore using the ORIGINAL SUPABASE_URL and SUPABASE_KEY secrets, or upload a local backup.')
+        previous = st.file_uploader('Merge an older DuckDB backup', type=['duckdb'], key='dark_old_db')
+        if previous is not None:
+            st.caption(f'{previous.name} · {previous.size/1048576:.1f} MB')
+            if previous.size > 50*1024*1024:
+                st.error('50 MB maximum for direct uploads. Restore larger backups using a managed process.')
+            elif st.button('Merge my previous history',key='dark_merge_db',type='primary'):
+                try:
+                    with tempfile.TemporaryDirectory(prefix='paper_restore_') as tmpdir:
+                        old_path = Path(tmpdir)/'older_history.duckdb'
+                        old_path.write_bytes(previous.getvalue())
+                        with DB_LOCK:
+                            report = merge_history_database(old_path, DB_PATH, ROOT_DIR/'backups')
+                    st.session_state['history_import_result'] = report
+                    st.rerun()
+                except Exception as error:
+                    logging.exception('History merge failed')
+                    st.error(f'Import safely stopped: {type(error).__name__}. See Streamlit logs.')
+        report = st.session_state.get('history_import_result')
+        if report:
+            st.success('Added (not replaced): '
+                       f"{report['added'].get('trade_journal',0)} stocks, "
+                       f"{report['added'].get('daily_options_journal',0)} options, "
+                       f"{report['added'].get('option_watchlist',0)} reviews.")
+            st.warning('Uploaded records remain local until backed up/synced to persistent storage.')
+        if st.button('💾 Prepare full DuckDB backup', key='dark_prepare_backup'):
+            with DB_LOCK:
+                outfile = snapshot_database(DB_PATH, ROOT_DIR/'backups', 'manual_history')
+            st.session_state['dark_backup_bytes'] = outfile.read_bytes()
+            st.session_state['dark_backup_stamp'] = ist_now().strftime('%Y%m%d_%H%M')
+        if st.session_state.get('dark_backup_bytes'):
+            st.download_button('⬇️ Download full history (.duckdb)',
+                data=st.session_state['dark_backup_bytes'],
+                file_name=f"NSE_paper_history_{st.session_state['dark_backup_stamp']}.duckdb",
+                mime='application/octet-stream', key='dark_download_history')
+        st.caption('Streamlit Cloud local files are not permanent. Store a backup externally and verify cloud sync before relying on unattended paper research.')
+
+
+# Streamlit styles: always use a vetted dark palette, and native base="dark".
 with st.sidebar:
-    theme_name = st.selectbox("🎨 Dashboard colours", THEMES, index=0, key="research_theme",
-        help="Try Aurora (purple/teal), Sunrise (coral/gold), or Ocean (blue/mint). No graphs.")
-st.markdown(f"<style>{theme_css(theme_name)}</style>", unsafe_allow_html=True)
-state = get_market_state()
+    palette_choice = st.selectbox('🌌 Dark colour theme', DARK_THEMES, index=0, key='dark_theme_selector')
+st.markdown(f'<style>{dark_theme_css(palette_choice)}</style>', unsafe_allow_html=True)
+
+now_ist = ist_now()
 market_open = is_nse_market_open()
-now = ist_now()
-
 with st.sidebar:
-    st.markdown("### ✨ Your research desk")
-    st.caption("Colourful cards • No charts • Decisions explained")
-    st.markdown("**Paper-trading capital:** ₹10,00,000")
-    auto_refresh = st.toggle("Auto-refresh while open", value=True, key="main_autorefresh")
-    st.markdown("---")
-    with st.expander("⚙️ Trading assumptions"):
-        st.caption("Stock ideas: normally ₹1 lakh, up to ₹2 lakh. Option lot: ₹50,000, overall option cap ₹2 lakh.")
-        st.number_input("Brokerage per order (₹)", min_value=0.0, max_value=100.0,
-                        value=DEFAULT_BROKERAGE_PER_ORDER_INR, key="brokerage_inr")
-        st.number_input("DP charge per sale (₹)", min_value=0.0, max_value=100.0,
-                        value=DEFAULT_DP_CHARGE_INR, key="dp_charge_inr")
-    with st.expander("🩺 Data and system status"):
-        jc = journal_counts()
-        st.caption(f"DuckDB schema v{DB_SCHEMA_STATUS.get('version', '?')}")
-        st.write(f"📚 Shares saved locally: **{jc['total']:,}**")
-        st.caption(f"Expected historical share baseline: at least {HISTORY_EXPECTED_MIN_SHARES:,} records")
-        st.write(f"📚 Options saved locally: **{len(load_options_journal_df()):,}**")
-        st.write(f"☁️ Supabase: **{'configured' if supabase else 'not configured'}**")
-        hi = st.session_state.get("hydrate_info", {})
-        if hi:
-            st.caption(f"Last cloud check: {hi.get('remote',0)} remote share rows, {hi.get('remote_options',0)} option rows; {hi.get('restored',0)} share rows restored")
-        if st.session_state.get("db_error"):
-            st.error(st.session_state["db_error"])
-        st.caption("Cloud-hosted local files can disappear after a restart. History is only durable if backed up externally.")
-    if st.button("↪️ Sign out", use_container_width=True):
-        st.session_state["password_correct"] = False
+    st.markdown('### ✦ Research terminal')
+    st.caption('Three views · No charts · Paper only')
+    auto_refresh = st.toggle('Auto-scan during NSE hours', value=True, key='dark_auto_scan')
+    refresh_mins = st.selectbox('Refresh interval', [15,30,60], index=0,
+        format_func=lambda v:f'{v} minutes', key='dark_refresh_minutes')
+    st.caption('Scans run while this Streamlit session is active. They are not an unattended background service.')
+    with st.expander('⚙️ Trading assumptions'):
+        st.write('Shared research budget: **₹10,00,000**')
+        st.write(f'Share slots: **{MAX_OPEN_POSITIONS}** · Stock time-exit: **{MAX_HOLD_CALENDAR_DAYS} calendar days**')
+        st.number_input('Brokerage per order (₹)', min_value=0.0, max_value=100.0,
+                        value=DEFAULT_BROKERAGE_PER_ORDER_INR, key='brokerage_inr')
+        st.number_input('Depository fee per sale (₹)', min_value=0.0, max_value=100.0,
+                        value=DEFAULT_DP_CHARGE_INR, key='dp_charge_inr')
+    with st.expander('🩺 Source and backup health'):
+        st.caption(f"Database schema v{DB_SCHEMA_STATUS.get('version','?')}")
+        st.caption(f"Minimum history expected: {HISTORY_EXPECTED_MIN_SHARES} shares / {HISTORY_EXPECTED_MIN_OPTIONS} options")
+        st.caption(f"Supabase: {'connected' if supabase else 'not configured'}")
+        st.caption(f"Model: {st.session_state.get('ml_model_source','Not yet checked')}")
+        if st.session_state.get('db_error'):
+            st.warning(str(st.session_state['db_error'])[:180])
+    if st.button('Sign out', key='dark_signout', use_container_width=True):
+        st.session_state['password_correct'] = False
         st.rerun()
 
 if auto_refresh and st_autorefresh:
-    st_autorefresh(interval=15*60*1000, key="bright_autorefresh")
+    st_autorefresh(interval=int(refresh_mins)*60*1000, key='dark_session_refresh')
 
-st.markdown(ui_hero(now.strftime('%d %b %Y · %H:%M'), market_open), unsafe_allow_html=True)
-if not market_open:
-    st.markdown(ui_status_strip("🌙 Market closed · Prices and recommendations are previous-scan research, not executable quotes. Recheck when NSE reopens."), unsafe_allow_html=True)
-else:
-    st.markdown(ui_status_strip("🟢 NSE session open · Signals are research only. Freshness and source checks still apply.", good=True), unsafe_allow_html=True)
+st.markdown(dark_hero(now_ist.strftime('%d %b %Y · %H:%M'), market_open),unsafe_allow_html=True)
+
+# Render three views only; never create additional top-level tabs with verbose tables.
+# Expensive scans run at most once each refresh interval per browser session.
+scan_interval = int(refresh_mins)*60
+force_all = st.session_state.pop('dark_force_all', False)
+force_shares = st.session_state.pop('dark_force_shares', False) or force_all
+force_options = st.session_state.pop('dark_force_options', False) or force_all
+force_audit = st.session_state.pop('dark_force_audit', False)
+refresh_due = market_open and auto_refresh
+if force_audit or (refresh_due and time.time()-st.session_state.get('dark_audit_epoch',0)>scan_interval):
+    with st.spinner('Reviewing open paper positions...'):
+        audit_and_reconcile_all_trades()
+    st.session_state['dark_audit_epoch'] = time.time()
+
+if force_shares or (refresh_due and time.time()-st.session_state.get('simple_share_epoch',0)>scan_interval):
+    with st.spinner('Analysing NSE shares and updating qualifying paper research records...'):
+        try:
+            ideas, _ = run_predictions()
+            st.session_state['simple_share_results'] = ideas
+            st.session_state['simple_share_epoch'] = time.time()
+            st.session_state['last_stock_scan'] = ist_now().strftime('%d %b · %H:%M IST')
+        except Exception as error:
+            logging.exception('Stock scan failed')
+            st.session_state['dark_stock_error'] = type(error).__name__
+
+if force_options or (refresh_due and time.time()-st.session_state.get('options_epoch',0)>scan_interval):
+    with st.spinner('Reviewing call and put contracts with NSE quote checks...'):
+        try:
+            st.session_state['option_candidates'] = scan_option_candidates()
+            st.session_state['options_epoch'] = time.time()
+            st.session_state['last_options_scan'] = ist_now().strftime('%d %b · %H:%M IST')
+        except Exception as error:
+            logging.exception('Options scan failed')
+            st.session_state['dark_options_error'] = type(error).__name__
+
+# Automatic paper option recording is separate from displaying a CONSIDER card.
+# A real fresh NSE quote, risk checks and budget are mandatory for a new record.
+try:
+    latest_option_idea = generate_daily_options_alpha()
+except Exception as error:
+    logging.exception('Option paper entry failed')
+    latest_option_idea = {}
+    st.session_state['dark_options_error'] = type(error).__name__
+
 cap = get_portfolio_capacity()
-counts = journal_counts()
 integrity = get_history_integrity()
-opt_all = load_options_journal_df()
-opt_open = (opt_all[opt_all["status"].apply(classify_outcome) == "ACTIVE"]
-            if not opt_all.empty else pd.DataFrame())
+share_results = ranked_shares(st.session_state.get('simple_share_results',pd.DataFrame()))
+option_results = option_sort(st.session_state.get('option_candidates',pd.DataFrame()))
+try:
+    journal_eq, journal_opt, journal_reviews = read_full_paper_ledger()
+except Exception as error:
+    logging.exception('Journal snapshot failed')
+    journal_eq = journal_opt = journal_reviews = pd.DataFrame()
+    st.error(f'Could not load complete paper history ({type(error).__name__}). Check Manage app → Logs; no missing rows are assumed closed.')
 
-st.markdown(ui_kpis([
-    ("Total research budget", "₹10,00,000", "Combined shares and options", "🏦", "lav"),
-    ("Available capacity", inr(cap["remaining_inr"]) if integrity["verified_count"] else "Unverified",
-     "New paper entries paused until history is restored" if not integrity["verified_count"] else
-     "Unallocated; new share entries paused (position limit)" if cap["fresh_slot_limit_reached"] else
-     "Unallocated paper capital", "✨", "teal"),
-    ("Shares allocated", inr(cap["equity_inr"]), f"{cap['open']} open share records • {cap['effective_limit']} new-position limit", "🏢", "peach"),
-    ("Options allocated", inr(cap["option_inr"]), f"{len(opt_open)} open CE / PE ideas", "🎯", "sky"),
+active_options = (journal_opt[journal_opt['status'].apply(classify_outcome)=='ACTIVE']
+                  if not journal_opt.empty else pd.DataFrame())
+used = cap['equity_inr'] + cap['option_inr']
+st.markdown(dark_stats([
+    ('Paper budget','₹10,00,000','Shared cap across stocks, CE and PE'),
+    ('Allocated',short_money(used,0),f"{cap['open']} open stocks · {len(active_options)} options"),
+    ('Unallocated',short_money(cap['remaining_inr'],0) if integrity['verified_count'] else 'Unverified',
+     'Not necessarily available to deploy'),
+    ('Learning data',str(len(journal_eq)),f"{len(journal_opt)} historical options; keep backups"),
 ]), unsafe_allow_html=True)
-if not integrity["verified_count"]:
-    st.error(f"🗂️ **Previous paper history is incomplete: {integrity['local']} of at least "
-             f"{integrity['minimum']} expected share records are available locally.** "
-             "The displayed share allocation may be incomplete. "
-             "New automatic paper entries are paused; scans and existing records remain accessible.")
-    st.warning(integrity["reason"] + " Open **History & learning → Recover previous data** or retry the cloud restore below. "
-               "Do not reset the database or model files.")
-    if supabase:
-        if st.button("☁️ Retry restoring earlier shares from Supabase", key="overview_retry_cloud_restore", type="primary"):
-            with st.spinner("Checking your original Supabase paper-history tables..."):
-                hydrate_duckdb_from_supabase()
-            st.rerun()
-    else:
-        st.info("Set SUPABASE_URL and SUPABASE_KEY in **Streamlit Cloud → App settings → Secrets** "
-                "for your **original** Supabase project, or upload a backed-up .duckdb file in History & learning.")
-if not cap["ok"]:
-    st.info("ℹ️ " + cap["reason"])
-if DB_SCHEMA_STATUS.get("unpriced_active_shares", 0) or DB_SCHEMA_STATUS.get("unpriced_active_options", 0):
-    st.warning("Some old active positions have missing allocations. Review History before trusting the capital available.")
+
+if not integrity['verified_count']:
+    st.markdown(dark_note('History integrity is not verified. New paper entries are paused until older records are restored. The figures may be incomplete.',True),unsafe_allow_html=True)
+elif cap['fresh_slot_limit_reached']:
+    st.markdown(dark_note(f"New share paper entries paused: {cap['open']} open positions versus {MAX_OPEN_POSITIONS} available slots. Existing history is preserved; research still runs."),unsafe_allow_html=True)
+if st.session_state.get('price_feed_problem'):
+    st.warning('⚠️ Price-feed outage: one or more paper positions could not be reconciled. Their capital stays reserved; no assumed sale was recorded.')
+if st.session_state.get('intraday_feed_problem'):
+    affected = ', '.join(st.session_state.get('intraday_feed_missing_tickers',[])[:5])
+    st.warning(f'⚠️ Minute-price coverage is incomplete for open paper positions ({affected or "some shares"}). '
+               'A temporary stop/target touch may not be detectable; affected positions remain unverified until quotes recover.')
 if not ANNOUNCEMENTS_AVAILABLE:
-    st.caption("ℹ️ Corporate filings module is unavailable; news-based checks may be incomplete.")
+    st.caption('⚠️ Corporate filing/news checker unavailable. Technical recommendations are incomplete without those checks.')
 
-page_home, page_shares, page_options, page_history = st.tabs([
-    "✨ Overview", "🏢 Stocks", "🎯 Calls & puts", "📚 History & learning"
-])
+page_preds, page_learning, page_ledger = st.tabs(['✦ Predictions','🧠 AI Learning','📒 Trade Ledger'])
 
-with page_home:
-    st.markdown(ui_intro("Your portfolio at a glance", "Paper portfolio • not actual broker holdings"), unsafe_allow_html=True)
-    learning = summarise_learning_progress()
-    share_snapshot = st.session_state.get("simple_share_results", pd.DataFrame())
-    option_snapshot = st.session_state.get("option_candidates", pd.DataFrame())
-    top_shares = select_top_share_ideas(share_snapshot, 3)
-    top_options = select_top_option_ideas(option_snapshot, 2)
+with page_preds:
+    st.markdown(dark_header('Predictions','One simple view · Stocks + Calls + Puts'),unsafe_allow_html=True)
+    a,b,c = st.columns([1,1,1])
+    with a:
+        if st.button('🔍 Scan stocks',key='dark_scan_stocks',use_container_width=True):
+            st.session_state['dark_force_shares'] = True
+            st.rerun()
+    with b:
+        if st.button('🎯 Scan CE / PE',key='dark_scan_options',use_container_width=True):
+            st.session_state['dark_force_options'] = True
+            st.rerun()
+    with c:
+        if st.button('↻ Refresh everything',type='primary',key='dark_scan_all',use_container_width=True):
+            st.session_state['dark_force_all'] = True
+            st.session_state['dark_force_audit'] = True
+            st.rerun()
     if not market_open:
-        st.caption("🌙 NSE closed: the ideas below are **previous-scan research**, not fresh executable quotes. "
-                   "Revalidate prices and news after the market opens.")
-    if learning["read_error"]:
-        st.error("⚠️ " + learning["read_error"])
-    elif learning["completed"] == 0:
-        st.caption("🧠 No local completed share outcomes are available to verify these displayed scores. "
-                   "The model's estimated percentages should not be treated as proven win probabilities.")
-
-    p1, p2 = st.columns([1.2, 1])
+        st.markdown(dark_note('NSE is closed: research prices may be old, and real buyable option quotes cannot be confirmed. No new automatic entries outside market hours.'),unsafe_allow_html=True)
+    if st.session_state.get('dark_stock_error'):
+        st.warning('Last share scan failed: '+str(st.session_state['dark_stock_error']))
+    if st.session_state.get('dark_options_error'):
+        st.warning('Last options scan failed: '+str(st.session_state['dark_options_error']))
+    p1,p2,p3 = st.columns([1.15,1.1,1])
     with p1:
-        legacy_note = (f"<p><b>{cap['legacy_open_excess']} open record(s) above the current limit</b> are included in the active count. "
-                       "These are existing records kept intact; the new share-position limit is 10. Their origin cannot be confirmed from the count alone.</p>") if cap.get("legacy_open_excess", 0) else ""
-        st.markdown("<div class='panel'><h3>🌱 Where things stand</h3>"
-                    f"<p><b>{cap['open']} share records</b> and <b>{len(opt_open)} options</b> are currently being followed. "
-                    f"Fresh share idea slots left: <b>{cap.get('fresh_slots_left', 0)}</b> out of <b>{cap.get('effective_limit', MAX_OPEN_POSITIONS)}</b>.</p>"
-                    f"<p>Estimated stop-risk on shares: <b>{inr(cap['risk_inr'])}</b> out of {inr(MAX_OPEN_RISK_INR)} planned. Stop exits are not guaranteed.</p>"
-                    + legacy_note +
-                    "</div>", unsafe_allow_html=True)
+        product_filter = st.segmented_control('Market', ['All','Stocks','Calls (CE)','Puts (PE)'], default='All', key='dark_product_filter')
     with p2:
-        wr = "Not enough finished results yet" if learning["win_rate"] is None else f"{learning['win_rate']:.1f}% win rate on decided outcomes"
-        progress_note = (f"<p>Recorded outcomes: <b>{learning['completed']:,}</b>. "
-                         f"Minimum retrain threshold: <b>{MIN_SETTLED_TO_RETRAIN}</b> eligible results. "
-                         "Completed outcomes are not automatically valid training examples.</p>")
-        st.markdown("<div class='panel learning'><h3>🧠 AI learning snapshot</h3>"
-                    + progress_note
-                    + f"<p>{wr}</p>"
-                    f"<p>Last retrain attempt: <b>{esc(learning['latest_retrain'])}</b><br>"
-                    f"Last promoted model: <b>{esc(learning['last_promotion'])}</b></p></div>",
-                    unsafe_allow_html=True)
+        decision_filter = st.selectbox('Research signal', ['CONSIDER','ALL','WATCH','AVOID'], key='dark_decision_filter')
+    with p3:
+        horizon = st.selectbox('Stock timing study', [3,5,7], index=1, format_func=lambda x:f'{x} trading sessions', key='dark_horizon')
+    keyword = st.text_input('Find a share or contract',placeholder='Search symbol or sector…', key='dark_prediction_search')
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(ui_intro("Top stock ideas right now", "Best 3 from the last scan"), unsafe_allow_html=True)
-        if isinstance(top_shares, pd.DataFrame) and not top_shares.empty:
-            for _, r in top_shares.iterrows():
-                reason = str(r.get("Rejection Reason") or "Met model and research checks")
-                st.markdown(ui_card(str(r["Ticker"]), str(r["Decision"]), str(r["Sector"]), [
-                    ("Current share price", inr(r["Price (₹)"],2)),
-                    ("Expected value", f"{_num(r.get('Expected value')):+.2f}%"),
-                    ("Model score", f"{_num(r.get('Adjusted Score')):.1f}")], reason), unsafe_allow_html=True)
-        else:
-            st.info("Run the stock scan to populate the top share ideas.")
-    with c2:
-        st.markdown(ui_intro("Best call & put setups", "Top CE and PE reviews"), unsafe_allow_html=True)
-        if isinstance(top_options, pd.DataFrame) and not top_options.empty:
-            for _, r in top_options.iterrows():
-                name = f"{r['Stock']} · {r['Type']} {'↗' if r['Type']=='CE' else '↘'}"
-                st.markdown(ui_card(name, str(r["Decision"]), f"{r['Expiry']} · strike {inr(r['Strike (₹)'],2)}", [
-                    ("One-lot premium", inr(r["Cost (₹)"])),
-                    ("Break-even", inr(r["Breakeven at expiry (₹)"],2)),
-                    ("Max risk", inr(r["Maximum premium loss (₹)"]))], str(r.get("Why") or "Contract reviewed")),
-                    unsafe_allow_html=True)
-        else:
-            if not market_open:
-                st.info("No currently validated CE / PE contracts. NSE is closed, so real bid/ask quotes cannot be refreshed. Review again during market hours.")
-            else:
-                st.info("No validated CE / PE contract from the latest scan. Open Calls & puts to retry; no trade is required.")
+    stock_view = (share_results.copy() if not share_results.empty else pd.DataFrame())
+    if not stock_view.empty and product_filter not in ('All','Stocks'):
+        stock_view = stock_view.iloc[0:0]
+    if not stock_view.empty and decision_filter!='ALL':
+        stock_view = stock_view[stock_view['Decision']==decision_filter]
+    if not stock_view.empty and keyword.strip():
+        term = re.escape(keyword.strip())
+        stock_view = stock_view[stock_view['Ticker'].astype(str).str.contains(term,case=False,na=False) |
+                                stock_view['Sector'].astype(str).str.contains(term,case=False,na=False)]
 
-    d1, d2 = st.columns([1.2, 1])
-    with d1:
-        st.markdown("<div class='panel guide'><h3>💡 Simple decision guide</h3>"
-                    "<p>🟢 <b>CONSIDER</b> — research filters passed, not a buy instruction.</p>"
-                    "<p>🟡 <b>WATCH</b> — data is uncertain or the setup is incomplete.</p>"
-                    "<p>🔴 <b>AVOID</b> — a major check failed or risk is too high.</p>"
-                    "<p>CE = call if bullish. PE = put if bearish. A long option can lose its full premium.</p></div>",
-                    unsafe_allow_html=True)
-    with d2:
-        closed_preview = learning["recent_finished"]
-        if learning["read_error"]:
-            st.warning("Recent finished ideas could not be loaded. Check the History tab and application logs.")
-        elif closed_preview.empty:
-            st.markdown("<div class='panel recent'><h3>📚 Recent finished ideas</h3><p>No recorded finished share ideas are available here yet.</p></div>", unsafe_allow_html=True)
-        else:
-            lines = []
-            for _, rr in closed_preview.iterrows():
-                lines.append(f"<p><b>{esc(rr['ticker'])}</b> · {esc(rr['status'])} · {(_num(rr['pnl_pct'])):+.2f}%</p>")
-            st.markdown("<div class='panel recent'><h3>📚 Recent finished ideas</h3>" + "".join(lines) + "</div>", unsafe_allow_html=True)
+    opt_view = option_results.copy() if not option_results.empty else pd.DataFrame()
+    if not opt_view.empty and product_filter=='Stocks':
+        opt_view = opt_view.iloc[0:0]
+    if not opt_view.empty and product_filter=='Calls (CE)':
+        opt_view = opt_view[opt_view['Type']=='CE']
+    if not opt_view.empty and product_filter=='Puts (PE)':
+        opt_view = opt_view[opt_view['Type']=='PE']
+    if not opt_view.empty and decision_filter!='ALL':
+        opt_view = opt_view[opt_view['Decision']==decision_filter]
+    if not opt_view.empty and keyword.strip():
+        opt_view = opt_view[opt_view['Stock'].astype(str).str.contains(re.escape(keyword.strip()),case=False,na=False)]
 
-    action1, action2 = st.columns(2)
-    with action1:
-        if st.button("🔄 Review open positions now", use_container_width=True, key="review_positions_now"):
-            with st.spinner("Refreshing open share and option records..."):
-                audit_and_reconcile_all_trades()
-            st.success("Open paper positions reviewed.")
-            st.rerun()
-    with action2:
-        if st.button("📥 Refresh both idea lists", use_container_width=True, key="refresh_both_lists"):
-            with st.spinner("Refreshing stock and option research lists..."):
-                audit_and_reconcile_all_trades()
-                st.session_state["simple_share_results"], _ = run_predictions()
-                st.session_state["simple_share_epoch"] = time.time()
-                st.session_state["option_candidates"] = scan_option_candidates()
-                st.session_state["options_epoch"] = time.time()
-                st.session_state["last_update_ist"] = ist_now().strftime('%d %b %H:%M IST')
-            st.success("Stock and option research lists refreshed.")
-            st.rerun()
+    st.caption(f"{len(stock_view)} shares · {len(opt_view)} options matching filters · "
+               f"Stocks {st.session_state.get('last_stock_scan','not scanned')} · "
+               f"Options {st.session_state.get('last_options_scan','not scanned')}")
+    shown_stocks = stock_view.head(5) if not stock_view.empty else pd.DataFrame()
+    for _, r in shown_stocks.iterrows():
+        ticker = str(r['Ticker'])
+        entry,target,stop = float(r['Price (₹)']),float(r['Target (₹)']),float(r['Stop Loss (₹)'])
+        estimate = stock_timeline(ticker, entry,target,stop,horizon)
+        subtitle = (f"{estimate.target_hits}/{estimate.trials} historical windows hit target first"
+                    if estimate.trials else 'Not enough validated historical windows')
+        action = ('Qualifies for research, but new paper entries are paused by portfolio constraints.'
+                  if r['Decision']=='CONSIDER' and not cap['ok'] else str(r.get('Rejection Reason') or 'Research filters passed'))
+        st.markdown(dark_card(ticker,str(r['Decision']),str(r['Sector']),[
+            ('Entry / reference',short_money(entry)),
+            ('Target · estimated',short_money(target)),
+            ('Stop-loss · risk',short_money(stop)),
+            ('Return to target',f"{(target/entry-1)*100:+.1f}%")],
+            action,
+            f"Target timeline: {estimate.label}", subtitle),unsafe_allow_html=True)
+        with st.expander(f'Why {ticker}? · timeline and risk details',expanded=False):
+            st.write(f"Current study: **{horizon} trading sessions**. {estimate.note}")
+            st.write(f"Historical target-first frequency: **{f'{estimate.target_rate_pct:.1f}%' if estimate.target_rate_pct is not None else 'Unavailable'}**. "
+                     'This is not a validated AI win probability.')
+            st.write('Model score:',f"{_num(r.get('Adjusted Score')):.1f}",
+                     '· Expected value after modelled costs:',f"{_num(r.get('Expected value')):+.2f}%")
+            st.caption('Entry and stop prices may gap past their levels; slippage and fees affect realised outcomes. The app currently exits stock ideas after 7 CALENDAR days, which may be shorter than a 7-session study.')
+    if product_filter in ('All','Stocks') and stock_view.empty:
+        st.info('No stocks match this filter. Run the stock scan to refresh research; a missing idea is not a buy signal.')
+    if len(stock_view)>len(shown_stocks):
+        st.caption(f'Showing the first {len(shown_stocks)} ranked shares of {len(stock_view)}. Narrow your search or open the table below.')
 
-    with st.expander(f"📋 See {cap['open']} active share positions"):
-        open_eq = get_active_positions_df()
-        if open_eq.empty:
-            st.caption("No active share ideas in this local database.")
-        else:
-            columns = ["ticker", "entry_price", "latest_price", "target_price", "stop_loss", "capital_allocated", "pnl_pct", "status"]
-            st.dataframe(open_eq[columns].rename(columns={"ticker":"Share","entry_price":"Entry ₹",
-                "latest_price":"Latest ₹","target_price":"Target ₹","stop_loss":"Stop ₹",
-                "capital_allocated":"Allocated ₹","pnl_pct":"Paper P/L %","status":"Status"}),
-                hide_index=True, use_container_width=True)
-    with st.expander(f"📜 See {len(opt_open)} active call / put positions"):
-        if opt_open.empty:
-            st.caption("No active option ideas in this local database.")
-        else:
-            st.dataframe(opt_open[["option_contract","entry_premium","current_option_price","total_capital","pnl_pct","status"]]
-                .rename(columns={"option_contract":"Contract","entry_premium":"Entry premium ₹",
-                "current_option_price":"Latest premium ₹","total_capital":"Premium committed ₹",
-                "pnl_pct":"Paper P/L %","status":"Status"}),hide_index=True,use_container_width=True)
-    if counts["total"] == 0 and len(opt_all) == 0:
-        st.warning("📭 No previous trade history is currently available on this deployment. "
-                   "Open **History & learning → Recover previous data** to reconnect Supabase or upload your old DuckDB backup.")
-    elif not supabase:
-        st.info("📚 Your existing local history is visible, but it isn't backed up to Supabase here. "
-                "Download an external backup from **History & learning**.")
+    shown_options = opt_view.head(4) if not opt_view.empty else pd.DataFrame()
+    for _, r in shown_options.iterrows():
+        kind = str(r['Type'])
+        premium = float(r['Buy premium (₹)'])
+        stop = premium * OPTION_STOP_MULT
+        target = premium * OPTION_TARGET_MULT
+        st.markdown(dark_card(f"{r['Stock']} · {kind}",str(r['Decision']),
+            f"Strike {short_money(r['Strike (₹)'])} · expires {r['Expiry']}",[
+            ('Entry premium · ask',short_money(premium)),
+            ('Target premium · rule',short_money(target)),
+            ('Stop premium · rule',short_money(stop)),
+            ('Premium / lot at risk',short_money(r['Cost (₹)'],0))],
+            str(r['Why']),
+            f"{r['Days left']} calendar days to expiry",
+            'No validated day-to-target forecast for this option premium.'),unsafe_allow_html=True)
+        with st.expander(f'Contract details · {r["Stock"]} {kind}',expanded=False):
+            st.write(f"Bid {short_money(r['Sell premium (₹)'])} · Ask {short_money(premium)} · "
+                     f"Lot {int(r['Lot'])} · Spread {_num(r['Spread (%)']):.1f}% · "
+                     f"Open interest {int(r['Open interest']):,}")
+            st.write(f"Spot break-even at expiry: **{short_money(r['Breakeven at expiry (₹)'])}**. "
+                     f"Maximum long-option premium risk: **{short_money(r['Maximum premium loss (₹)'])}**.")
+            st.caption('Premium target/stop are research exit guidelines, not guaranteed executions. Long stock options may have physical settlement obligations; review broker and expiry rules.')
+    if product_filter in ('All','Calls (CE)','Puts (PE)') and opt_view.empty:
+        st.info('No verified CE/PE contracts for the current filters. The app will not present a theoretical option premium as a tradable quote.')
 
-with page_shares:
-    st.markdown(ui_intro("Stock ideas", "Whole eligible NSE EQ universe • rotating scans"), unsafe_allow_html=True)
-    left, right = st.columns([2, 1])
-    with left:
-        st.caption("No penny-stock-only filter. All prices are eligible for research if basic liquidity and data checks pass.")
-    with right:
-        rescan_shares = st.button("🔄 Analyse stocks", type="primary", key="refresh_shares", use_container_width=True)
-    if rescan_shares or "simple_share_results" not in st.session_state or (auto_refresh and time.time()-st.session_state.get("simple_share_epoch",0)>900):
-        with st.spinner("Reading market prices and running the trained stock model..."):
-            audit_and_reconcile_all_trades()
-            share_ideas, cleared = run_predictions()
-            st.session_state["simple_share_results"] = share_ideas
-            st.session_state["simple_share_epoch"] = time.time()
-            st.session_state["last_update_ist"] = ist_now().strftime('%d %b %H:%M IST')
-    shares = st.session_state.get("simple_share_results", pd.DataFrame())
-    scan = st.session_state.get("scan_stats", {})
-    if scan.get("error"):
-        st.error(scan["error"])
-    if scan.get("source"):
-        st.caption(f"🛰️ NSE list: {scan.get('listed',0):,} shares · {scan['source']}")
-    if scan.get("partial"):
-        st.warning("Only part of the market was scanned this time; results are incomplete.")
-    if isinstance(shares, pd.DataFrame) and not shares.empty:
-        shares = shares.copy()
-        st.success(f"Showing the latest scan across the eligible NSE share universe. Fresh share idea slots left: {cap.get('fresh_slots_left', 0)} / {cap.get('effective_limit', MAX_OPEN_POSITIONS)}")
-        shares["Decision"] = shares.apply(lambda r: "CONSIDER" if r["Qualified"]
-            else "AVOID" if "Bad news" in str(r["Rejection Reason"]) or "risk" in str(r["Rejection Reason"]).lower()
-            else "WATCH", axis=1)
-        a,b = st.columns([1.3,2])
-        with a:
-            choice = st.segmented_control("Signal", ["CONSIDER","WATCH","AVOID","ALL"],default="CONSIDER",key="share_decision_filter")
-        with b:
-            needle = st.text_input("Find a stock", placeholder="Search by symbol or sector...", key="stock_search")
-        view = shares if choice == "ALL" else shares[shares["Decision"] == choice]
-        if needle.strip():
-            view = view[view["Ticker"].astype(str).str.contains(re.escape(needle.strip()),case=False,na=False) |
-                        view["Sector"].astype(str).str.contains(re.escape(needle.strip()),case=False,na=False)]
-        st.caption(f"{len(view)} matching ideas · last scan {st.session_state.get('last_update_ist','not yet')} ")
-        if view.empty:
-            st.info("No matching candidates. A blank result is safer than an invented recommendation.")
+    with st.expander('🩺 Scan quality / full candidate list'):
+        if not share_results.empty:
+            st.caption(f"Share universe: {st.session_state.get('scan_stats',{}).get('listed','?')} NSE symbols. "
+                       'Only some have usable data and pass the shortlist; a scan may be partial.')
+            cols = ['Ticker','Sector','Decision','Price (₹)','Target (₹)','Stop Loss (₹)','Expected value','Rejection Reason']
+            st.dataframe(share_results[[x for x in cols if x in share_results.columns]],hide_index=True,use_container_width=True)
         else:
-            for _, r in view.head(6).iterrows():
-                st.markdown(ui_card(str(r["Ticker"]), str(r["Decision"]), str(r["Sector"]), [
-                    ("Current share price", inr(r["Price (₹)"],2)),
-                    ("Profit target (estimate)", inr(r["Target (₹)"],2)),
-                    ("Risk stop (not guaranteed)", inr(r["Stop Loss (₹)"],2))],
-                    str(r["Rejection Reason"] if str(r["Rejection Reason"]).strip() else "Met model and research checks")),
-                    unsafe_allow_html=True)
-            if len(view) > 6:
-                st.caption(f"Showing 6 of {len(view)} — use Search or the table below for more.")
-        with st.expander("🧾 See all evaluated stocks and estimated allocations"):
-            display_cols = ["Ticker","Sector","Decision","Price (₹)","Expected value","Adjusted Score",
-                            "Target (₹)","Stop Loss (₹)","Total Cost (₹)","Rejection Reason"]
-            st.dataframe(view[display_cols].rename(columns={"Ticker":"Stock","Expected value":"Modelled EV %",
-                "Adjusted Score":"Model score","Rejection Reason":"Reason"}), hide_index=True,use_container_width=True)
+            st.caption('No share candidate table saved in this session.')
+        health = st.session_state.get('option_scan_health') or {}
+        st.caption(option_http_note(health) or st.session_state.get('option_scan_note','No option scan diagnostics yet.'))
+        if not option_results.empty:
+            cols = ['Stock','Type','Decision','Expiry','Strike (₹)','Buy premium (₹)','Cost (₹)','Why']
+            st.dataframe(option_results[[x for x in cols if x in option_results.columns]],hide_index=True,use_container_width=True)
+        if not ANNOUNCEMENTS_AVAILABLE:
+            st.warning('NSE corporate filings module is unavailable. News checks are incomplete; treat technical CONSIDER scores cautiously.')
+
+with page_learning:
+    st.markdown(dark_header('What the AI can learn','Individual stock results · verified observations, not invented explanations'),unsafe_allow_html=True)
+    if journal_eq.empty:
+        st.info('No stock training history is available locally. Check the Ledger recovery tools.')
     else:
-        st.info("No verified stock candidates are available right now. Check price feeds and whether the original model file is present.")
-    st.caption("Model score, price target and expected value are uncertain estimates, not guaranteed returns.")
-
-with page_options:
-    st.markdown(ui_intro("Calls and puts", "CE: bullish • PE: bearish"), unsafe_allow_html=True)
-    st.caption("Only long stock options are analysed. A CONSIDER label requires an available NSE contract quote and current lot size.")
-    rescan_options = st.button("🔄 Analyse options", type="primary", key="refresh_options")
-    if rescan_options or "option_candidates" not in st.session_state or (auto_refresh and time.time()-st.session_state.get("options_epoch",0)>900):
-        with st.spinner("Reviewing NSE contract quotes and current expiry details..."):
-            st.session_state["option_candidates"] = scan_option_candidates()
-            st.session_state["options_epoch"] = time.time()
-            st.session_state["last_update_ist"] = ist_now().strftime('%d %b %H:%M IST')
-    options = st.session_state.get("option_candidates", pd.DataFrame())
-    st.caption(st.session_state.get("option_scan_note", "Option scan not run yet."))
-    st.caption("A CE benefits from bullish movement; a PE benefits from bearish movement. The app prefers contracts with live quotes, tighter spreads and usable open interest.")
-    if isinstance(options, pd.DataFrame) and not options.empty:
-        a,b = st.columns([1.4,1])
-        with a:
-            opt_filter = st.segmented_control("Status", ["CONSIDER","WATCH","AVOID","ALL"],default="CONSIDER",key="option_decision_filter")
-        with b:
-            kind_filter = st.segmented_control("Direction", ["BOTH","CE","PE"],default="BOTH",key="option_kind_filter")
-        filtered = options if opt_filter == "ALL" else options[options["Decision"] == opt_filter]
-        filtered = filtered if kind_filter == "BOTH" else filtered[filtered["Type"] == kind_filter]
-        st.caption(f"{len(filtered)} matching live contract reviews")
-        if filtered.empty:
-            st.info("Nothing qualifies under these filters. You don't have to take a trade.")
-        else:
-            for _, r in filtered.head(5).iterrows():
-                name = f"{r['Stock']} · {r['Type']} {'↗' if r['Type']=='CE' else '↘'}"
-                st.markdown(ui_card(name, str(r["Decision"]), f"{r['Expiry']} · strike {inr(r['Strike (₹)'],2)}", [
-                    ("One-lot premium", inr(r["Cost (₹)"])),
-                    ("Break-even at expiry", inr(r["Breakeven at expiry (₹)"],2)),
-                    ("Max premium at risk", inr(r["Maximum premium loss (₹)"]))],
-                    str(r["Why"])), unsafe_allow_html=True)
-                with st.expander(f"🔍 {r['Stock']} {r['Type']} · contract details"):
-                    st.caption(f"Bid ₹{r['Sell premium (₹)']:,.2f} · Ask ₹{r['Buy premium (₹)']:,.2f} · "
-                        f"Lot {int(r['Lot'])} · Expiry in {r['Days left']} days · Spread {r['Spread (%)']:.1f}% · "
-                        f"OI {r['Open interest']:,} · IV {r['IV (%)']:.1f}%")
-            if len(filtered)>5:
-                st.caption(f"Showing 5 of {len(filtered)}; see the full table below.")
-        with st.expander("📋 See all call/put reviews"):
-            cols = ["Stock","Type","Decision","Expiry","Strike (₹)","Buy premium (₹)",
-                    "Lot","Cost (₹)","Breakeven at expiry (₹)","Maximum premium loss (₹)","Why"]
-            st.dataframe(filtered[cols], hide_index=True,use_container_width=True)
-    else:
-        st.info("No live NSE quotes validated during this check. The app will not pretend theoretical option prices are buyable quotes.")
-    coverage = st.session_state.get("fno_coverage")
-    if isinstance(coverage, dict):
-        st.caption(f"Exchange universe health: {coverage.get('matched', 0)} F&O underlyings matched from "
-                   f"{coverage.get('lot_rows', 0)} lot-file entries. This is a sanity check, not proof of a complete scan.")
-        if not coverage.get("plausible"):
-            st.warning("F&O universe coverage is incomplete. Try a fresh exchange download during market hours; "
-                       "do not treat this as 1-of-1 total coverage.")
-    if not opt_all.empty:
-        with st.expander(f"📜 See {len(opt_all)} saved historical option paper ideas (not live buy quotes)"):
-            paper_history = opt_all.sort_values("date_key", ascending=False).head(10)
-            cols = ["date_key", "option_contract", "status", "entry_premium", "pnl_pct"]
-            st.dataframe(paper_history[[c for c in cols if c in paper_history.columns]].rename(columns={
-                "date_key": "Date", "option_contract": "Contract", "status": "Paper status",
-                "entry_premium": "Recorded premium ₹", "pnl_pct": "Paper P/L %"}),
-                hide_index=True, use_container_width=True)
-            st.caption("Historical positions do not constitute fresh CE or PE recommendations.")
-    idea = generate_daily_options_alpha()
-    if idea:
-        st.success(f"📝 Paper idea logged: {idea['option_contract']} · Premium budget {inr(idea['total_capital'])}")
-    st.caption("⚠️ Long options can lose their full premium. Stock-option exercise can involve physical settlement; do not rely on a stop order to prevent this.")
-
-with page_history:
-    st.markdown(ui_intro("History, learning and recovery", "All previous records • no graphs"), unsafe_allow_html=True)
-    if not integrity["verified_count"]:
-        st.warning(f"History check: {integrity['local']} of {integrity['minimum']} previously expected share records are present. "
-                   "Restore the original history before relying on paper-profit totals or retraining.")
-    try:
-        local_counts = count_history(DB_PATH)
-    except Exception as e:
-        st.error(f"Could not count the historical records: {type(e).__name__}")
-        local_counts = {"trade_journal":0,"daily_options_journal":0,"option_watchlist":0}
-    st.markdown(ui_kpis([
-        ("Saved stock records", f"{local_counts['trade_journal']:,}", "Includes open and older records", "📚", "lav"),
-        ("Saved option ideas", f"{local_counts['daily_options_journal']:,}", "CE and PE paper history", "📜", "peach"),
-        ("Option checks stored", f"{local_counts['option_watchlist']:,}", "Includes rejected candidates", "🔎", "sky"),
-        ("Cloud history", "Configured" if supabase else "Not linked", "Cloud credentials status", "☁️", "teal" if supabase else ""),
-    ]), unsafe_allow_html=True)
-    hx1, hx2 = st.columns(2)
-    with hx1:
-        if st.button("🔄 Reconcile all open trades", key="history_reconcile_open", use_container_width=True):
-            with st.spinner("Reviewing all active paper positions..."):
-                audit_and_reconcile_all_trades()
-            st.success("Open positions reconciled.")
-            st.rerun()
-    with hx2:
-        st.caption("Use the recovery tools below if earlier records are missing after deployment or restart.")
-    with st.expander("🔁 Recover previous data", expanded=(sum(local_counts.values())==0)):
-        st.markdown("**Two safe ways to bring back older records**")
-        st.caption("(1) Retry Supabase if this deployment has your existing SUPABASE_URL and SUPABASE_KEY secrets. "
-                   "(2) Upload an earlier market_data.duckdb or backed-up .duckdb file from your computer. "
-                   "Neither method deliberately deletes current records.")
-        if supabase:
-            if st.button("☁️ Restore history from Supabase", key="retry_cloud_history", use_container_width=True):
-                with st.spinner("Checking remote historical paper records..."):
-                    hydrate_duckdb_from_supabase()
-                st.rerun()
-            hi = st.session_state.get("hydrate_info", {})
-            if hi:
-                st.caption(f"Last cloud restore: {hi.get('remote',0):,} stock rows and "
-                           f"{hi.get('remote_options',0):,} option rows found; "
-                           f"{hi.get('restored',0):,} records restored; "
-                           f"{hi.get('bad_rows',0):,} skipped.")
-            with st.expander("📤 Save missing local history to your Supabase", expanded=False):
-                st.caption("Uploads records that are absent from legacy predictions/options_journal tables. Existing remote records are never overwritten. "
-                           "The option research watchlist is not synced by this feature. Verify cloud totals after syncing.")
-                if st.button("Sync up to 200 historical rows", key="sync_to_supabase"):
-                    with st.spinner("Checking existing remote rows and uploading only missing records..."):
-                        stats = sync_local_history_to_supabase(200, st.session_state.get("history_sync_offset",0))
-                    st.session_state["history_sync_offset"] = stats["next_offset"] if stats["more_to_check"] else 0
-                    if stats["failed"]:
-                        st.error(f"Cloud sync incomplete: {stats['failed']} failed. " + "; ".join(stats["errors"][:2]))
-                    else:
-                        st.success(f"New cloud rows: {stats['shares_inserted']} shares, {stats['options_inserted']} options. "
-                                   f"Already present: {stats['already_remote']}.")
-                    if stats["more_to_check"]:
-                        st.info(f"Processed {stats['next_offset']:,} of {stats['total_rows']:,} rows. Click sync again to continue.")
-            if hi and hi.get("remote", 0) + hi.get("remote_options", 0) == 0 and sum(local_counts.values()) == 0:
-                st.warning("The configured cloud tables returned no historical records. Verify that these secrets point to your **original** Supabase project.")
-        else:
-            st.warning("Supabase is not connected here. Your Cloud deployment cannot automatically restore older records from it. "
-                       "Set SUPABASE_URL and SUPABASE_KEY in Streamlit Secrets if you already used Supabase.")
-        upload = st.file_uploader("Or choose your old DuckDB file", type=["duckdb"],
-                                  help="Select the saved market_data.duckdb from your old project or backups folder.")
-        if upload is not None:
-            st.caption(f"Selected {upload.name} · {upload.size / 1024 / 1024:.1f} MB")
-            if upload.size > 50 * 1024 * 1024:
-                st.error("For safety this upload is limited to 50 MB. Use Supabase or a managed import for a larger file.")
-            elif st.button("📥 Merge my old history", key="merge_old_history", type="primary"):
-                with st.spinner("Backing up current records and merging new history IDs..."):
-                    try:
-                        with tempfile.TemporaryDirectory(prefix="nse_history_restore_") as td:
-                            old_path = Path(td) / "uploaded_old_history.duckdb"
-                            old_path.write_bytes(upload.getvalue())
-                            with DB_LOCK:
-                                recovery = merge_history_database(old_path, DB_PATH, ROOT_DIR / "backups")
-                        st.session_state["history_import_result"] = recovery
-                        st.session_state["history_sync_offset"] = 0
-                        st.rerun()
-                    except Exception as e:
-                        logging.exception("Failed to merge uploaded historical database")
-                        st.error(f"Import stopped safely: {type(e).__name__}: {str(e)[:250]}")
-        if st.session_state.get("history_import_result"):
-            recovered = st.session_state["history_import_result"]
-            st.success("Merge completed. New stock rows: "
-                       f"{recovered['added'].get('trade_journal',0)}, option rows: "
-                       f"{recovered['added'].get('daily_options_journal',0)}, "
-                       f"research reviews: {recovered['added'].get('option_watchlist',0)}. Existing rows were kept.")
-            st.warning("This import is local to the running server. Download a backup now. To survive Cloud restarts, "
-                       "you need a persistent remote database and a verified sync strategy.")
-        if st.button("💾 Prepare downloadable DuckDB backup", key="prepare_history_backup"):
-            with DB_LOCK:
-                snap = snapshot_database(DB_PATH, ROOT_DIR / "backups", "downloadable_history")
-                st.session_state["history_backup_bytes"] = snap.read_bytes()
-                st.session_state["history_backup_date"] = ist_now().strftime('%Y%m%d_%H%M')
-        if st.session_state.get("history_backup_bytes"):
-            st.download_button("⬇️ Download my full paper-history database",st.session_state["history_backup_bytes"],
-                file_name=f"NSE_history_{st.session_state['history_backup_date']}.duckdb",
-                mime="application/octet-stream",use_container_width=True)
-    # The old screen showed only the last 100 closed 'known' outcomes, hiding OPEN/UNKNOWN.
-    # This ledger displays ALL local history including legacy unknown statuses.
-    with DB_LOCK:
-        dbcon = duckdb.connect(DB_PATH, read_only=True)
+        totals = stock_history_summary(journal_eq)
+        state_raw = get_meta('retrain_state','{}')
         try:
-            all_shares = dbcon.execute("SELECT trade_id,date_str,ticker,status,entry_price,pnl_pct,capital_allocated,features_json FROM trade_journal ORDER BY date_str DESC NULLS LAST").df()
-            all_options = dbcon.execute("SELECT date_key,option_contract,status,entry_premium,total_capital,pnl_pct FROM daily_options_journal ORDER BY date_key DESC NULLS LAST").df()
-            all_reviews = dbcon.execute("SELECT date_key,symbol,side,decision,reason,checked_at FROM option_watchlist ORDER BY checked_at DESC NULLS LAST").df()
-        finally:
-            dbcon.close()
-    st.markdown(ui_intro("Every recorded stock idea", "Open, finished and legacy records"), unsafe_allow_html=True)
-    if all_shares.empty:
-        st.info("No stock records in the current database yet. Use Recover previous data above.")
-    else:
-        f1, f2 = st.columns([1, 2])
-        with f1:
-            states = sorted(all_shares["status"].fillna("UNKNOWN").astype(str).unique())
-            state_filter = st.selectbox("Filter by outcome", ["All outcomes"] + states, key="history_state_filter")
-        with f2:
-            history_search = st.text_input("Find an earlier stock", placeholder="e.g. SBIN or RELIANCE", key="history_search")
-        history_view = all_shares
-        if state_filter != "All outcomes":
-            history_view = history_view[history_view["status"].fillna("UNKNOWN").astype(str)==state_filter]
-        if history_search.strip():
-            history_view = history_view[history_view["ticker"].astype(str).str.contains(re.escape(history_search.strip()),case=False,na=False)]
-        st.caption(f"Showing {len(history_view):,} of {len(all_shares):,} stored records. UNKNOWN records are still preserved, but cannot be treated as confirmed wins/losses.")
-        st.dataframe(history_view[["date_str","ticker","status","entry_price","capital_allocated","pnl_pct"]]
-            .rename(columns={"date_str":"Date","ticker":"Share","status":"Result","entry_price":"Entry ₹",
-                             "capital_allocated":"Capital ₹","pnl_pct":"Paper P/L %"}),
-            hide_index=True,use_container_width=True)
-        st.download_button("⬇️ Export visible share history (CSV)",history_view.to_csv(index=False).encode(),
-            file_name="share_history.csv",mime="text/csv")
-        labelled = all_shares[all_shares["status"].apply(classify_outcome).isin(["WIN","LOSS","BE","EXPIRED"])].copy()
-        st.caption(f"🧠 {len(labelled):,} recorded completed outcomes are available for evaluation; "
-                   "training further requires validated features, labels and model-quality checks.")
-    st.markdown(ui_intro("Previous option ideas", "All dates, not only recent entries"),unsafe_allow_html=True)
-    if all_options.empty:
-        st.caption("No option paper history stored on this deployment.")
-    else:
-        st.dataframe(all_options.rename(columns={"date_key":"Date","option_contract":"Contract",
-            "status":"Result","entry_premium":"Entry premium ₹","total_capital":"Capital ₹","pnl_pct":"Paper P/L %"}),
-            hide_index=True,use_container_width=True)
-    with st.expander(f"🔎 See {len(all_reviews):,} saved CE/PE research reviews"):
-        if all_reviews.empty:
-            st.caption("No individual contract reviews have been stored yet.")
-        else:
-            st.dataframe(all_reviews,hide_index=True,use_container_width=True)
-    with st.expander("🧠 How the model learns from past records"):
-        st.caption(f"A challenger is considered after at least {MIN_SETTLED_TO_RETRAIN} validated completed share cases, "
-                   f"then after {RETRAIN_STEP_INTERVAL} additional cases. It replaces the current model only if it beats "
-                   "the champion on later-period validation. Saved training history isn't deleted by this interface.")
-        last_state_raw = get_meta("retrain_state", "{}")
-        try:
-            train_state = json.loads(last_state_raw or "{}")
+            train_state = json.loads(state_raw or '{}')
         except (ValueError,TypeError):
             train_state = {}
-        st.write("Last retrain attempt:", train_state.get("last_attempt_date", "Not eligible yet"))
-        st.write("Last model promotion:", train_state.get("last_promoted", "None recorded"))
-        st.caption("The original trained-model file and any live model file must be kept alongside the project. "
-                   "Restoring the DuckDB file alone does not restore missing model .pkl files.")
-    st.caption("Streamlit auto-refresh works while a browser session is open. Fully unattended ten-year research would need "
-               "a separate scheduled service, persistent storage, backups, monitoring and periodic maintenance.")
+        st.markdown(dark_stats([
+            ('Recorded outcomes',str(totals['finished']),'Confirmed closes; some are unsuitable for training'),
+            ('Decided win rate',f"{totals['win_rate']:.1f}%" if totals['win_rate'] is not None else '—',
+             f"{totals['decided']} journal wins or losses, not model accuracy"),
+            ('Feature snapshots',str(totals['potential_training']),'Potential cases; not guaranteed eligible'),
+            ('Model last promoted',str(train_state.get('last_promoted','Not yet')),'Only after later-period challenger validation'),
+        ]),unsafe_allow_html=True)
+        st.markdown(dark_note('An observed winning or losing trade does not prove the AI changed its model. Per-stock patterns below are descriptions of the journal. Actual training and upgrades are tracked separately.'),unsafe_allow_html=True)
+        sym_counts = journal_eq['ticker'].fillna('').astype(str).value_counts()
+        ordered = [name for name in sym_counts.index if name.strip()]
+        pick1,pick2 = st.columns([1.5,1])
+        with pick1:
+            selected_stock = st.selectbox('Choose a stock to inspect', ordered, key='dark_learning_stock')
+        with pick2:
+            learn_filter = st.selectbox('Show outcomes', ['ALL','WIN','LOSS','ACTIVE','OTHER'],key='dark_learning_filter')
+        only = journal_eq[journal_eq['ticker'].astype(str)==selected_stock].copy()
+        stock_stats = stock_history_summary(only)
+        st.markdown(dark_stats([
+            ('Trades recorded',str(stock_stats['total']),f"{stock_stats['open']} still open"),
+            ('Wins / losses',f"{stock_stats['wins']} / {stock_stats['losses']}",'Other exits shown in the ledger'),
+            ('Average closed result',f"{stock_stats['avg_pnl']:+.2f}%" if stock_stats['avg_pnl'] is not None else '—','Historical paper results only'),
+            ('Potential training rows',str(stock_stats['potential_training']),'Requires full validation'),
+        ]),unsafe_allow_html=True)
+        st.markdown(dark_header(f'Observations from {selected_stock}','Simple explanations · no causal claims'),unsafe_allow_html=True)
+        for line in stock_evidence(only):
+            st.markdown('• '+line)
+        st.markdown(dark_header('Individual trade lessons','Actual recorded outcomes, including failures'),unsafe_allow_html=True)
+        filtered = only if learn_filter=='ALL' else only[only['status'].apply(
+            lambda x: classify_outcome(x)==learn_filter if learn_filter!='OTHER' else classify_outcome(x) not in ('WIN','LOSS','ACTIVE'))]
+        for _, row in filtered.head(20).iterrows():
+            rec = row.to_dict()
+            obs = describe_trade(rec)
+            pnl = obs['pnl']
+            pnl_label = f'{pnl:+.2f}%' if pnl is not None and math.isfinite(pnl) else 'P/L unknown'
+            name = f"{str(rec.get('date_str',''))[:10]} · {obs['outcome']} · {pnl_label}"
+            with st.expander(name,expanded=False):
+                st.write(obs['observation'])
+                st.caption(obs['conditions'])
+                st.write('**How it can help future research:** '+obs['training_note'])
+                st.write('**Earlier timeline versus outcome:** '+forecast_review(rec))
+                entry,target,stop = _num(rec.get('entry_price')),_num(rec.get('target_price')),_num(rec.get('stop_loss'))
+                st.caption(f"Entry {short_money(entry)} · Target {short_money(target)} · Stop {short_money(stop)} "
+                           f"· Holding period {obs['days_held'] if obs['days_held'] is not None else 'unknown'} calendar days")
+        if len(filtered)>20:
+            st.caption(f'Showing 20 of {len(filtered)} events for this symbol. Full history is in Trade Ledger.')
+        with st.expander('🧠 Model training details'):
+            st.write(f'Current minimum: **{MIN_SETTLED_TO_RETRAIN}** suitable, validated share outcomes. '
+                     f"Next attempts after roughly **{RETRAIN_STEP_INTERVAL}** additional eligible cases.")
+            st.write('Last retraining attempt:',train_state.get('last_attempt_date','Not eligible yet'))
+            st.write('Last challenger promotion:',train_state.get('last_promoted','None recorded'))
+            st.caption('Old snapshots are never silently rewritten to look better. Without saved entry features or historical forecasts, some legacy records cannot support training or timeline evaluation.')
 
-st.caption("Research and paper trading only. No broker orders are sent; all price forecasts and option ratings are uncertain.")
+with page_ledger:
+    st.markdown(dark_header('Trade ledger','All paper stocks, calls and puts · open and closed'),unsafe_allow_html=True)
+    if journal_eq.empty and journal_opt.empty:
+        st.warning('No trading history available from this local database. Use recovery below. Do not reset your existing database.')
+    st.markdown(dark_stats([
+        ('Share records',str(len(journal_eq)),'Includes old and current entries'),
+        ('Active shares',str(cap['open']),f"Current entry limit {MAX_OPEN_POSITIONS}"),
+        ('Option records',str(len(journal_opt)),'Live-quoted and older estimated-price ideas'),
+        ('Reviews saved',str(len(journal_reviews)),'Newer CE/PE quote checks'),
+    ]),unsafe_allow_html=True)
+    ledger_kind = st.segmented_control('Ledger type', ['Stocks','Calls & Puts','Option research reviews'],default='Stocks', key='dark_ledger_type')
+    l1,l2,l3 = st.columns([1.1,1.5,1])
+    with l1:
+        ledger_status = st.selectbox('Status', ['ALL','OPEN','CLOSED','WINS','LOSSES'],key='dark_ledger_status')
+    with l2:
+        ledger_search = st.text_input('Search your ledger',placeholder='Symbol or contract…',key='dark_ledger_search')
+    with l3:
+        visible_rows = st.selectbox('Rows shown',[15,30,75,150],key='dark_rows_shown')
+    if ledger_kind=='Stocks':
+        view = journal_eq.copy()
+        filter_col = 'ticker'
+    elif ledger_kind=='Calls & Puts':
+        view = journal_opt.copy()
+        filter_col = 'option_contract'
+    else:
+        view = journal_reviews.copy()
+        filter_col = 'symbol'
+    if not view.empty:
+        if 'status' in view.columns:
+            outcomes = view['status'].apply(classify_outcome)
+            if ledger_status=='OPEN':
+                view=view[outcomes=='ACTIVE']
+            elif ledger_status=='CLOSED':
+                view=view[outcomes!='ACTIVE']
+            elif ledger_status=='WINS':
+                view=view[outcomes=='WIN']
+            elif ledger_status=='LOSSES':
+                view=view[outcomes=='LOSS']
+        elif ledger_status != 'ALL':
+            st.caption('This research-review table has no open/closed trade statuses.')
+        if ledger_search.strip() and filter_col in view.columns:
+            view = view[view[filter_col].astype(str).str.contains(re.escape(ledger_search.strip()),case=False,na=False)]
+    st.caption(f"{len(view):,} matching records. Showing up to {visible_rows}; CSV export includes every match. No history is removed by filters.")
+    if view.empty:
+        st.info('No matching ledger rows. Clear filters or check recovery below.')
+    else:
+        if ledger_kind=='Stocks':
+            friendly_cols = ['date_str','ticker','status','entry_price','target_price','stop_loss','latest_price','shares','capital_allocated','pnl_pct','exit_timestamp']
+            display_names = {'date_str':'Date','ticker':'Share','status':'Status','entry_price':'Entry ₹','target_price':'Target ₹','stop_loss':'Stop ₹','latest_price':'Latest ₹',
+                             'shares':'Qty','capital_allocated':'Allocated ₹','pnl_pct':'Paper P/L %','exit_timestamp':'Closed at'}
+        elif ledger_kind=='Calls & Puts':
+            friendly_cols = ['date_key','option_contract','status','entry_premium','target_premium','stop_loss_premium','current_option_price','lot_size','total_capital','pnl_pct','last_audited']
+            display_names = {'date_key':'Date','option_contract':'CE / PE Contract','status':'Status','entry_premium':'Entry premium ₹','target_premium':'Target ₹','stop_loss_premium':'Stop ₹',
+                             'current_option_price':'Last premium ₹','lot_size':'Lot','total_capital':'Allocated ₹','pnl_pct':'Paper P/L %','last_audited':'Checked at'}
+        else:
+            friendly_cols = ['checked_at','symbol','side','decision','reason']
+            display_names = {'checked_at':'Checked at','symbol':'Stock','side':'CE / PE','decision':'Decision','reason':'Reason'}
+        st.dataframe(view[[c for c in friendly_cols if c in view.columns]].head(visible_rows).rename(columns=display_names),
+                     hide_index=True,use_container_width=True,height=min(550,90+36*min(visible_rows,len(view))))
+        st.download_button('↓ Export all matching records (CSV)',data=view.to_csv(index=False).encode('utf-8'),
+                           file_name='nse_'+ledger_kind.lower().replace(' ','_').replace('&','and')+'_ledger.csv',
+                           mime='text/csv',key='dark_ledger_export')
+    if st.button('↻ Reconcile open paper positions', key='dark_reconcile', use_container_width=False):
+        st.session_state['dark_force_audit'] = True
+        st.rerun()
+    render_history_recovery()
+    st.caption('No broker orders. Stop-loss fills and estimated model targets are uncertain. Streamlit session auto-refresh is NOT an unattended 10-year service.')
+
+st.caption('NSE market research · Paper capital only · Uncertain forecasts · Never treat a CONSIDER label as a guaranteed trade or return')

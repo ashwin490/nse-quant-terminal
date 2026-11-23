@@ -1,3 +1,11 @@
+# NSE Quant — v9 colourful dashboard + scan diagnostics (23 November 2026)
+
+**Start with [DEPLOY_V9.md](DEPLOY_V9.md)** for the tab-by-tab findings, non-destructive update instructions and deployment checklist.
+
+This build preserves the three colourful themes and the simple no-chart design. The new per-batch F&O diagnostics distinguish 35 symbols selected from actual exchange option chains received, and do not invent options when usable quotes are missing. Overview now updates after scans; the 10-share entry cap, historical journal and data-recovery tools remain intact.
+
+---
+
 # Version 8 — colourful dashboard + NSE F&O universe parser fix (20 Nov 2026)
 
 This is a **presentation and input-data validation release**, NOT a new AI model and

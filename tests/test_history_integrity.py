@@ -25,6 +25,12 @@ class HistoryIntegrityTests(unittest.TestCase):
         state = history_state(2, 20, True, cloud_failed=True)
         self.assertIn('error', state['reason'])
 
+    def test_option_history_floor_is_independent(self):
+        state = history_state(0, 21, True, cloud_shares=0, record_label='option')
+        self.assertFalse(state['allow_new_paper_entries'])
+        self.assertEqual(state['missing'], 21)
+        self.assertIn('no options', state['reason'])
+
     def test_zero_baseline_explicit_fresh_start(self):
         state = history_state(0, 0, False)
         self.assertTrue(state['allow_new_paper_entries'])
