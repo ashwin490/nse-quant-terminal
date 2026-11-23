@@ -3854,6 +3854,15 @@ with page_ledger:
     if st.button('↻ Reconcile open paper positions', key='dark_reconcile', width="content"):
         st.session_state['dark_force_audit'] = True
         st.rerun()
+    # Cloud sync check is informational: the restore counter may be older
+    # than newly written local records. Never delete local history to match it.
+    cloud_info = st.session_state.get('hydrate_info') or {}
+    if supabase and 'remote_options' in cloud_info and len(journal_opt) > _int(cloud_info.get('remote_options')):
+        st.warning(
+            f"The local ledger contains {len(journal_opt):,} option ideas, while the last Supabase "
+            f"check saw {_int(cloud_info.get('remote_options')):,}. This may reflect an unsynced "
+            "idea or an older cloud snapshot. Export a backup and verify cloud sync before a restart."
+        )
     render_history_recovery()
     st.caption('No broker orders. Stop-loss fills and estimated model targets are uncertain. Streamlit session auto-refresh is NOT an unattended 10-year service.')
 

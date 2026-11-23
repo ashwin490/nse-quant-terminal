@@ -58,6 +58,44 @@ class IntradayExitTests(unittest.TestCase):
         self.assertFalse(x.covered)
         self.assertIn('latest interval', x.note)
 
+    def test_protected_stop_above_original_entry_is_valid(self):
+        # BLUESTARCO-like case: entry 100, current ratcheted stop 100.4.
+        # A brief dip to the protected stop must be detected instead of
+        # incorrectly reporting the entire minute feed as unusable.
+        rows = [[102, 103, 101, 102]] * 15
+        rows[6] = [101, 101.5, 100.2, 100.9]
+        result = scan_intraday_minutes(self.bars(rows), entry=100, target=105,
+            stop=100.4, from_time=datetime(2026, 11, 23, 10),
+            as_of=datetime(2026, 11, 23, 10, 15))
+        self.assertTrue(result.covered)
+        self.assertEqual(result.outcome, 'STOP')
+        self.assertAlmostEqual(result.fill, 100.4)
+
+    def test_protected_stop_without_touch_stays_active_but_verified(self):
+        rows = [[102, 103, 101, 102]] * 15
+        result = scan_intraday_minutes(self.bars(rows), entry=100, target=105,
+            stop=100.4, from_time=datetime(2026, 11, 23, 10),
+            as_of=datetime(2026, 11, 23, 10, 15))
+        self.assertTrue(result.covered)
+        self.assertIsNone(result.outcome)
+
+    def test_stop_at_entry_allowed_for_break_even(self):
+        rows = [[101, 102, 100.5, 101]] * 15
+        rows[7] = [101, 101.2, 99.8, 100.1]
+        result = scan_intraday_minutes(self.bars(rows), entry=100, target=105,
+            stop=100, from_time=datetime(2026, 11, 23, 10),
+            as_of=datetime(2026, 11, 23, 10, 15))
+        self.assertEqual(result.outcome, 'STOP')
+        self.assertEqual(result.fill, 100)
+
+    def test_stop_at_target_still_invalid(self):
+        rows = [[102, 103, 101, 102]] * 15
+        result = scan_intraday_minutes(self.bars(rows), entry=100, target=105,
+            stop=105, from_time=datetime(2026, 11, 23, 10),
+            as_of=datetime(2026, 11, 23, 10, 15))
+        self.assertFalse(result.covered)
+        self.assertIsNone(result.outcome)
+
     def test_breakeven_only_next_minute(self):
         rows = [[100,101,99,100]] * 15
         rows[5] = [100,104,99,103]

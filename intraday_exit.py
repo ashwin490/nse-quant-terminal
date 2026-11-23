@@ -43,7 +43,10 @@ def scan_intraday_minutes(bars: pd.DataFrame, *, entry: float, target: float,
         return pending
     try:
         prices = [float(entry), float(target), float(stop)]
-        if not all(map(math.isfinite, prices)) or not 0 < stop < entry < target:
+        # A paper stop may have been ratcheted ABOVE entry to protect gains.
+        # Reject nonsensical thresholds, but do not confuse a protected stop
+        # with missing minute-bar coverage (as the old `stop < entry` check did).
+        if not all(map(math.isfinite, prices)) or not (0 < entry < target and 0 < stop < target):
             return pending
         start, now = pd.Timestamp(from_time), pd.Timestamp(as_of)
         if start.tzinfo is not None:

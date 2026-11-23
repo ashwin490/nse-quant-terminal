@@ -312,3 +312,13 @@ learning or the ₹10 lakh allocation limit. The original model `.pkl` must also
 kept separately and backed up; past record recovery does not recreate a lost model.
 
 New pure-Python tests: `tests/test_history_integrity.py`.
+
+
+### v10.2 protected stop repair (23 Nov 2026)
+
+`intraday_exit.scan_intraday_minutes` now accepts a trailing/protected stop-loss
+that has moved to or above the original entry, provided it remains below the
+target. Previously these valid positions were falsely flagged as unavailable
+minute-price data. Stop-first ambiguity and missing-candle safeguards remain.
+This release does not repair actual incomplete exchange feeds, restore missing
+cloud option records, or guarantee a broker-like fill.
