@@ -1,3 +1,5 @@
+**Historical note:** v10.5 replaces the per-stock selector described below with an automatic 15-stock learning feed. See `UPDATE_V10_5.md`.
+
 # NSE AI Research Terminal — v10.4
 
 ## Changed

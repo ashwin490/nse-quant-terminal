@@ -3372,6 +3372,7 @@ from history_recovery import merge_history_database, snapshot_database, count_hi
 from scan_health import option_http_note
 from portfolio_overview import portfolio_open_snapshot
 from learning_tiles import build_learning_tile
+from learning_feed import latest_completed_by_stock
 
 
 def read_full_paper_ledger() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -3776,40 +3777,39 @@ with page_learning:
                    f"{totals['potential_training']} possible entry-feature examples (not all validated) · "
                    f"Last model promotion: {train_state.get('last_promoted','None recorded')}")
         st.caption('Each tile is based on one journal record. It explains a possible future test, not a proven reason for a win/loss or an automatic model update.')
-        sym_counts = journal_eq['ticker'].fillna('').astype(str).value_counts()
-        ordered = [name for name in sym_counts.index if name.strip()]
-        if ordered:
-            pick1,pick2,pick3 = st.columns([1.6,1,1])
-            with pick1:
-                selected_stock = st.selectbox('Choose a stock to inspect', ordered, key='dark_learning_stock')
-            with pick2:
-                learn_filter = st.selectbox('Show outcomes', ['ALL','WIN','LOSS','ACTIVE','OTHER'], key='dark_learning_filter')
-            with pick3:
-                learning_limit = st.selectbox('Learning cards', [5,10,20,50], index=0, key='dark_learning_count')
-            only = journal_eq[journal_eq['ticker'].astype(str)==selected_stock].copy()
-            filtered = only if learn_filter=='ALL' else only[only['status'].apply(
-                lambda x: classify_outcome(x)==learn_filter if learn_filter!='OTHER' else classify_outcome(x) not in ('WIN','LOSS','ACTIVE'))]
-            st.markdown(dark_header(f'Observations for {selected_stock}',
-                f'{len(filtered)} recorded trade events · newest first'), unsafe_allow_html=True)
-            if filtered.empty:
-                st.info('No events match your selection. Choose another outcome filter.')
-            else:
-                records = filtered.head(learning_limit).to_dict('records')
-                cards = [dark_learning_tile(build_learning_tile(rec)) for rec in records]
-                st.markdown('<div class="learning-tiles">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
-                if len(filtered) > learning_limit:
-                    st.caption(f'Showing {learning_limit} of {len(filtered)} events. Increase Learning cards to see more.')
-                with st.expander('Exact prices, saved forecasts and dates for these trades'):
-                    for n, rec in enumerate(records):
-                        obs = describe_trade(rec)
-                        st.markdown(f"**{str(rec.get('date_str') or '')[:10]} · {obs['outcome']}**")
-                        st.caption(f"Entry {short_money(rec.get('entry_price'))} · "
-                                   f"Target {short_money(rec.get('target_price'))} · "
-                                   f"Stop {short_money(rec.get('stop_loss'))} · "
-                                   f"Held {obs['days_held'] if obs['days_held'] is not None else 'unknown'} calendar days")
-                        st.caption('Original forecast: ' + forecast_review(rec))
-                        if n < len(records)-1:
-                            st.divider()
+        # One automatic feed covering different shares: no symbol picker, filters
+        # or card-count dropdown. A card describes a genuine finished journal
+        # outcome; an open trade cannot be described as a learned win/loss.
+        completed_feed = latest_completed_by_stock(journal_eq)
+        if not completed_feed:
+            st.info('No completed stock outcomes yet. Current open trades will appear here after their recorded outcomes are confirmed.')
+        else:
+            if 'learning_feed_visible' not in st.session_state:
+                st.session_state['learning_feed_visible'] = 15
+            visible_count = min(max(15, int(st.session_state['learning_feed_visible'])), len(completed_feed))
+            records = completed_feed[:visible_count]
+            st.markdown(dark_header('Latest stock learning observations',
+                f'{visible_count} of {len(completed_feed)} distinct stocks · latest completed result per stock · newest first'),
+                unsafe_allow_html=True)
+            st.caption('Each card shows one actual closed paper trade for a different stock. These are observations and proposed future tests, not proof the AI has already learned the pattern.')
+            cards = [dark_learning_tile(build_learning_tile(rec)) for rec in records]
+            st.markdown('<div class="learning-tiles">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+            if visible_count < len(completed_feed):
+                if st.button('↓ Show 15 more stocks', key='show_more_learning_feed', width='stretch'):
+                    st.session_state['learning_feed_visible'] = min(visible_count + 15, len(completed_feed))
+                    st.rerun()
+            with st.expander('Exact trade prices and saved forecasts for the cards above'):
+                for n, rec in enumerate(records):
+                    obs = describe_trade(rec)
+                    stock_name = str(rec.get('ticker') or 'Unknown stock')
+                    st.markdown(f"**{esc(stock_name)} · {str(rec.get('date_str') or '')[:10]} · {obs['outcome']}**")
+                    st.caption(f"Entry {short_money(rec.get('entry_price'))} · "
+                               f"Target {short_money(rec.get('target_price'))} · "
+                               f"Stop {short_money(rec.get('stop_loss'))} · "
+                               f"Held {obs['days_held'] if obs['days_held'] is not None else 'unknown'} calendar days")
+                    st.caption('Original forecast: ' + forecast_review(rec))
+                    if n < len(records)-1:
+                        st.divider()
         with st.expander('🧠 Model training status and validation'):
             st.write(f'Minimum: **{MIN_SETTLED_TO_RETRAIN}** suitable, validated share outcomes. '
                      f'Next retraining attempts after roughly **{RETRAIN_STEP_INTERVAL}** additional eligible cases.')

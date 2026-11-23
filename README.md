@@ -1,3 +1,5 @@
+**NEW (v10.5):** AI Learning now automatically displays 15 latest distinct stocks with completed outcomes; use **Show 15 more stocks** for older observations. No ticker/outcome/card-count selectors. See `UPDATE_V10_5.md`.
+
 > **v10.4 update:** Three-view dark dashboard now shows per-trade AI learning tiles, combined open share/CE/PE counts, and last-recorded open paper P/L. See `UPDATE_V10_4.md`.
 
 # NSE Quant — v9 colourful dashboard + scan diagnostics (23 November 2026)
