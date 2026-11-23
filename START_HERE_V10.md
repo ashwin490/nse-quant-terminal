@@ -55,3 +55,14 @@ git push origin HEAD
 - Streamlit, DuckDB migration execution, Yahoo/NSE live minute feeds, Supabase Cloud and browser refresh have **not been end-to-end tested here**.
 - NO system based on Yahoo/NSE web endpoints and Streamlit sessions can be guaranteed bug-free or run unattended for ten years. Unattended research requires persistent DB backups, an always-running scheduler, monitoring/alerts, provider contracts, model drift reviews and periodic maintenance.
 - Historical paper trade outcomes reflect modelling assumptions; they do not prove actual realised trade performance.
+
+
+## Patch 10.1 — Streamlit width warnings and option scan visibility
+
+- Replaced all 10 deprecated `use_container_width` keyword arguments in `app.py` with
+  `width="stretch"` (9 occurrences) and `width="content"` (1 occurrence).
+- The **Scan quality** expander now shows both the detailed options-scan outcome
+  and any HTTP status counts. HTTP 200 alone is not evidence of a valid contract quote.
+- No trade, database schema, model, Supabase, or paper capital logic is intentionally changed.
+- Your existing `.streamlit/secrets.toml`, models, DuckDB data and persistent Supabase
+  settings must not be overwritten by the source ZIP.

@@ -3422,14 +3422,14 @@ def render_history_recovery() -> None:
     with st.expander('🛠️ Backup and recover history', expanded=False):
         st.caption('Keep the original Supabase project and your local DuckDB backups. An upload MERGES IDs; it never deliberately resets the journal.')
         if supabase:
-            if st.button('☁️ Retry restoring from Supabase', key='dark_cloud_restore', use_container_width=True):
+            if st.button('☁️ Retry restoring from Supabase', key='dark_cloud_restore', width="stretch"):
                 with st.spinner('Comparing cloud and local paper history...'):
                     hydrate_duckdb_from_supabase()
                 st.rerun()
             hi = st.session_state.get('hydrate_info',{})
             st.caption(f"Last cloud check: {hi.get('remote',0)} share rows, {hi.get('remote_options',0)} option rows, "
                        f"{hi.get('restored',0)} share rows restored, {hi.get('bad_rows',0)} skipped")
-            if st.button('📤 Sync up to 200 missing records to Supabase', key='dark_cloud_sync', use_container_width=True):
+            if st.button('📤 Sync up to 200 missing records to Supabase', key='dark_cloud_sync', width="stretch"):
                 with st.spinner('Uploading only rows absent from cloud...'):
                     result = sync_local_history_to_supabase(200, st.session_state.get('history_sync_offset',0))
                 st.session_state['history_sync_offset'] = result['next_offset'] if result['more_to_check'] else 0
@@ -3507,7 +3507,7 @@ with st.sidebar:
         st.caption(f"Model: {st.session_state.get('ml_model_source','Not yet checked')}")
         if st.session_state.get('db_error'):
             st.warning(str(st.session_state['db_error'])[:180])
-    if st.button('Sign out', key='dark_signout', use_container_width=True):
+    if st.button('Sign out', key='dark_signout', width="stretch"):
         st.session_state['password_correct'] = False
         st.rerun()
 
@@ -3600,15 +3600,15 @@ with page_preds:
     st.markdown(dark_header('Predictions','One simple view · Stocks + Calls + Puts'),unsafe_allow_html=True)
     a,b,c = st.columns([1,1,1])
     with a:
-        if st.button('🔍 Scan stocks',key='dark_scan_stocks',use_container_width=True):
+        if st.button('🔍 Scan stocks',key='dark_scan_stocks',width="stretch"):
             st.session_state['dark_force_shares'] = True
             st.rerun()
     with b:
-        if st.button('🎯 Scan CE / PE',key='dark_scan_options',use_container_width=True):
+        if st.button('🎯 Scan CE / PE',key='dark_scan_options',width="stretch"):
             st.session_state['dark_force_options'] = True
             st.rerun()
     with c:
-        if st.button('↻ Refresh everything',type='primary',key='dark_scan_all',use_container_width=True):
+        if st.button('↻ Refresh everything',type='primary',key='dark_scan_all',width="stretch"):
             st.session_state['dark_force_all'] = True
             st.session_state['dark_force_audit'] = True
             st.rerun()
@@ -3710,14 +3710,19 @@ with page_preds:
             st.caption(f"Share universe: {st.session_state.get('scan_stats',{}).get('listed','?')} NSE symbols. "
                        'Only some have usable data and pass the shortlist; a scan may be partial.')
             cols = ['Ticker','Sector','Decision','Price (₹)','Target (₹)','Stop Loss (₹)','Expected value','Rejection Reason']
-            st.dataframe(share_results[[x for x in cols if x in share_results.columns]],hide_index=True,use_container_width=True)
+            st.dataframe(share_results[[x for x in cols if x in share_results.columns]],hide_index=True,width="stretch")
         else:
             st.caption('No share candidate table saved in this session.')
         health = st.session_state.get('option_scan_health') or {}
-        st.caption(option_http_note(health) or st.session_state.get('option_scan_note','No option scan diagnostics yet.'))
+        # Report both the scan outcome and HTTP statuses. A 200 response alone
+        # does not imply fresh, usable, exchange-validated option contracts.
+        st.caption(st.session_state.get('option_scan_note','No option scan diagnostics yet.'))
+        http_note = option_http_note(health)
+        if http_note:
+            st.caption(http_note)
         if not option_results.empty:
             cols = ['Stock','Type','Decision','Expiry','Strike (₹)','Buy premium (₹)','Cost (₹)','Why']
-            st.dataframe(option_results[[x for x in cols if x in option_results.columns]],hide_index=True,use_container_width=True)
+            st.dataframe(option_results[[x for x in cols if x in option_results.columns]],hide_index=True,width="stretch")
         if not ANNOUNCEMENTS_AVAILABLE:
             st.warning('NSE corporate filings module is unavailable. News checks are incomplete; treat technical CONSIDER scores cautiously.')
 
@@ -3842,11 +3847,11 @@ with page_ledger:
             friendly_cols = ['checked_at','symbol','side','decision','reason']
             display_names = {'checked_at':'Checked at','symbol':'Stock','side':'CE / PE','decision':'Decision','reason':'Reason'}
         st.dataframe(view[[c for c in friendly_cols if c in view.columns]].head(visible_rows).rename(columns=display_names),
-                     hide_index=True,use_container_width=True,height=min(550,90+36*min(visible_rows,len(view))))
+                     hide_index=True,width="stretch",height=min(550,90+36*min(visible_rows,len(view))))
         st.download_button('↓ Export all matching records (CSV)',data=view.to_csv(index=False).encode('utf-8'),
                            file_name='nse_'+ledger_kind.lower().replace(' ','_').replace('&','and')+'_ledger.csv',
                            mime='text/csv',key='dark_ledger_export')
-    if st.button('↻ Reconcile open paper positions', key='dark_reconcile', use_container_width=False):
+    if st.button('↻ Reconcile open paper positions', key='dark_reconcile', width="content"):
         st.session_state['dark_force_audit'] = True
         st.rerun()
     render_history_recovery()
