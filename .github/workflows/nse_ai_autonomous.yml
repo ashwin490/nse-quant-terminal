@@ -1,0 +1,70 @@
+name: NSE Independent AI Research and Monitoring
+
+on:
+  schedule:
+    # Weekday market monitoring, 09:30–15:30 IST (UTC 04:00–10:00).
+    # The worker enforces the NSE clock. GitHub schedules can be delayed/dropped.
+    - cron: '*/15 4-10 * * 1-5'
+    # Daily learning after NSE closes (18:13 IST / 12:43 UTC).
+    - cron: '43 12 * * 1-5'
+    # Best-effort independent watchdog later in the evening, after daily run.
+    - cron: '17 14 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run daily learning / monitor / health / dry-run'
+        type: choice
+        required: true
+        default: daily
+        options:
+          - daily
+          - monitor
+          - health
+          - dry-run
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nse-ai-independent-worker
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      NSE_ALERT_WEBHOOK_URL: ${{ secrets.NSE_ALERT_WEBHOOK_URL }}
+      NSE_WORKER_SYMBOLS: ${{ vars.NSE_WORKER_SYMBOLS }}
+      NSE_DAILY_SYMBOLS: '35'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-worker.txt
+      - run: python -m pip install -r requirements-worker.txt
+      - name: Check module compilation and unit tests
+        run: |
+          python -m compileall -q nse_ai_core.py nse_ai_store.py nse_autonomous_worker.py nse_ai_dashboard.py
+          python -m unittest discover -s tests -p 'test_autonomous_*.py' -q
+      - name: Choose job mode
+        shell: bash
+        env:
+          REQUESTED_MODE: ${{ inputs.mode }}
+          TRIGGER_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [[ '${{ github.event_name }}' == 'workflow_dispatch' ]]; then
+            echo "NSE_MODE=${REQUESTED_MODE}" >> "$GITHUB_ENV"
+          elif [[ "$TRIGGER_SCHEDULE" == '43 12 * * 1-5' ]]; then
+            echo 'NSE_MODE=daily' >> "$GITHUB_ENV"
+          elif [[ "$TRIGGER_SCHEDULE" == '17 14 * * 1-5' ]]; then
+            echo 'NSE_MODE=health' >> "$GITHUB_ENV"
+          else
+            echo 'NSE_MODE=monitor' >> "$GITHUB_ENV"
+          fi
+      - name: Run fail-closed independent research
+        run: python nse_autonomous_worker.py --mode "$NSE_MODE"

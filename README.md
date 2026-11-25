@@ -1,3 +1,7 @@
+# NSE Quant Terminal v11: independent historical learning (paper research)
+
+**START HERE:** See [UPDATE_V11_AUTONOMOUS.md](UPDATE_V11_AUTONOMOUS.md) for the exact one-time SQL, GitHub Actions Secrets and deployment steps. This package adds a scheduled daily market-history learner, model promotion only after time-separated validation, read-only paper position monitoring and worker-health reporting. It retains the three-tab dark dashboard. **It does not guarantee 10-year hands-off operation, profitable trades, or live CE/PE options quotes.**
+
 **NEW (v10.5):** AI Learning now automatically displays 15 latest distinct stocks with completed outcomes; use **Show 15 more stocks** for older observations. No ticker/outcome/card-count selectors. See `UPDATE_V10_5.md`.
 
 > **v10.4 update:** Three-view dark dashboard now shows per-trade AI learning tiles, combined open share/CE/PE counts, and last-recorded open paper P/L. See `UPDATE_V10_4.md`.

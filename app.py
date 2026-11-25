@@ -18,6 +18,7 @@ from intraday_exit import scan_intraday_minutes
 from nse_option_chain import (expiry_labels, supported_expiries, matching_rows, nearby_strikes, option_payload_shape, parse_expiry_date,
     exact_contract, bid_ask, quote_is_fresh, underlying_value, exchange_timestamp)
 from reconciliation_policy import preserve_local_row, closed_record_conflict
+from nse_ai_dashboard import worker_status, valid_forecasts
 from datetime import datetime, time as dtime, timedelta
 import random
 import shutil
@@ -3795,6 +3796,42 @@ if st.session_state.get('intraday_feed_problem'):
 if not ANNOUNCEMENTS_AVAILABLE:
     st.caption('⚠️ Corporate filing/news checker unavailable. Technical recommendations are incomplete without those checks.')
 
+# Independent background daily learner (read-only). It never updates existing
+# historical journals or replaces the old live model. If setup is incomplete,
+# the original dashboard and paper monitoring still work as before.
+@st.cache_data(ttl=240, show_spinner=False)
+def read_independent_nse_research() -> dict:
+    if not supabase:
+        return {"configured": False, "forecasts": [], "champion": {}, "run": {}}
+    try:
+        settings = supabase.table('nse_ai_settings').select('value').eq('key','champion').limit(1).execute()
+        champion = settings.data[0]['value'] if settings.data else {}
+        latest_run = (supabase.table('nse_ai_runs').select('run_id,status,finished_at,started_at,kind')
+                      .eq('kind','daily').order('started_at',desc=True).limit(1).execute())
+        rows = (supabase.table('nse_ai_forecasts')
+                .select('forecast_for,ticker,model_id,entry_price,target_price,stop_loss,target_first_probability,conservative_ev_pct,time_estimate,horizon_sessions,decision')
+                .order('forecast_for',desc=True).limit(80).execute())
+        all_rows = rows.data or []
+        last_date = str(all_rows[0].get('forecast_for','')) if all_rows else None
+        fresh = [r for r in all_rows if str(r.get('forecast_for')) == last_date]
+        return {"configured": True, "champion": champion or {},
+                "run": (latest_run.data or [None])[0],
+                "forecasts": valid_forecasts(fresh, (champion or {}).get('model_id'), max_cards=5)}
+    except Exception:
+        # Old Supabase schema / missing table / anon-key RLS: no UI crash and
+        # no inferred ML prediction. Deployment instructions explain migration.
+        return {"configured": False, "forecasts": [], "champion": {}, "run": {}}
+
+independent_research = read_independent_nse_research()
+if independent_research['configured']:
+    background_health = worker_status(independent_research['run'])
+    st.caption('🧠 Independent daily learning: ' + background_health['label'] +
+               ' · Research-only; never a broker execution')
+    if background_health['state'] in ('STALE','FAILED'):
+        st.warning('Scheduled daily learning is stale or failed. Check GitHub Actions and Supabase worker-run history; do not assume forecasts have refreshed.')
+else:
+    st.caption('🧠 Independent background learning: not configured or private database tables unavailable. Existing research remains unchanged.')
+
 page_preds, page_learning, page_ledger = st.tabs(['✦ Predictions','🧠 AI Learning','📒 Trade Ledger'])
 
 with page_preds:
@@ -3914,6 +3951,25 @@ with page_preds:
     if st.session_state.get('opt_note'):
         st.caption('CE/PE paper entry: ' + str(st.session_state['opt_note']))
 
+    if product_filter in ('All','Stocks') and independent_research['forecasts']:
+        with st.expander('🧠 Background AI daily share forecasts · time-tested research', expanded=False):
+            st.caption('These are separate EOD research forecasts from a time-tested model, NOT live execution quotes. '
+                       'Their probabilities are model estimates, not guaranteed or proven live calibration. '
+                       'They do not replace the original stock ranker or automatically open paper positions.')
+            for auto in independent_research['forecasts']:
+                entry, target, stop = float(auto['entry_price']),float(auto['target_price']),float(auto['stop_loss'])
+                model_score = float(auto['target_first_probability'])*100
+                st.markdown(dark_card(str(auto['ticker']), str(auto['decision']),
+                    f"Daily ML as of {auto['forecast_for']} · model {str(auto['model_id'])[:20]}", [
+                    ('EOD entry reference', short_money(entry)),
+                    ('Target · historical model', short_money(target)),
+                    ('Stop-loss · risk', short_money(stop)),
+                    ('Target-first estimate', f'{model_score:.1f}%')],
+                    f"Conservative modelled value {float(auto['conservative_ev_pct']):+.2f}% after assumed costs",
+                    f"Horizon {auto['horizon_sessions']} sessions · target history: {auto['time_estimate']}",
+                    'The latest close can gap before next entry. Missing CE/PE quotes are unaffected.'),
+                    unsafe_allow_html=True)
+
     with st.expander('🩺 Scan quality / full candidate list'):
         if not share_results.empty:
             st.caption(f"Share universe: {st.session_state.get('scan_stats',{}).get('listed','?')} NSE symbols. "
@@ -3936,6 +3992,15 @@ with page_preds:
             st.warning('NSE corporate filings module is unavailable. News checks are incomplete; treat technical CONSIDER scores cautiously.')
 
 with page_learning:
+    champion_live = independent_research.get('champion') or {}
+    if champion_live:
+        stats = champion_live.get('metrics') or {}
+        st.caption(f"Independent daily market AI · champion {str(champion_live.get('model_id','?'))[:24]} · "
+                   f"trained through {champion_live.get('trained_until','?')} · "
+                   f"held-out Brier {stats.get('brier','?')} (lower is better). "
+                   "This uses newly labelled daily market history, separately from your trade journal.")
+    else:
+        st.caption('Independent daily market learner: no challenger has passed promotion checks yet, or the worker is not configured.')
     st.markdown(dark_header('AI Learning — one trade at a time',
         'Individual results, observations and tests the model could learn from · no graphs'),
         unsafe_allow_html=True)

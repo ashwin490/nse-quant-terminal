@@ -1,0 +1,6 @@
+# Separate from Streamlit; stable small environment for scheduled learning.
+requests>=2.31,<3
+pandas>=2.1,<3
+numpy>=1.26,<3
+scikit-learn>=1.4,<2
+joblib>=1.3,<2
