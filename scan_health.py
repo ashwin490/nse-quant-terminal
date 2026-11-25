@@ -16,9 +16,11 @@ def new_option_scan_health(selected: int = 0, universe: int = 0) -> dict:
         'missing_bid_ask', 'valid_bid_ask', 'contract_reviews',
         'guardrail_rejections', 'consider', 'watch', 'avoid',
         'time_budget_reached', 'rate_limited', 'missing_lots',
+        'expiry_attempts', 'alternate_expiry_attempts', 'empty_payloads',
+        'different_expiry_payloads', 'undated_payloads', 'unknown_shape_payloads',
     )
     result = {name: 0 for name in counters}
-    result.update(selected=max(0, int(selected)), universe=max(0, int(universe)), http_status_counts={})
+    result.update(selected=max(0, int(selected)), universe=max(0, int(universe)), http_status_counts={}, payload_examples=[])
     return result
 
 
@@ -33,6 +35,8 @@ def option_scan_summary(stats: dict) -> str:
             f"{n('strikes_examined')} nearby CE/PE strikes · "
             f"{n('valid_bid_ask')} valid bid/ask quotes · "
             f"{n('contract_reviews')} risk reviews. ")
+    if n('alternate_expiry_attempts'):
+        base += f"{n('alternate_expiry_attempts')} alternate exchange-listed expiries attempted. "
     extra = ''
     if n('time_budget_reached'):
         extra += 'Scan time budget reached; remaining selected symbols were NOT checked. '
@@ -53,6 +57,10 @@ def option_scan_summary(stats: dict) -> str:
         extra += 'No contract passed the minimum checks needed for a review. '
     rejects = (
         ('no_supported_expiry_lot', 'No matching allowed expiry and verified month lot'),
+        ('empty_payloads', 'Empty option rows (expiry checks)'),
+        ('different_expiry_payloads', 'Rows present only for other expiries'),
+        ('undated_payloads', 'Option rows without expiry dates'),
+        ('unknown_shape_payloads', 'Unrecognized response payload structures'),
         ('empty_expiry_rows', 'Empty requested-expiry rows'),
         ('stale_or_untimed', 'Stale or timestamp-free chain'),
         ('spot_disagreements', 'Underlying quote/history disagreement >10%'),
@@ -64,6 +72,9 @@ def option_scan_summary(stats: dict) -> str:
     active = [f'{label}: {n(key)}' for key, label in rejects if n(key)]
     if active:
         extra += 'Diagnostics — ' + '; '.join(active) + '.'
+    examples = (stats.get('payload_examples') or [])[:4]
+    if examples:
+        extra += ' Response samples — ' + ' | '.join(str(x) for x in examples) + '.'
     return base + extra
 
 

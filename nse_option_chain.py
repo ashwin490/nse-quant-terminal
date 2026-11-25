@@ -24,8 +24,23 @@ def _as_records(payload: dict) -> dict:
     return payload.get('records') if isinstance(payload.get('records'), dict) else {}
 
 
+def parse_expiry_date(value) -> date | None:
+    """Parse only unambiguous exchange expiry formats; never guess a date."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    raw = str(value or '').strip()
+    for fmt in ('%d-%b-%Y', '%d %b %Y', '%Y-%m-%d', '%d-%b-%y'):
+        try:
+            return datetime.strptime(raw.title(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def expiry_labels(payload: dict) -> list[str]:
-    """Exchange-specified expiries only. No estimated expiry calendar."""
+    """Normalize expiry labels from the exchange only; never infer calendar dates."""
     if not isinstance(payload, dict):
         return []
     raw = _as_records(payload).get('expiryDates') or payload.get('expiryDates') or []
@@ -33,15 +48,13 @@ def expiry_labels(payload: dict) -> list[str]:
         return []
     good = []
     for value in raw:
-        try:
-            dt = datetime.strptime(str(value).strip().title(), '%d-%b-%Y')
-        except (TypeError, ValueError):
+        dt = parse_expiry_date(value)
+        if dt is None:
             continue
         label = dt.strftime('%d-%b-%Y')
         if label not in good:
             good.append(label)
     return good
-
 
 def supported_expiries(payload: dict, month_lots: dict, today: date,
                        min_days: int = 8, max_days: int = 65) -> list[tuple[str, int, int]]:
@@ -57,28 +70,73 @@ def supported_expiries(payload: dict, month_lots: dict, today: date,
 
 
 def matching_rows(payload: dict, expiry: str) -> list[dict]:
-    """Return the exact exchange-listed expiry's rows; no cross-expiry mixing."""
-    if not isinstance(payload, dict):
-        return []
-    records = _as_records(payload).get('data')
-    if not isinstance(records, list) or not records:
-        filt = payload.get('filtered') if isinstance(payload.get('filtered'), dict) else {}
-        records = filt.get('data')
-    if not isinstance(records, list):
-        return []
-    out = []
-    for row in records:
-        if not isinstance(row, dict):
-            continue
-        actual = row.get('expiryDate')
-        if not actual:
-            ce = row.get('CE') if isinstance(row.get('CE'), dict) else {}
-            pe = row.get('PE') if isinstance(row.get('PE'), dict) else {}
-            actual = ce.get('expiryDate') or pe.get('expiryDate')
-        if str(actual).strip().lower() == expiry.lower():
-            out.append(row)
-    return out
+    """Select only exact-expiry records; search both NSE records and filtered arrays.
 
+    Some responses contain unrelated dates under records.data but the requested
+    date under filtered.data. Never mix those dates or infer missing dates.
+    """
+    wanted = parse_expiry_date(expiry)
+    if not isinstance(payload, dict) or wanted is None:
+        return []
+    records = _as_records(payload)
+    filt = payload.get('filtered') if isinstance(payload.get('filtered'), dict) else {}
+    for rows in (records.get('data'), filt.get('data')):
+        if not isinstance(rows, list):
+            continue
+        matches = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # A row-level expiry, when present, wins over a conflicting leg.
+            # Conflicting leg dates are bad data and must never be mixed.
+            explicit_row_date = parse_expiry_date(row.get('expiryDate'))
+            if explicit_row_date is not None:
+                dates = [row.get('expiryDate')]
+            else:
+                dates = []
+                for side in ('CE', 'PE'):
+                    leg = row.get(side)
+                    if isinstance(leg, dict):
+                        dates.append(leg.get('expiryDate'))
+            # Explicit dates on the row or legs are required; a v3 URL alone
+            # is insufficient evidence to accept an otherwise undated option.
+            if any(parse_expiry_date(value) == wanted for value in dates):
+                matches.append(row)
+        if matches:
+            return matches
+    return []
+
+
+def option_payload_shape(payload: dict, expiry: str) -> tuple[str, str]:
+    """Safe shape summary for an HTTP-200 payload, never raw market quotes."""
+    if not isinstance(payload, dict):
+        return 'not-json-object', 'JSON object missing'
+    records = _as_records(payload)
+    filt = payload.get('filtered') if isinstance(payload.get('filtered'), dict) else {}
+    all_lists = [x for x in (records.get('data'), filt.get('data')) if isinstance(x, list)]
+    if matching_rows(payload, expiry):
+        return 'matching', 'matching expiry rows found'
+    if not all_lists:
+        keys = ', '.join(sorted(str(k)[:28] for k in payload)[:5])
+        return 'unknown-shape', 'no records.data/filtered.data lists; top-level keys: ' + (keys or 'none')
+    rows = [r for group in all_lists for r in group if isinstance(r, dict)]
+    if not rows:
+        return 'empty', 'records.data/filtered.data contain no option rows'
+    seen = set()
+    for row in rows:
+        for key in ('expiryDate',):
+            dt = parse_expiry_date(row.get(key))
+            if dt is not None:
+                seen.add(dt.strftime('%d-%b-%Y'))
+        for side in ('CE', 'PE'):
+            leg = row.get(side)
+            if isinstance(leg, dict):
+                dt = parse_expiry_date(leg.get('expiryDate'))
+                if dt is not None:
+                    seen.add(dt.strftime('%d-%b-%Y'))
+    if seen:
+        return 'other-expiry', 'available expiry labels: ' + ', '.join(sorted(seen)[:3])
+    return 'undated', 'strike rows supplied without explicit expiry dates'
 
 def exchange_timestamp(payload: dict):
     """Timestamp from exchange payload only; never use client retrieval time."""

@@ -15,7 +15,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from intraday_exit import scan_intraday_minutes
-from nse_option_chain import (expiry_labels, supported_expiries, matching_rows, nearby_strikes,
+from nse_option_chain import (expiry_labels, supported_expiries, matching_rows, nearby_strikes, option_payload_shape, parse_expiry_date,
     exact_contract, bid_ask, quote_is_fresh, underlying_value, exchange_timestamp)
 from reconciliation_policy import preserve_local_row, closed_record_conflict
 from datetime import datetime, time as dtime, timedelta
@@ -1668,72 +1668,111 @@ def _track_option_request(health: dict | None, endpoint: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
+def _option_payload_diagnostic(health, endpoint: str, symbol: str,
+                               expiry: str, payload) -> None:
+    """Count sanitized response shapes, not just HTTP statuses.
+
+    HTTP 200 can be an empty list, an error envelope, an unrelated expiry or
+    valid actual contract rows. Never store raw bid/ask data in session logs.
+    """
+    if health is None:
+        return
+    shape, reason = option_payload_shape(payload, expiry)
+    counter = {
+        'empty': 'empty_payloads',
+        'other-expiry': 'different_expiry_payloads',
+        'undated': 'undated_payloads',
+        'unknown-shape': 'unknown_shape_payloads',
+        'not-json-object': 'unknown_shape_payloads',
+    }.get(shape)
+    if counter:
+        health[counter] = health.get(counter, 0) + 1
+        examples = health.setdefault('payload_examples', [])
+        if len(examples) < 4:
+            examples.append(f'{symbol} {expiry} {endpoint}: {reason}')
+
+
 def _exchange_equity_option_chain(symbol: str, expiry_label: str | None = None,
                                   lots_for_symbol: dict | None = None,
                                   health: dict | None = None):
-    """Prefer exchange expiry-discovery + v3, then try legacy as a fallback.
+    """Require explicit expiry rows, real exchange timestamps and verified lots.
 
-    Returns (raw chain, exact expiry, days remaining, lot). The returned data may
-    be stale; the caller must independently require exchange timestamp freshness.
-    Invalid/missing quotes are NEVER backfilled by a theoretical model.
+    Tries a second *exchange-listed* supported expiry if the first returns
+    no valid chain. An HTTP 200 or contract-info list cannot become a quote.
+    No more than two expiry-scoped attempts per underlying.
     """
     name = clean_sym_name(symbol)
-    quoted = urllib.parse.quote(name, safe="")
+    quoted = urllib.parse.quote(name, safe='')
     today = ist_now().date()
-    old_url = "https://www.nseindia.com/api/option-chain-equities?symbol=" + quoted
+    old_url = 'https://www.nseindia.com/api/option-chain-equities?symbol=' + quoted
     legacy = None
-    if not expiry_label:
-        info = _nse_get_json("https://www.nseindia.com/api/option-chain-contract-info?symbol=" + quoted)
-        _track_option_request(health, "contract-info")
-        if health is not None and expiry_labels(info):
-            health["contract_info_received"] += 1
-        available = supported_expiries(info, lots_for_symbol or {}, today)
-        if not available:
-            legacy = _nse_get_json(old_url)
-            _track_option_request(health, "legacy")
-            if not isinstance(legacy, dict):
-                return None
-            available = supported_expiries(legacy, lots_for_symbol or {}, today)
-        if not available:
-            if health is not None:
-                health["no_supported_expiry_lot"] += 1
+    if expiry_label:
+        dt = parse_expiry_date(expiry_label)
+        if dt is None:
             return None
-        expiry_label, days_left, lot = available[0]
+        candidates = [(dt.strftime('%d-%b-%Y'), (dt - today).days, 0)]
     else:
-        try:
-            days_left = (datetime.strptime(expiry_label, '%d-%b-%Y').date() - today).days
-        except (TypeError, ValueError):
+        info = _nse_get_json('https://www.nseindia.com/api/option-chain-contract-info?symbol=' + quoted)
+        _track_option_request(health, 'contract-info')
+        if health is not None and expiry_labels(info):
+            health['contract_info_received'] += 1
+        candidates = supported_expiries(info, lots_for_symbol or {}, today)
+        if not candidates:
+            legacy = _nse_get_json(old_url)
+            _track_option_request(health, 'legacy')
+            candidates = supported_expiries(legacy, lots_for_symbol or {}, today)
+        if not candidates:
+            if health is not None:
+                health['no_supported_expiry_lot'] += 1
             return None
-        lot = 0
-    if health is not None:
-        health["expiry_matches"] += 1
-    url = ("https://www.nseindia.com/api/option-chain-v3?type=Equity&symbol=" + quoted +
-           "&expiry=" + urllib.parse.quote(expiry_label, safe=""))
-    v3 = _nse_get_json(url)
-    _track_option_request(health, "v3")
-    if isinstance(v3, dict) and matching_rows(v3, expiry_label):
-        if health is not None:
-            health["v3_rows_received"] += 1
-        # A stale v3 response must not suppress a potentially fresher legacy response.
-        if quote_is_fresh(v3, ist_now()):
-            return v3, expiry_label, days_left, lot
-    if legacy is None:
-        legacy = _nse_get_json(old_url)
-        _track_option_request(health, "legacy")
-    if isinstance(legacy, dict) and matching_rows(legacy, expiry_label):
-        if health is not None:
-            health["legacy_rows_received"] += 1
-        if quote_is_fresh(legacy, ist_now()):
-            return legacy, expiry_label, days_left, lot
-    # Keep a stale result for diagnostic counters, not for buyable paper contracts.
-    if isinstance(v3, dict) and matching_rows(v3, expiry_label):
-        return v3, expiry_label, days_left, lot
-    if isinstance(legacy, dict) and matching_rows(legacy, expiry_label):
-        return legacy, expiry_label, days_left, lot
-    if health is not None:
-        health["empty_expiry_rows"] += 1
-    return None
+        # Prefer soonest expiry, but never invent an alternative or its lot.
+        candidates = candidates[:2]
 
+    stale_candidate = None
+    for index, (selected, days_left, lot) in enumerate(candidates):
+        if health is not None:
+            health['expiry_matches'] += 1
+            health['expiry_attempts'] = health.get('expiry_attempts', 0) + 1
+            if index:
+                health['alternate_expiry_attempts'] = health.get('alternate_expiry_attempts', 0) + 1
+        url = ('https://www.nseindia.com/api/option-chain-v3?type=Equity&symbol=' + quoted +
+               '&expiry=' + urllib.parse.quote(selected, safe=''))
+        v3 = _nse_get_json(url)
+        _track_option_request(health, 'v3')
+        _option_payload_diagnostic(health, 'v3', name, selected, v3)
+        v3_rows = matching_rows(v3, selected)
+        if v3_rows:
+            if health is not None:
+                health['v3_rows_received'] += 1
+            if quote_is_fresh(v3, ist_now()):
+                return v3, selected, days_left, lot
+            if stale_candidate is None:
+                stale_candidate = (v3, selected, days_left, lot)
+
+        # If v3 failed or is stale, check legacy once and reuse it for another
+        # expiry; the legacy endpoint is not expiry-scoped.
+        if legacy is None:
+            legacy = _nse_get_json(old_url)
+            _track_option_request(health, 'legacy')
+        _option_payload_diagnostic(health, 'legacy', name, selected, legacy)
+        legacy_rows = matching_rows(legacy, selected)
+        if legacy_rows:
+            if health is not None:
+                health['legacy_rows_received'] += 1
+            if quote_is_fresh(legacy, ist_now()):
+                return legacy, selected, days_left, lot
+            if stale_candidate is None:
+                stale_candidate = (legacy, selected, days_left, lot)
+        # Honour NSE rate limiting; do not multiply requests after 429.
+        if health is not None and any(str(key).endswith(' 429')
+                                      for key in health.get('http_status_counts', {})):
+            break
+
+    if stale_candidate is not None:
+        return stale_candidate  # caller will refuse stale quote; counter stays honest
+    if health is not None:
+        health['empty_expiry_rows'] = health.get('empty_expiry_rows', 0) + 1
+    return None
 
 def get_nse_option_quote(symbol: str, expiry_dt: datetime, strike: float, side: str = "CE"):
     """Refresh the EXACT exchange CE/PE contract; no model-price substitutions."""

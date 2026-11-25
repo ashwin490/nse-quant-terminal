@@ -7,7 +7,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 
 from nse_option_chain import (expiry_labels, supported_expiries, matching_rows,
     nearby_strikes, exact_contract, quote_is_fresh, exchange_timestamp,
-    bid_ask, underlying_value, positive_number)
+    bid_ask, underlying_value, positive_number, option_payload_shape, parse_expiry_date)
 from quant_guardrails import review_long_option
 
 NOW = datetime(2026,11,23,13,15,0)
@@ -49,6 +49,35 @@ class NseChainTests(unittest.TestCase):
         p['records']['data'].append({'strikePrice':990,'expiryDate':'28-Jan-2027', 'CE':leg()})
         self.assertEqual(len(matching_rows(p,'29-Dec-2026')),7)
         self.assertEqual(matching_rows(p,'28-Jan-2027')[0]['strikePrice'],990)
+
+    def test_records_other_expiry_filtered_requested_expiry(self):
+        p = {'records': {'data': [{'strikePrice': 950, 'expiryDate': '26-Jan-2027',
+                                     'CE': leg(expiry='26-Jan-2027')}]},
+             'filtered': {'data': [{'strikePrice': 1000, 'expiryDate': '29-Dec-2026',
+                                     'PE': leg(expiry='29-Dec-2026')}]}}
+        result = matching_rows(p, '29-Dec-2026')
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]['strikePrice'], 1000)
+
+    def test_iso_format_expiry_still_must_exact_match(self):
+        self.assertEqual(parse_expiry_date('2026-12-29'), date(2026, 12, 29))
+        p = {'records': {'data': [{'strikePrice': 1000,
+                                    'expiryDate': '2026-12-29',
+                                    'CE': leg(expiry='29-Dec-2026')}]}}
+        self.assertEqual(len(matching_rows(p, '29-Dec-2026')), 1)
+        self.assertEqual(matching_rows(p, '26-Jan-2027'), [])
+        self.assertEqual(expiry_labels({'expiryDates': ['2026-12-29']}), ['29-Dec-2026'])
+
+    def test_http_200_error_envelope_not_a_chain(self):
+        shape, desc = option_payload_shape({'message': 'Symbol not available'}, '29-Dec-2026')
+        self.assertEqual(shape, 'unknown-shape')
+        self.assertNotIn('Symbol not available', desc)  # no raw response text
+        self.assertEqual(matching_rows({'message': 'Symbol not available'}, '29-Dec-2026'), [])
+
+    def test_response_shape_differentiates_empty_from_other_expiry(self):
+        self.assertEqual(option_payload_shape({'records': {'data': []}}, '29-Dec-2026')[0], 'empty')
+        self.assertEqual(option_payload_shape({'records': {'data': [
+            {'strikePrice': 1000, 'expiryDate': '26-Jan-2027'}]}}, '29-Dec-2026')[0], 'other-expiry')
 
     def test_filtered_v3_rows(self):
         p={'filtered':{'data':[{'strikePrice':1000,'CE':leg('CE'),'PE':leg('PE')}]}}

@@ -330,3 +330,22 @@ cloud option records, or guarantee a broker-like fill.
 ## 2026-11-23: Version 10.6 options scanner repair
 
 Version 10.6 includes `nse_option_chain.py`, which reads real NSE `option-chain-contract-info` expiry metadata and tries expiry-scoped `option-chain-v3` data before the older legacy endpoint. Both CE and PE are evaluated across up to seven eligible nearby strikes, using verified exchange bid/ask prices and current exchange timestamps. Existing option budget and guardrails remain active. Quotes are rechecked immediately before any new *paper-only* option journal entry. If the market-feed access, chain rows, quote timestamp, expiry-specific lot, or price/liquidity checks fail, a candidate is withheld rather than modelled as a tradable premium. See `UPDATE_V10_6.md` for all diagnostics and rollout limitations.
+
+
+## Version 10.7 option scan: expiry-row diagnostics
+
+If `contract-info` and `v3` both return HTTP 200, but `0` usable CE/PE
+contracts are displayed, expand the Scan quality section. Version 10.7
+distinguishes empty chain arrays, rows for a different expiry, unknown
+response structures, and missing timestamps. It tries **at most one additional
+exchange-listed, lot-verified expiry** when an earlier expiry has no
+confirmed fresh rows. It does not synthesise option quotes.
+
+The `4/5 trend conditions passed` message is a **rule-based gate**, not an
+ML option-premium prediction. The share ranker model is not an independently
+validated CE/PE model. Real options ML requires historical labelled
+contract-premium data and time-ordered out-of-sample evaluation.
+
+If all expiries have empty responses despite 200 statuses, code changes
+cannot reconstruct those missing quotes. Use a supported licensed market-data
+source rather than bypassing exchange controls.
