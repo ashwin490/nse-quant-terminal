@@ -208,14 +208,27 @@ def ensure_schema(db_path, backup_dir=None) -> dict:
             info["unpriced_active_shares"], info["unpriced_active_options"] = _unpriced_active(con)
             return info
         if existing:
-            # A plain copy is only valid AFTER checkpoint; refuse to migrate
-            # if a consistent pre-migration snapshot cannot be made.
+            # Windows refuses to copy a DuckDB file while this *same process*
+            # still owns a writable connection to it (WinError 32). First
+            # checkpoint, then close our connection before copying the file.
+            # If any other process has the DB open, the copy may still fail:
+            # treat that as a hard stop, never proceed without a backup.
             con.execute("CHECKPOINT")
+            con.close()
+            con = None
             backup_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
             backup = backup_dir / f"market_data.before_schema_v{SCHEMA_VERSION}.{stamp}.duckdb"
-            shutil.copy2(db_path, backup)
+            try:
+                shutil.copy2(db_path, backup)
+            except Exception:
+                # Do not leave a partial file that could be mistaken for a
+                # reliable backup. The original is unchanged at this point.
+                backup.unlink(missing_ok=True)
+                raise
             info["backup"] = str(backup)
+            # Reacquire DuckDB's writer lock before any migration statements.
+            con = duckdb.connect(str(db_path), read_only=False)
         original = {t: set(_columns(con, t)) for t in TABLE_COLUMNS if t in _tables(con)}
         con.execute("BEGIN TRANSACTION")
         try:
@@ -267,4 +280,5 @@ def ensure_schema(db_path, backup_dir=None) -> dict:
     except Exception as exc:
         raise SchemaMigrationError(f"Could not upgrade DuckDB schema (original retained): {exc}") from exc
     finally:
-        con.close()
+        if con is not None:
+            con.close()
