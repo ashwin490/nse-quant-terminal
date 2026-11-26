@@ -3995,7 +3995,7 @@ with st.sidebar:
                 '<span>NSE AI<br>Research Terminal</span></div>'
                 '<div class="ml-brand-caption">PREDICT · LEARN · REVIEW</div></div>', unsafe_allow_html=True)
     palette_choice = st.selectbox('Appearance', DARK_THEMES, index=0, key='dark_theme_selector')
-st.markdown(f'<style>{dark_theme_css(palette_choice)}\n{minimal_dark_css()}</style>', unsafe_allow_html=True)
+st.markdown(f'<style>{dark_theme_css(palette_choice)}\n{minimal_dark_css()}\n{lse_nse_css()}</style>', unsafe_allow_html=True)
 
 now_ist = ist_now()
 market_open = is_nse_market_open()
