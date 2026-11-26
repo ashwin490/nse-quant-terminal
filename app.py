@@ -47,7 +47,7 @@ st.set_page_config(
     page_title="NSE AI • Dark Research Terminal",
     page_icon="✦",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -3824,6 +3824,171 @@ def minimal_sidebar_panels(idea_lines: list[str], health: list[tuple[str,str,str
             '<p class="ml-side-sub">Data checks and autonomous learning</p>'
             f'{rows}<div class="ml-health-foot">{html.escape(str(footnote))}</div></div>')
 
+# -----------------------------------------------------------------------------
+# ALPHA-LSE-inspired daily research dashboard: presentation-only components.
+# This is deliberately implemented in app.py so the visual change deploys as a
+# single file. It does not modify the scanner, paper ledger, or AI worker.
+# -----------------------------------------------------------------------------
+def lse_nse_css() -> str:
+    return r"""
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    :root {--lx-bg:#111214;--lx-card:#1d1f23;--lx-border:#33373d;--lx-text:#f2f4f7;
+           --lx-sub:#aeb6c3;--lx-green:#60d9a2;--lx-red:#f57583;--lx-blue:#70b9f5;}
+    .stApp,[data-testid='stAppViewContainer']{background:var(--lx-bg) !important;color:var(--lx-text);}
+    html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif !important;}
+    .block-container{max-width:1430px;padding-top:1rem;padding-bottom:3rem;}
+    [data-testid='stSidebar']{background:#17181a;border-right:1px solid #33373d;}
+    .lx-hero{border:1px solid #343943;border-top:2px solid #537d69;border-radius:16px;
+       padding:20px 24px 18px;background:linear-gradient(113deg,#25283f 0%,#232e33 64%,#1c292b 100%);
+       margin:4px 0 12px;}
+    .lx-brand{font-size:clamp(21px,2vw,29px);font-weight:800;letter-spacing:-.035em;color:#eef3ff;line-height:1.18;}
+    .lx-brand .bolt{color:#8eb1ff;margin-right:9px;}
+    .lx-description{color:#b9c5d4;font-size:12px;margin:8px 0 10px;}
+    .lx-chips{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:12px;}
+    .lx-chip{border:1px solid #485064;color:#cad6e3;border-radius:999px;padding:5px 10px;font-size:10px;font-weight:650;background:#252b35;}
+    .lx-chip.live{color:#81e3ac;border-color:#355a48;background:#22362f;}
+    .lx-chip.warn{color:#ffdb8d;border-color:#735835;background:#382f24;}
+    .lx-brief{background:#1e2025;border:1px solid #393d46;border-radius:15px;padding:16px 19px;margin:12px 0 17px;color:#d8e0ea;line-height:1.6;font-size:13px;}
+    .lx-brief b{color:#f7f8fc;}.lx-brief-title{font-size:10px;font-weight:800;letter-spacing:.075em;color:#decfa5;margin-bottom:7px;}
+    .ml-stats{gap:12px;margin:8px 0 19px;}.ml-stat{min-height:98px;padding:14px 16px;border:1px solid var(--lx-border) !important;
+        background:#1c1d20 !important;border-radius:15px;position:relative;overflow:hidden;box-shadow:none;}
+    .ml-stat:before{content:'';height:3px;position:absolute;left:0;right:0;top:0;background:#5dd7a3;}
+    .ml-stat:nth-child(2):before{background:#68b9e6;}.ml-stat:nth-child(3):before{background:#8587e4;}
+    .ml-stat:nth-child(4):before{background:#b7a1e4;}
+    .ml-stat-icon{display:none;}.ml-stat-heading{font-size:10px;color:#bdc1c9;text-transform:uppercase;letter-spacing:.045em;}
+    .ml-stat-value{font-size:clamp(19px,1.8vw,26px);margin:9px 0 4px;color:#f6f7fa;}
+    .ml-stat-sub{font-size:10px;color:#a6a8b3;}
+    .stTabs [data-baseweb='tab-list']{gap:5px;border-bottom:1px solid #3b3e47;margin-top:4px;}
+    .stTabs button[role='tab'][aria-selected='true']{border-bottom-color:#e46b78 !important;color:#f7ecee !important;}
+    .stTabs button[role='tab']{padding:10px 12px !important;}
+    .lx-section{display:flex;align-items:center;gap:8px;margin:19px 0 10px;color:#f5f6fa;font-size:15px;font-weight:800;letter-spacing:-.015em;}
+    .lx-bar{display:inline-block;width:3px;height:21px;border-radius:4px;background:#6d9ff9;}
+    .lx-side-count{color:#a5b1bf;font-size:11px;font-weight:500;margin-left:5px;}
+    .lx-positions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
+    .lx-position{background:#1c1d20;border:1px solid #383b42;border-radius:13px;padding:12px 13px;min-width:0;}
+    .lx-position:hover,.lx-pick:hover{border-color:#617082;}
+    .lx-position-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;}
+    .lx-ticker{font-size:13px;font-weight:800;color:#eef3fa;overflow-wrap:anywhere;}
+    .lx-percent{font-size:12px;font-weight:800;white-space:nowrap;}.lx-positive{color:var(--lx-green);}.lx-negative{color:var(--lx-red);}.lx-unknown{color:#e3c384;}
+    .lx-sub{font-size:10px;color:#aab2bd;margin:5px 0 8px;overflow-wrap:anywhere;}
+    .lx-prices{display:flex;gap:9px;flex-wrap:wrap;color:#c4cdda;font-size:10px;line-height:1.6;}
+    .lx-prices span b{color:#e2e9f4;font-weight:650;}
+    .lx-pick{border:1px solid #373b44;border-radius:13px;background:#1d1f23;padding:12px 13px;margin:8px 0;}
+    .lx-pick-top{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;}
+    .lx-pill{font-size:9px;font-weight:800;border-radius:6px;padding:4px 8px;background:#214536;color:#a1f2c9;white-space:nowrap;}
+    .lx-pill.watch{background:#263a58;color:#abd5ff;}.lx-pill.avoid{background:#5b3039;color:#ffc5c9;}
+    .lx-pick-prices{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:11px 0 8px;}
+    .lx-pick-value{font-size:13px;font-weight:750;color:#edf2f8;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
+    .lx-pick-value.up{color:#76e3b5;}.lx-pick-value.down{color:#f78b94;}
+    .lx-mini-label{display:block;color:#a8b1be;font-size:10px;margin-bottom:4px;}
+    .lx-pick-bottom{font-size:10px;color:#acb7c6;display:flex;gap:10px;align-items:center;justify-content:space-between;}
+    .lx-empty{font-size:12px;border:1px dashed #4c5059;border-radius:12px;padding:16px;color:#adb8c8;background:#191b1e;}
+    [data-testid='stExpander']{background:#191b1f;border:1px solid #353a44;border-radius:10px;}
+    [data-testid='stAlert']{border-radius:11px;padding:9px 13px;}
+    [data-testid='stDataFrame']{border-color:#444a54;}
+    .stButton>button[kind='primary']{background:#426a55 !important;color:white !important;border-color:#53866c !important;}
+    @media(max-width:960px){.lx-positions{grid-template-columns:1fr;}}
+    @media(max-width:740px){.lx-hero{padding:15px 16px;}.lx-positions{grid-template-columns:repeat(2,minmax(0,1fr));}}
+    @media(max-width:490px){.lx-positions{grid-template-columns:1fr;}.lx-pick-value{font-size:11px;}.block-container{padding:1rem .7rem 2rem;}}
+    """
+
+
+def lse_nse_hero(stamp: str, is_open: bool) -> str:
+    state = '🟢 NSE market OPEN' if is_open else '🌙 NSE market CLOSED'
+    status_cls = 'live' if is_open else 'warn'
+    escape = lambda v: html.escape(str(v), quote=True)
+    return (
+        '<header class="lx-hero"><div class="lx-brand"><span class="bolt">✦</span>NSE AI · Market Intelligence</div>'
+        '<div class="lx-description">Indian shares · Calls &amp; puts · Evidence-based forecasts · Automated research</div>'
+        '<div class="lx-chips"><span class="lx-chip">◉ PAPER ACCOUNT</span>'
+        f'<span class="lx-chip {status_cls}">{escape(state)}</span>'
+        '<span class="lx-chip">☁ Autonomous daily learner</span>'
+        '<span class="lx-chip">🔒 No broker orders</span>'
+        f'<span class="lx-chip">Last checked {escape(stamp)} IST</span></div></header>'
+    )
+
+
+def lse_briefing(*, is_open: bool, open_count: int, open_details: str,
+                 pnl_text: str, pnl_partial: bool, idea_count: int,
+                 option_count: int, learning_state: str) -> str:
+    safe = lambda v: html.escape(str(v), quote=True)
+    market = 'open' if is_open else 'closed'
+    pnl_clause = ('is incomplete because some current prices are unavailable' if pnl_partial else 'uses the last saved paper marks')
+    return (
+        '<section class="lx-brief"><div class="lx-brief-title">☀ YOUR DAILY BRIEFING · NSE PAPER RESEARCH</div>'
+        f'The NSE is <b>{market}</b>. Your ledger currently shows <b>{int(open_count)} open positions</b> '
+        f'({safe(open_details)}); estimated open paper P/L is <b>{safe(pnl_text)}</b> and {pnl_clause}. '
+        f'Your latest saved scan has <b>{int(idea_count)} CONSIDER share ideas</b> and '
+        f'<b>{int(option_count)} CONSIDER CE/PE contracts</b>. '
+        f'Independent daily learning: <b>{safe(learning_state)}</b>. '
+        'Signals are research only, not verified future returns.</section>'
+    )
+
+
+def _lse_finite(value):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def lse_open_cards(shares: pd.DataFrame, options: pd.DataFrame, *, limit: int = 8) -> str:
+    """Read-only position tiles; never infer quote prices, P/L or closed outcomes."""
+    cards = []
+    esc_ui = lambda val: html.escape(str(val), quote=True)
+    if isinstance(shares, pd.DataFrame) and not shares.empty and 'status' in shares.columns:
+        selected = shares.loc[shares['status'].map(lambda x: classify_outcome(x)=='ACTIVE')]
+        for row in selected.to_dict('records'):
+            ticker = str(row.get('ticker') or 'Unknown stock')
+            last = _lse_finite(row.get('latest_price'))
+            pct = _lse_finite(row.get('pnl_pct')) if last and last > 0 else None
+            tone = 'lx-positive' if pct is not None and pct > 0 else 'lx-negative' if pct is not None and pct < 0 else 'lx-unknown'
+            pct_text = f'{pct:+.2f}%' if pct is not None else 'Quote unverified'
+            entry, target, stop = [short_money(row.get(k)) for k in ('entry_price','target_price','stop_loss')]
+            cards.append((ticker, f'Last {short_money(last) if last else "unverified"} · {int(_lse_finite(row.get("shares")) or 0)} shares',
+                          pct_text,tone,entry,target,stop))
+    if isinstance(options,pd.DataFrame) and not options.empty and 'status' in options.columns:
+        selected=options.loc[options['status'].map(lambda x: classify_outcome(x)=='ACTIVE')]
+        for row in selected.to_dict('records'):
+            ticker=str(row.get('option_contract') or 'CE/PE contract')
+            last=_lse_finite(row.get('current_option_price'))
+            pct=_lse_finite(row.get('pnl_pct')) if last and last>0 else None
+            tone='lx-positive' if pct is not None and pct>0 else 'lx-negative' if pct is not None and pct<0 else 'lx-unknown'
+            pct_text=f'{pct:+.2f}%' if pct is not None else 'Quote unverified'
+            entry,target,stop=[short_money(row.get(k)) for k in ('entry_premium','target_premium','stop_loss_premium')]
+            cards.append((ticker,'CE/PE paper contract · premium marks',pct_text,tone,entry,target,stop))
+    if not cards:
+        return '<div class="lx-empty">No open paper positions recorded; new positions appear here only after verified entry.</div>'
+    parts=[]
+    for ticker,subtitle,pct,tone,entry,target,stop in cards[:max(1,int(limit))]:
+        parts.append('<article class="lx-position"><div class="lx-position-top">'
+                     f'<span class="lx-ticker">{esc_ui(ticker)}</span><span class="lx-percent {tone}">{esc_ui(pct)}</span></div>'
+                     f'<div class="lx-sub">{esc_ui(subtitle)}</div><div class="lx-prices">'
+                     f'<span>Entry <b>{esc_ui(entry)}</b></span><span>Target <b>{esc_ui(target)}</b></span>'
+                     f'<span>Stop <b>{esc_ui(stop)}</b></span></div></article>')
+    return '<div class="lx-positions">'+''.join(parts)+'</div>'
+
+
+def lse_pick_card(name: str, decision: str, sector: str, entry: str, target: str,
+                  stop: str, timeline: str, *, ev=None) -> str:
+    esc_ui = lambda v: html.escape(str(v),quote=True)
+    tone=str(decision).lower() if str(decision).upper() in ('WATCH','AVOID') else ''
+    ev_number=_lse_finite(ev)
+    ev_note=f'Modelled EV {ev_number:+.2f}% · ' if ev_number is not None else ''
+    return (
+        '<article class="lx-pick"><div class="lx-pick-top">'
+        f'<div><span class="lx-ticker">{esc_ui(name)}</span><div class="lx-sub">{esc_ui(sector)}</div></div>'
+        f'<span class="lx-pill {tone}">{esc_ui(decision)}</span></div>'
+        '<div class="lx-pick-prices">'
+        f'<div><span class="lx-mini-label">Entry</span><span class="lx-pick-value">{esc_ui(entry)}</span></div>'
+        f'<div><span class="lx-mini-label">Target</span><span class="lx-pick-value up">{esc_ui(target)}</span></div>'
+        f'<div><span class="lx-mini-label">Stop-loss</span><span class="lx-pick-value down">{esc_ui(stop)}</span></div>'
+        '</div><div class="lx-pick-bottom">'
+        f'<span>◷ {esc_ui(timeline)}</span><span>{esc_ui(ev_note.rstrip(" · "))}</span></div></article>'
+    )
+
+
 # Streamlit styles: always use a vetted dark palette, and native base="dark".
 with st.sidebar:
     st.markdown('<div class="ml-brand"><div class="ml-brand-name"><span class="ml-brand-icon">↗</span>'
@@ -3861,7 +4026,7 @@ with st.sidebar:
 if auto_refresh and st_autorefresh:
     st_autorefresh(interval=int(refresh_mins)*60*1000, key='dark_session_refresh')
 
-st.markdown(minimal_hero(now_ist.strftime('%d %b %Y · %H:%M'), market_open),unsafe_allow_html=True)
+st.markdown(lse_nse_hero(now_ist.strftime('%d %b %Y · %H:%M'), market_open),unsafe_allow_html=True)
 
 # Render three views only; never create additional top-level tabs with verbose tables.
 # Expensive scans run at most once each refresh interval per browser session.
@@ -4007,7 +4172,7 @@ if independent_research['configured']:
 else:
     st.caption('🧠 Independent background learning: unavailable. Add SUPABASE_AI_READ_KEY to Streamlit Secrets for private-table access, or check the NSE project/key and worker logs. Existing research remains unchanged.')
 
-page_preds, page_learning, page_ledger = st.tabs(['✦ Predictions','🧠 AI Learning','📒 Trade Ledger'])
+page_preds, page_learning, page_ledger = st.tabs(['☀️ Today’s predictions','🧠 Learning progress','📒 Trade ledger'])
 
 with page_preds:
     if not market_open:
@@ -4063,14 +4228,31 @@ with page_preds:
     if not opt_view.empty and keyword.strip():
         opt_view = opt_view[opt_view['Stock'].astype(str).str.contains(re.escape(keyword.strip()),case=False,na=False)]
 
-    st.caption(f"{len(stock_view)} shares · {len(opt_view)} options matching filters · "
-               f"Stocks {st.session_state.get('last_stock_scan','not scanned')} · "
-               f"Options {st.session_state.get('last_options_scan','not scanned')}")
-    main_predictions, right_insights = st.columns([3.15, 1.2], gap="large")
+    st.caption(f"Latest scans · Shares {st.session_state.get('last_stock_scan','not scanned')} · "
+               f"CE/PE {st.session_state.get('last_options_scan','not scanned')} · "
+               f"{len(stock_view)} stocks / {len(opt_view)} option contracts match filters")
+    stock_consider_total = (int((share_results['Decision']=='CONSIDER').sum())
+                            if not share_results.empty else 0)
+    option_consider_total = (int((option_results['Decision']=='CONSIDER').sum())
+                             if not option_results.empty else 0)
+    learning_status = (worker_status(independent_research.get('run')).get('label','Unknown')
+                       if independent_research['configured'] else 'Not connected')
+    st.markdown(lse_briefing(is_open=market_open,open_count=open_summary['open_total'],
+        open_details=option_details,pnl_text=pnl_value,pnl_partial=bool(open_summary['missing_count']),
+        idea_count=stock_consider_total,option_count=option_consider_total,
+        learning_state=learning_status),unsafe_allow_html=True)
+    positions_panel, main_predictions = st.columns([1.0,1.12],gap='medium')
+    with positions_panel:
+        st.markdown(f'<div class="lx-section"><span class="lx-bar"></span>🟢 Your positions'
+                    f'<span class="lx-side-count">{open_summary["open_total"]} open · saved marks</span></div>',
+                    unsafe_allow_html=True)
+        st.markdown(lse_open_cards(journal_eq,journal_opt),unsafe_allow_html=True)
+        if open_summary['open_total']>8:
+            st.caption(f'Showing 8 of {open_summary["open_total"]} open records; see Trade ledger for all.')
+        st.caption('Open paper P/L and last prices are estimates; a missing or stale option quote is never treated as a fill.')
     with main_predictions:
-        st.markdown('<div class="ml-panel-title"><div><h2>AI Predictions</h2>'
-                    '<p>Stock, call and put ideas · Entry, target, stop-loss and estimated time</p></div>'
-                    f'<span class="ml-count">{len(stock_view)} stocks · {len(opt_view)} options</span></div>',
+        st.markdown('<div class="lx-section"><span class="lx-bar"></span>🎯 Today’s predictions'
+                    f'<span class="lx-side-count">{len(stock_view)} stocks · {len(opt_view)} options</span></div>',
                     unsafe_allow_html=True)
         shown_stocks = stock_view.head(5) if not stock_view.empty else pd.DataFrame()
         for _, r in shown_stocks.iterrows():
@@ -4081,8 +4263,9 @@ with page_preds:
                         if estimate.trials else 'Not enough validated historical windows')
             action = ('Qualifies for research, but new paper entries are paused by portfolio constraints.'
                       if r['Decision']=='CONSIDER' and not cap['ok'] else str(r.get('Rejection Reason') or 'Research filters passed'))
-            st.markdown(minimal_prediction_row(ticker,str(r['Decision']),str(r['Sector']),
-                short_money(entry),short_money(target),short_money(stop),estimate.label),unsafe_allow_html=True)
+            st.markdown(lse_pick_card(ticker,str(r['Decision']),str(r['Sector']),
+                short_money(entry),short_money(target),short_money(stop),estimate.label,
+                ev=r.get('Expected value')),unsafe_allow_html=True)
             with st.expander(f'Details · {ticker}',expanded=False):
                 st.caption(action)
                 st.caption(subtitle)
@@ -4103,7 +4286,7 @@ with page_preds:
             premium = float(r['Buy premium (₹)'])
             stop = premium * OPTION_STOP_MULT
             target = premium * OPTION_TARGET_MULT
-            st.markdown(minimal_prediction_row(f"{r['Stock']} · {kind}",str(r['Decision']),
+            st.markdown(lse_pick_card(f"{r['Stock']} · {kind}",str(r['Decision']),
                 f"Strike {short_money(r['Strike (₹)'])} · expiry {r['Expiry']}",
                 short_money(premium),short_money(target),short_money(stop),
                 f"{r['Days left']} days to expiry"),unsafe_allow_html=True)
@@ -4146,7 +4329,7 @@ with page_preds:
                         'The latest close can gap before next entry. Missing CE/PE quotes are unaffected.'),
                         unsafe_allow_html=True)
 
-    with right_insights:
+    with st.expander('📡 AI insights & system health', expanded=False):
         stock_consider = int((share_results['Decision']=='CONSIDER').sum()) if not share_results.empty else 0
         option_consider = int((option_results['Decision']=='CONSIDER').sum()) if not option_results.empty else 0
         checked = st.session_state.get('option_scan_health') or {}
