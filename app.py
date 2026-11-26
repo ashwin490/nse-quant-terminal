@@ -19,6 +19,7 @@ from nse_option_chain import (expiry_labels, supported_expiries, matching_rows, 
     exact_contract, bid_ask, quote_is_fresh, underlying_value, exchange_timestamp)
 from reconciliation_policy import preserve_local_row, closed_record_conflict
 from nse_ai_dashboard import worker_status, valid_forecasts
+from nse_ai_private_reader import private_research_snapshot, PrivateResearchReadError
 from datetime import datetime, time as dtime, timedelta
 import random
 import shutil
@@ -3801,6 +3802,21 @@ if not ANNOUNCEMENTS_AVAILABLE:
 # the original dashboard and paper monitoring still work as before.
 @st.cache_data(ttl=240, show_spinner=False)
 def read_independent_nse_research() -> dict:
+    # Prefer isolated server-side credentials for the private autonomous tables.
+    # Keep the ordinary ledger client on SUPABASE_KEY unchanged.
+    private_key = _secret('SUPABASE_AI_READ_KEY')
+    if private_key:
+        try:
+            snapshot = private_research_snapshot(_secret('SUPABASE_URL'), private_key)
+            all_rows = snapshot['forecasts']
+            last_date = str(all_rows[0].get('forecast_for','')) if all_rows else None
+            fresh = [r for r in all_rows if str(r.get('forecast_for')) == last_date]
+            champion = snapshot['champion']
+            return {"configured": True, "champion": champion,
+                    "run": snapshot['run'],
+                    "forecasts": valid_forecasts(fresh, champion.get('model_id'), max_cards=5)}
+        except PrivateResearchReadError:
+            return {"configured": False, "forecasts": [], "champion": {}, "run": {}}
     if not supabase:
         return {"configured": False, "forecasts": [], "champion": {}, "run": {}}
     try:
@@ -3830,7 +3846,7 @@ if independent_research['configured']:
     if background_health['state'] in ('STALE','FAILED'):
         st.warning('Scheduled daily learning is stale or failed. Check GitHub Actions and Supabase worker-run history; do not assume forecasts have refreshed.')
 else:
-    st.caption('🧠 Independent background learning: not configured or private database tables unavailable. Existing research remains unchanged.')
+    st.caption('🧠 Independent background learning: unavailable. Add SUPABASE_AI_READ_KEY to Streamlit Secrets for private-table access, or check the NSE project/key and worker logs. Existing research remains unchanged.')
 
 page_preds, page_learning, page_ledger = st.tabs(['✦ Predictions','🧠 AI Learning','📒 Trade Ledger'])
 
