@@ -47,7 +47,7 @@ st.set_page_config(
     page_title="NSE AI • Dark Research Terminal",
     page_icon="✦",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -3667,16 +3667,175 @@ def render_history_recovery() -> None:
         st.caption('Streamlit Cloud local files are not permanent. Store a backup externally and verify cloud sync before relying on unattended paper research.')
 
 
+# -----------------------------------------------------------------------------
+# Minimal dark workspace · presentation only (all values escaped)
+# No changes to trading rules, database operations, scan schedules or ML models.
+# -----------------------------------------------------------------------------
+def minimal_dark_css() -> str:
+    return r"""
+    :root {--ml-bg:#0b1019;--ml-panel:#171e2a;--ml-panel2:#1c2532;--ml-border:#2d3949;
+           --ml-copy:#edf3f9;--ml-muted:#99aabc;--ml-green:#72e6af;--ml-red:#ff969e;}
+    html,body,.stApp,[data-testid='stAppViewContainer'] {font-family:'DM Sans',system-ui,sans-serif;}
+    .stApp{background:radial-gradient(ellipse 50% 34% at 96% 0%,rgba(107,89,181,.11),transparent 80%),
+      radial-gradient(ellipse 38% 33% at 2% 93%,rgba(31,143,122,.06),transparent 85%),var(--ml-bg);}
+    .block-container {max-width:1600px;padding:1.15rem clamp(1.0rem,2.6vw,2.7rem) 3rem;}
+    [data-testid='stSidebar']{background:#0c121d;border-right:1px solid #263143;}
+    [data-testid='stSidebar'] [data-testid='stVerticalBlock'] {gap:.7rem;}
+    .ml-brand{padding:12px 4px 16px;border-bottom:1px solid #263345;margin-bottom:8px;}
+    .ml-brand-name{display:flex;align-items:center;gap:11px;font:750 19px 'Outfit',sans-serif;color:#f4f8ff;line-height:1.18;}
+    .ml-brand-icon{display:grid;place-items:center;width:39px;height:39px;background:linear-gradient(145deg,#194b3e,#17342e);
+        color:#8af5c5;border-radius:11px;font-size:24px;}
+    .ml-brand-caption{color:#8399b4;font-size:11px;margin:12px 0 0 1px;letter-spacing:.06em;}
+    .ml-hero{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:5px 0 17px;}
+    .ml-hero h1{font:750 clamp(26px,2.7vw,38px)/1.16 'Outfit','DM Sans',sans-serif;color:#f7f9ff;letter-spacing:-.035em;margin:0;}
+    .ml-sub{font-size:13px;color:#a1b2c7;margin:4px 0 0;}
+    .ml-meta{display:flex;align-items:center;flex-wrap:wrap;justify-content:flex-end;gap:10px;color:#b6c6d8;font-size:12px;}
+    .ml-market{color:#7aeeb4;font-weight:750;display:inline-flex;align-items:center;gap:6px;}
+    .ml-market.closed{color:#d3b6ef;}.ml-dot{width:7px;height:7px;border-radius:99px;background:currentColor;display:inline-block;}
+    .ml-divider{height:15px;width:1px;background:#344051;}
+    .ml-paper{background:#172233;border:1px solid #344258;color:#aec0d6;border-radius:99px;padding:5px 9px;font-size:11px;}
+    .ml-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:6px 0 19px;}
+    .ml-stat{border:1px solid var(--ml-border);border-radius:16px;background:linear-gradient(135deg,#1a2230,#161d29);
+        padding:16px 18px;min-width:0;min-height:110px;box-shadow:0 8px 28px rgba(0,0,0,.11);}
+    .ml-stat-heading{display:flex;align-items:center;gap:9px;color:#b5c5d7;font-size:12px;font-weight:650;}
+    .ml-stat-icon{width:27px;height:27px;display:grid;place-items:center;background:#273547;border-radius:9px;color:#9fbde2;font-size:15px;}
+    .ml-stat:nth-child(2) .ml-stat-icon{color:var(--ml-green);background:#183c33;}
+    .ml-stat-value{color:#f4f8ff;font:750 clamp(21px,2.25vw,28px) 'Outfit',sans-serif;line-height:1.25;
+        margin:8px 0 5px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
+    .ml-stat-value.gain{color:var(--ml-green);}.ml-stat-value.loss{color:var(--ml-red);}
+    .ml-stat-sub{font-size:11px;color:#92a6bc;line-height:1.4;}
+    .stTabs [data-baseweb='tab-list']{background:transparent;border:none;border-bottom:1px solid #344051;border-radius:0;
+        padding:0;gap:15px;min-height:48px;margin-top:2px;}
+    .stTabs button[role='tab'],.stTabs [data-baseweb='tab']{background:transparent !important;box-shadow:none !important;
+        color:#a4b6cb !important;border:0 !important;border-bottom:2px solid transparent !important;
+        border-radius:0 !important;padding:10px 12px !important;min-height:45px;}
+    .stTabs button[role='tab'] p{font-size:13px !important;font-weight:650 !important;}
+    .stTabs button[role='tab'][aria-selected='true']{color:#e5fff2 !important;border-bottom:2px solid #78e7b2 !important;}
+    .ml-panel-title{margin:14px 0 12px;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:10px;}
+    .ml-panel-title h2{font:750 23px 'Outfit',sans-serif;letter-spacing:-.025em;margin:0;color:#f7f9ff;}
+    .ml-panel-title p{font-size:12px;color:#96aac0;margin:2px 0 0;}
+    .ml-count{font-size:11px;color:#acbfd2;background:#17263a;border:1px solid #344057;padding:6px 10px;border-radius:99px;}
+    .ml-row{border:1px solid #313e50;border-radius:13px;background:linear-gradient(120deg,#1c2531,#171f2b);
+        padding:14px 14px;display:grid;grid-template-columns:minmax(122px,1.48fr) minmax(73px,.75fr)
+        repeat(3,minmax(75px,.86fr)) minmax(93px,1.1fr);gap:10px;align-items:center;
+        margin:8px 0;transition:border-color .18s,transform .18s,box-shadow .18s;}
+    .ml-row:hover{border-color:#52627b;transform:translateY(-1px);box-shadow:0 10px 25px rgba(0,0,0,.15);}
+    .ml-ticker{font:750 15px 'Outfit',sans-serif;color:#f4f8ff;overflow-wrap:anywhere;}
+    .ml-ticker-meta{font-size:10px;color:#93a8be;margin-top:3px;overflow-wrap:anywhere;line-height:1.4;}
+    .ml-symbol{display:flex;align-items:center;gap:11px;min-width:0;}
+    .ml-monogram{flex:0 0 34px;height:34px;width:34px;background:#213649;border-radius:50%;border:1px solid #36506a;
+        color:#8edccf;display:grid;place-items:center;font-size:14px;font-weight:800;}
+    .ml-col small{font-size:10px;color:#8ea1b9;display:block;margin-bottom:4px;}
+    .ml-col strong{font-size:13px;font-weight:750;color:#e5edf8;word-wrap:anywhere;font-variant-numeric:tabular-nums;}
+    .ml-col strong.target{color:#7cecb8;}.ml-col strong.stop{color:#ffa0a7;}
+    .ml-pill{display:inline-block;font-size:9px;letter-spacing:.035em;font-weight:800;padding:5px 9px;
+        border-radius:99px;background:#1a4838;color:#90f3c2;white-space:nowrap;}
+    .ml-pill.watch{background:#273c58;color:#afd0fa;}.ml-pill.avoid{background:#522e38;color:#ffb5bd;}
+    .ml-side-panel{border:1px solid #314054;border-radius:16px;background:linear-gradient(138deg,#1b2631,#141c29);
+        padding:19px 18px;margin:14px 0;box-shadow:0 10px 30px rgba(0,0,0,.10);}
+    .ml-side-panel h3{font:750 18px 'Outfit',sans-serif;color:#eff8ff;margin:0 0 3px;}
+    .ml-side-panel .ml-side-sub{font-size:11px;color:#98abc0;margin:0 0 12px;}
+    .ml-insight-item{display:flex;gap:9px;padding:12px 0;border-top:1px solid #2d3a4c;color:#d0deeb;
+        font-size:12px;line-height:1.5;}
+    .ml-insight-dot{margin-top:6px;background:#74e8b0;height:7px;width:7px;border-radius:50%;flex:0 0 7px;}
+    .ml-health-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-top:1px solid #2d3a4c;
+        font-size:11px;color:#afc1d6;}
+    .ml-health-pill{font-size:10px;white-space:nowrap;color:#e6d39a;background:#443923;padding:5px 8px;border-radius:99px;}
+    .ml-health-pill.good{color:#92f2bf;background:#194537;}.ml-health-pill.bad{color:#ffb4b9;background:#522a36;}
+    .ml-health-foot{font-size:10px;color:#899bb2;margin-top:12px;line-height:1.5;}
+    .dash-header{margin-top:17px;}.dash-header h3{font-size:20px;}
+    .learning-tiles{grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:12px;}
+    .learning-tile{background:linear-gradient(135deg,#192433,#121c29);border-color:#344155;}
+    [data-testid='stExpander'],[data-testid='stDataFrame']{border-color:#354357;}
+    [data-testid='stAlert']{padding:9px 12px;border-radius:12px;}
+    .stButton>button[kind='primary']{background:#1e573f;color:#e7fff1;border:1px solid #347b58;box-shadow:none;}
+    .stButton>button[kind='primary']:hover{background:#246a4d;}
+    @media (max-width:1170px){.ml-stats{grid-template-columns:repeat(2,minmax(0,1fr));}
+        .ml-row{grid-template-columns:minmax(135px,1.4fr) repeat(3,minmax(78px,1fr));}
+        .ml-symbol{grid-column:1 / -1;}.ml-meta{justify-content:flex-start;}}
+    @media (max-width:730px){.ml-stats{gap:8px;}.ml-stat{min-height:102px;padding:12px;}
+        .ml-row{grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;padding:14px;}
+        .ml-symbol{grid-column:1/-1;}.ml-hero h1{font-size:26px;}.ml-meta{font-size:10px;}
+        .ml-panel-title h2{font-size:21px;}.block-container{padding:1rem .85rem 2.5rem;}}
+    @media(max-width:430px){.ml-stat-value{font-size:20px;}.ml-market{white-space:nowrap;}}
+    """
+
+
+def minimal_hero(stamp: str, is_open: bool) -> str:
+    market = 'NSE Open' if is_open else 'NSE Closed'
+    css = '' if is_open else ' closed'
+    return (
+        '<div class="ml-hero"><div><h1>NSE AI Research Terminal</h1>'
+        '<div class="ml-sub">Sharper signals. Less noise. · Stocks, CE &amp; PE research</div></div>'
+        '<div class="ml-meta">'
+        f'<span class="ml-market{css}"><i class="ml-dot"></i>{html.escape(market)}</span>'
+        '<i class="ml-divider"></i>'
+        f'<span>{html.escape(str(stamp))} IST</span>'
+        '<span class="ml-paper">Paper trading only</span></div></div>'
+    )
+
+
+def minimal_stats(items: list[tuple[str,str,str]]) -> str:
+    icons = ('▣','↗','▱','◫')
+    parts=[]
+    for i, (label, value, description) in enumerate(items):
+        pnl_tone = (' gain' if i==1 and str(value).startswith('+') else
+                    ' loss' if i==1 and (str(value).startswith('-') or str(value).startswith('−') or '₹-' in str(value)) else '')
+        parts.append(
+            f'<div class="ml-stat"><div class="ml-stat-heading">'
+            f'<span class="ml-stat-icon">{icons[i%len(icons)]}</span>{html.escape(str(label))}</div>'
+            f'<div class="ml-stat-value{pnl_tone}">{html.escape(str(value))}</div>'
+            f'<div class="ml-stat-sub">{html.escape(str(description))}</div></div>'
+        )
+    return '<div class="ml-stats">'+''.join(parts)+'</div>'
+
+
+def minimal_prediction_row(name: str, decision: str, description: str,
+                           entry: str, target: str, stop: str, timeline: str) -> str:
+    tone = str(decision).lower() if decision in ('WATCH','AVOID') else 'consider'
+    # Never interpolate unescaped ticker names, NSE-derived fields or exchange values.
+    esc_ui = lambda v: html.escape(str(v),quote=True)
+    symbol_icon = (name.split(' · ')[0][:1] or '•').upper()
+    cells=[('Signal',f'<span class="ml-pill {tone}">{esc_ui(decision)}</span>'),
+           ('Entry',f'<strong>{esc_ui(entry)}</strong>'),
+           ('Target',f'<strong class="target">{esc_ui(target)}</strong>'),
+           ('Stop-loss',f'<strong class="stop">{esc_ui(stop)}</strong>'),
+           ('Timeline',f'<strong>{esc_ui(timeline)}</strong>')]
+    return (
+        f'<article class="ml-row"><div class="ml-symbol">'
+        f'<span class="ml-monogram">{esc_ui(symbol_icon)}</span><div>'
+        f'<div class="ml-ticker">{esc_ui(name)}</div><div class="ml-ticker-meta">{esc_ui(description)}</div></div></div>'
+        +''.join(f'<div class="ml-col"><small>{esc_ui(label)}</small>{value}</div>' for label,value in cells)
+        +'</article>'
+    )
+
+
+def minimal_sidebar_panels(idea_lines: list[str], health: list[tuple[str,str,str]],
+                            footnote: str) -> str:
+    bullet = ''.join('<div class="ml-insight-item"><span class="ml-insight-dot"></span><span>'
+                     +html.escape(str(x))+'</span></div>' for x in idea_lines[:4])
+    states={'good','warn','bad'}
+    rows=''.join(f'<div class="ml-health-row"><span>{html.escape(str(label))}</span>'
+                 f'<span class="ml-health-pill {tone if tone in states else "warn"}">{html.escape(str(value))}</span></div>'
+                 for label,value,tone in health)
+    return ('<div class="ml-side-panel"><h3>✧ AI Insights</h3>'
+            '<p class="ml-side-sub">What the current research actually shows</p>'
+            f'{bullet}</div><div class="ml-side-panel"><h3>⌁ System health</h3>'
+            '<p class="ml-side-sub">Data checks and autonomous learning</p>'
+            f'{rows}<div class="ml-health-foot">{html.escape(str(footnote))}</div></div>')
+
 # Streamlit styles: always use a vetted dark palette, and native base="dark".
 with st.sidebar:
-    palette_choice = st.selectbox('🌌 Dark colour theme', DARK_THEMES, index=0, key='dark_theme_selector')
-st.markdown(f'<style>{dark_theme_css(palette_choice)}</style>', unsafe_allow_html=True)
+    st.markdown('<div class="ml-brand"><div class="ml-brand-name"><span class="ml-brand-icon">↗</span>'
+                '<span>NSE AI<br>Research Terminal</span></div>'
+                '<div class="ml-brand-caption">PREDICT · LEARN · REVIEW</div></div>', unsafe_allow_html=True)
+    palette_choice = st.selectbox('Appearance', DARK_THEMES, index=0, key='dark_theme_selector')
+st.markdown(f'<style>{dark_theme_css(palette_choice)}\n{minimal_dark_css()}</style>', unsafe_allow_html=True)
 
 now_ist = ist_now()
 market_open = is_nse_market_open()
 with st.sidebar:
-    st.markdown('### ✦ Research terminal')
-    st.caption('Three views · No charts · Paper only')
+    st.caption('SESSION CONTROLS')
     auto_refresh = st.toggle('Auto-scan during NSE hours', value=True, key='dark_auto_scan')
     refresh_mins = st.selectbox('Refresh interval', [15,30,60], index=0,
         format_func=lambda v:f'{v} minutes', key='dark_refresh_minutes')
@@ -3702,7 +3861,7 @@ with st.sidebar:
 if auto_refresh and st_autorefresh:
     st_autorefresh(interval=int(refresh_mins)*60*1000, key='dark_session_refresh')
 
-st.markdown(dark_hero(now_ist.strftime('%d %b %Y · %H:%M'), market_open),unsafe_allow_html=True)
+st.markdown(minimal_hero(now_ist.strftime('%d %b %Y · %H:%M'), market_open),unsafe_allow_html=True)
 
 # Render three views only; never create additional top-level tabs with verbose tables.
 # Expensive scans run at most once each refresh interval per browser session.
@@ -3773,7 +3932,7 @@ elif open_summary['open_total'] == 0:
 else:
     pnl_value = ('+' if open_summary['paper_pnl_inr'] > 0 else '-' if open_summary['paper_pnl_inr'] < 0 else '') + short_money(abs(open_summary['paper_pnl_inr']), 0)
     pnl_note = 'Last recorded paper marks · unrealised, not live fills'
-st.markdown(dark_stats([
+st.markdown(minimal_stats([
     ('Open positions',str(open_summary['open_total']),option_details),
     ('Open paper P/L',pnl_value,pnl_note),
     ('Allocated',short_money(used,0),'Across all active shares, CE and PE'),
@@ -3851,35 +4010,36 @@ else:
 page_preds, page_learning, page_ledger = st.tabs(['✦ Predictions','🧠 AI Learning','📒 Trade Ledger'])
 
 with page_preds:
-    st.markdown(dark_header('Predictions','One simple view · Stocks + Calls + Puts'),unsafe_allow_html=True)
-    a,b,c = st.columns([1,1,1])
-    with a:
-        if st.button('🔍 Scan stocks',key='dark_scan_stocks',width="stretch"):
-            st.session_state['dark_force_shares'] = True
-            st.rerun()
-    with b:
-        if st.button('🎯 Scan CE / PE',key='dark_scan_options',width="stretch"):
-            st.session_state['dark_force_options'] = True
-            st.rerun()
-    with c:
-        if st.button('↻ Refresh everything',type='primary',key='dark_scan_all',width="stretch"):
-            st.session_state['dark_force_all'] = True
-            st.session_state['dark_force_audit'] = True
-            st.rerun()
     if not market_open:
-        st.markdown(dark_note('NSE is closed: research prices may be old, and real buyable option quotes cannot be confirmed. No new automatic entries outside market hours.'),unsafe_allow_html=True)
+        st.markdown(dark_note('NSE is closed: reference prices may be stale; new paper entries are paused.'),unsafe_allow_html=True)
     if st.session_state.get('dark_stock_error'):
         st.warning('Last share scan failed: '+str(st.session_state['dark_stock_error']))
     if st.session_state.get('dark_options_error'):
         st.warning('Last options scan failed: '+str(st.session_state['dark_options_error']))
-    p1,p2,p3 = st.columns([1.15,1.1,1])
+    p1,p2,p3 = st.columns([1.55, 1.0, 1.45],gap="small")
     with p1:
         product_filter = st.segmented_control('Market', ['All','Stocks','Calls (CE)','Puts (PE)'], default='All', key='dark_product_filter')
     with p2:
-        decision_filter = st.selectbox('Research signal', ['CONSIDER','ALL','WATCH','AVOID'], key='dark_decision_filter')
+        decision_filter = st.selectbox('Signal', ['CONSIDER','ALL','WATCH','AVOID'], key='dark_decision_filter')
     with p3:
-        horizon = st.selectbox('Stock timing study', [3,5,7], index=1, format_func=lambda x:f'{x} trading sessions', key='dark_horizon')
-    keyword = st.text_input('Find a share or contract',placeholder='Search symbol or sector…', key='dark_prediction_search')
+        keyword = st.text_input('Search',placeholder='Symbol or sector…', key='dark_prediction_search')
+    with st.expander('⚙️ Scan controls and timing', expanded=False):
+        a,b,c = st.columns([1,1,1])
+        with a:
+            if st.button('🔍 Scan stocks',key='dark_scan_stocks',width="stretch"):
+                st.session_state['dark_force_shares'] = True
+                st.rerun()
+        with b:
+            if st.button('🎯 Scan CE / PE',key='dark_scan_options',width="stretch"):
+                st.session_state['dark_force_options'] = True
+                st.rerun()
+        with c:
+            if st.button('↻ Refresh everything',type='primary',key='dark_scan_all',width="stretch"):
+                st.session_state['dark_force_all'] = True
+                st.session_state['dark_force_audit'] = True
+                st.rerun()
+        horizon = st.selectbox('Stock timing study', [3,5,7], index=1,
+                               format_func=lambda x:f'{x} trading sessions', key='dark_horizon')
 
     stock_view = (share_results.copy() if not share_results.empty else pd.DataFrame())
     if not stock_view.empty and product_filter not in ('All','Stocks'):
@@ -3906,85 +4066,115 @@ with page_preds:
     st.caption(f"{len(stock_view)} shares · {len(opt_view)} options matching filters · "
                f"Stocks {st.session_state.get('last_stock_scan','not scanned')} · "
                f"Options {st.session_state.get('last_options_scan','not scanned')}")
-    shown_stocks = stock_view.head(5) if not stock_view.empty else pd.DataFrame()
-    for _, r in shown_stocks.iterrows():
-        ticker = str(r['Ticker'])
-        entry,target,stop = float(r['Price (₹)']),float(r['Target (₹)']),float(r['Stop Loss (₹)'])
-        estimate = stock_timeline(ticker, entry,target,stop,horizon)
-        subtitle = (f"{estimate.target_hits}/{estimate.trials} historical windows hit target first"
-                    if estimate.trials else 'Not enough validated historical windows')
-        action = ('Qualifies for research, but new paper entries are paused by portfolio constraints.'
-                  if r['Decision']=='CONSIDER' and not cap['ok'] else str(r.get('Rejection Reason') or 'Research filters passed'))
-        st.markdown(dark_card(ticker,str(r['Decision']),str(r['Sector']),[
-            ('Entry / reference',short_money(entry)),
-            ('Target · estimated',short_money(target)),
-            ('Stop-loss · risk',short_money(stop)),
-            ('Return to target',f"{(target/entry-1)*100:+.1f}%")],
-            action,
-            f"Target timeline: {estimate.label}", subtitle),unsafe_allow_html=True)
-        with st.expander(f'Why {ticker}? · timeline and risk details',expanded=False):
-            st.write(f"Current study: **{horizon} trading sessions**. {estimate.note}")
-            st.write(f"Historical target-first frequency: **{f'{estimate.target_rate_pct:.1f}%' if estimate.target_rate_pct is not None else 'Unavailable'}**. "
-                     'This is not a validated AI win probability.')
-            st.write('Model score:',f"{_num(r.get('Adjusted Score')):.1f}",
-                     '· Expected value after modelled costs:',f"{_num(r.get('Expected value')):+.2f}%")
-            st.caption('Entry and stop prices may gap past their levels; slippage and fees affect realised outcomes. The app currently exits stock ideas after 7 CALENDAR days, which may be shorter than a 7-session study.')
-    if product_filter in ('All','Stocks') and stock_view.empty:
-        st.info('No stocks match this filter. Run the stock scan to refresh research; a missing idea is not a buy signal.')
-    if len(stock_view)>len(shown_stocks):
-        st.caption(f'Showing the first {len(shown_stocks)} ranked shares of {len(stock_view)}. Narrow your search or open the table below.')
-
-    shown_options = opt_view.head(4) if not opt_view.empty else pd.DataFrame()
-    for _, r in shown_options.iterrows():
-        kind = str(r['Type'])
-        premium = float(r['Buy premium (₹)'])
-        stop = premium * OPTION_STOP_MULT
-        target = premium * OPTION_TARGET_MULT
-        st.markdown(dark_card(f"{r['Stock']} · {kind}",str(r['Decision']),
-            f"Strike {short_money(r['Strike (₹)'])} · expires {r['Expiry']}",[
-            ('Entry premium · ask',short_money(premium)),
-            ('Target premium · rule',short_money(target)),
-            ('Stop premium · rule',short_money(stop)),
-            ('Premium / lot at risk',short_money(r['Cost (₹)'],0))],
-            str(r['Why']),
-            f"{r['Days left']} calendar days to expiry",
-            'No validated day-to-target forecast for this option premium.'),unsafe_allow_html=True)
-        with st.expander(f'Contract details · {r["Stock"]} {kind}',expanded=False):
-            st.write(f"Bid {short_money(r['Sell premium (₹)'])} · Ask {short_money(premium)} · "
-                     f"Lot {int(r['Lot'])} · Spread {_num(r['Spread (%)']):.1f}% · "
-                     f"Open interest {int(r['Open interest']):,}")
-            st.write(f"Spot break-even at expiry: **{short_money(r['Breakeven at expiry (₹)'])}**. "
-                     f"Maximum long-option premium risk: **{short_money(r['Maximum premium loss (₹)'])}**.")
-            st.caption('Premium target/stop are research exit guidelines, not guaranteed executions. Long stock options may have physical settlement obligations; review broker and expiry rules.')
-    if product_filter in ('All','Calls (CE)','Puts (PE)') and opt_view.empty:
-        if not option_results.empty and decision_filter == 'CONSIDER':
-            held = option_results if product_filter == 'All' else option_results[option_results['Type']==('CE' if product_filter=='Calls (CE)' else 'PE')]
-            st.info(f'No CE/PE contracts passed the CONSIDER rules. {len(held)} quoted contracts have ' 
-                    'WATCH/AVOID outcomes; select Research signal → ALL to inspect the reasons. ' 
-                    'No theoretical option premium is shown as an exchange quote.')
-        else:
-            st.info('No verified CE/PE contracts for the current filters. The app will not present a theoretical option premium as a tradable quote.')
-    if st.session_state.get('opt_note'):
-        st.caption('CE/PE paper entry: ' + str(st.session_state['opt_note']))
-
-    if product_filter in ('All','Stocks') and independent_research['forecasts']:
-        with st.expander('🧠 Background AI daily share forecasts · time-tested research', expanded=False):
-            st.caption('These are separate EOD research forecasts from a time-tested model, NOT live execution quotes. '
-                       'Their probabilities are model estimates, not guaranteed or proven live calibration. '
-                       'They do not replace the original stock ranker or automatically open paper positions.')
-            for auto in independent_research['forecasts']:
-                entry, target, stop = float(auto['entry_price']),float(auto['target_price']),float(auto['stop_loss'])
-                model_score = float(auto['target_first_probability'])*100
-                st.markdown(dark_card(str(auto['ticker']), str(auto['decision']),
-                    f"Daily ML as of {auto['forecast_for']} · model {str(auto['model_id'])[:20]}", [
-                    ('EOD entry reference', short_money(entry)),
-                    ('Target · historical model', short_money(target)),
-                    ('Stop-loss · risk', short_money(stop)),
-                    ('Target-first estimate', f'{model_score:.1f}%')],
-                    f"Conservative modelled value {float(auto['conservative_ev_pct']):+.2f}% after assumed costs",
-                    f"Horizon {auto['horizon_sessions']} sessions · target history: {auto['time_estimate']}",
-                    'The latest close can gap before next entry. Missing CE/PE quotes are unaffected.'),
+    main_predictions, right_insights = st.columns([3.15, 1.2], gap="large")
+    with main_predictions:
+        st.markdown('<div class="ml-panel-title"><div><h2>AI Predictions</h2>'
+                    '<p>Stock, call and put ideas · Entry, target, stop-loss and estimated time</p></div>'
+                    f'<span class="ml-count">{len(stock_view)} stocks · {len(opt_view)} options</span></div>',
                     unsafe_allow_html=True)
+        shown_stocks = stock_view.head(5) if not stock_view.empty else pd.DataFrame()
+        for _, r in shown_stocks.iterrows():
+            ticker = str(r['Ticker'])
+            entry,target,stop = float(r['Price (₹)']),float(r['Target (₹)']),float(r['Stop Loss (₹)'])
+            estimate = stock_timeline(ticker, entry,target,stop,horizon)
+            subtitle = (f"{estimate.target_hits}/{estimate.trials} historical windows hit target first"
+                        if estimate.trials else 'Not enough validated historical windows')
+            action = ('Qualifies for research, but new paper entries are paused by portfolio constraints.'
+                      if r['Decision']=='CONSIDER' and not cap['ok'] else str(r.get('Rejection Reason') or 'Research filters passed'))
+            st.markdown(minimal_prediction_row(ticker,str(r['Decision']),str(r['Sector']),
+                short_money(entry),short_money(target),short_money(stop),estimate.label),unsafe_allow_html=True)
+            with st.expander(f'Details · {ticker}',expanded=False):
+                st.caption(action)
+                st.caption(subtitle)
+                st.write(f"Current study: **{horizon} trading sessions**. {estimate.note}")
+                st.write(f"Historical target-first frequency: **{f'{estimate.target_rate_pct:.1f}%' if estimate.target_rate_pct is not None else 'Unavailable'}**. "
+                         'This is not a validated AI win probability.')
+                st.write('Model score:',f"{_num(r.get('Adjusted Score')):.1f}",
+                         '· Expected value after modelled costs:',f"{_num(r.get('Expected value')):+.2f}%")
+                st.caption('Entry and stop prices may gap past their levels; slippage and fees affect realised outcomes. The app currently exits stock ideas after 7 CALENDAR days, which may be shorter than a 7-session study.')
+        if product_filter in ('All','Stocks') and stock_view.empty:
+            st.info('No stocks match this filter. Run the stock scan to refresh research; a missing idea is not a buy signal.')
+        if len(stock_view)>len(shown_stocks):
+            st.caption(f'Showing the first {len(shown_stocks)} ranked shares of {len(stock_view)}. Narrow your search or open the table below.')
+
+        shown_options = opt_view.head(4) if not opt_view.empty else pd.DataFrame()
+        for _, r in shown_options.iterrows():
+            kind = str(r['Type'])
+            premium = float(r['Buy premium (₹)'])
+            stop = premium * OPTION_STOP_MULT
+            target = premium * OPTION_TARGET_MULT
+            st.markdown(minimal_prediction_row(f"{r['Stock']} · {kind}",str(r['Decision']),
+                f"Strike {short_money(r['Strike (₹)'])} · expiry {r['Expiry']}",
+                short_money(premium),short_money(target),short_money(stop),
+                f"{r['Days left']} days to expiry"),unsafe_allow_html=True)
+            with st.expander(f'Contract details · {r["Stock"]} {kind}',expanded=False):
+                st.caption(str(r["Why"]))
+                st.caption("No validated day-to-target forecast for this option premium.")
+                st.write(f"Bid {short_money(r['Sell premium (₹)'])} · Ask {short_money(premium)} · "
+                         f"Lot {int(r['Lot'])} · Spread {_num(r['Spread (%)']):.1f}% · "
+                         f"Open interest {int(r['Open interest']):,}")
+                st.write(f"Spot break-even at expiry: **{short_money(r['Breakeven at expiry (₹)'])}**. "
+                         f"Maximum long-option premium risk: **{short_money(r['Maximum premium loss (₹)'])}**.")
+                st.caption('Premium target/stop are research exit guidelines, not guaranteed executions. Long stock options may have physical settlement obligations; review broker and expiry rules.')
+        if product_filter in ('All','Calls (CE)','Puts (PE)') and opt_view.empty:
+            if not option_results.empty and decision_filter == 'CONSIDER':
+                held = option_results if product_filter == 'All' else option_results[option_results['Type']==('CE' if product_filter=='Calls (CE)' else 'PE')]
+                st.info(f'No CE/PE contracts passed the CONSIDER rules. {len(held)} quoted contracts have ' 
+                        'WATCH/AVOID outcomes; select Research signal → ALL to inspect the reasons. ' 
+                        'No theoretical option premium is shown as an exchange quote.')
+            else:
+                st.info('No verified CE/PE contracts for the current filters. The app will not present a theoretical option premium as a tradable quote.')
+        if st.session_state.get('opt_note'):
+            st.caption('CE/PE paper entry: ' + str(st.session_state['opt_note']))
+
+        if product_filter in ('All','Stocks') and independent_research['forecasts']:
+            with st.expander('🧠 Background AI daily share forecasts · time-tested research', expanded=False):
+                st.caption('These are separate EOD research forecasts from a time-tested model, NOT live execution quotes. '
+                           'Their probabilities are model estimates, not guaranteed or proven live calibration. '
+                           'They do not replace the original stock ranker or automatically open paper positions.')
+                for auto in independent_research['forecasts']:
+                    entry, target, stop = float(auto['entry_price']),float(auto['target_price']),float(auto['stop_loss'])
+                    model_score = float(auto['target_first_probability'])*100
+                    st.markdown(dark_card(str(auto['ticker']), str(auto['decision']),
+                        f"Daily ML as of {auto['forecast_for']} · model {str(auto['model_id'])[:20]}", [
+                        ('EOD entry reference', short_money(entry)),
+                        ('Target · historical model', short_money(target)),
+                        ('Stop-loss · risk', short_money(stop)),
+                        ('Target-first estimate', f'{model_score:.1f}%')],
+                        f"Conservative modelled value {float(auto['conservative_ev_pct']):+.2f}% after assumed costs",
+                        f"Horizon {auto['horizon_sessions']} sessions · target history: {auto['time_estimate']}",
+                        'The latest close can gap before next entry. Missing CE/PE quotes are unaffected.'),
+                        unsafe_allow_html=True)
+
+    with right_insights:
+        stock_consider = int((share_results['Decision']=='CONSIDER').sum()) if not share_results.empty else 0
+        option_consider = int((option_results['Decision']=='CONSIDER').sum()) if not option_results.empty else 0
+        checked = st.session_state.get('option_scan_health') or {}
+        background = worker_status(independent_research.get('run')) if independent_research['configured'] else {'state':'NOT_CONFIGURED','label':'Not configured'}
+        insights = [
+            f'{stock_consider} stock research ideas meet current CONSIDER checks; filings may remain unverified.',
+            (f'{option_consider} CE/PE contracts meet the current research checks.' if option_consider else
+             'No validated CE/PE CONSIDER quote is available; no premium prediction is invented.'),
+            (f'{cap["open"]} of {MAX_OPEN_POSITIONS} share slots occupied; new share entries are paused.' if cap['fresh_slot_limit_reached'] else
+             f'{cap["open"]} of {MAX_OPEN_POSITIONS} share slots occupied; risk limits still apply.'),
+            ('Stock timing windows come from historical paths, not guaranteed target dates.'),
+        ]
+        option_valid_quotes = int(checked.get('valid_quotes',0) or checked.get('valid_bid_ask',0) or 0)
+        health = [
+            ('Daily learner',str(background.get('label') or background['state']),
+                'good' if background['state']=='HEALTHY' else 'bad' if background['state'] in ('FAILED','STALE') else 'warn'),
+            ('Saved history','Verified' if integrity['verified_count'] else 'Recovery needed',
+                'good' if integrity['verified_count'] else 'bad'),
+            ('CE/PE quote checks','Quotes reviewed' if option_valid_quotes or len(option_results)>0 else 'Unverified',
+                'good' if option_valid_quotes or len(option_results)>0 else 'warn'),
+            ('Minute candles','Incomplete' if st.session_state.get('intraday_feed_problem') else 'No gaps flagged',
+                'warn' if st.session_state.get('intraday_feed_problem') else 'good'),
+            ('Corporate filings','Unavailable' if not ANNOUNCEMENTS_AVAILABLE else 'Module available',
+                'warn' if not ANNOUNCEMENTS_AVAILABLE else 'good'),
+        ]
+        st.markdown(minimal_sidebar_panels(insights,health,
+            'These labels report app checks, not verified prediction accuracy, an exchange service guarantee, or brokerage execution.'),
+            unsafe_allow_html=True)
 
     with st.expander('🩺 Scan quality / full candidate list'):
         if not share_results.empty:
@@ -4016,7 +4206,7 @@ with page_learning:
                    f"held-out Brier {stats.get('brier','?')} (lower is better). "
                    "This uses newly labelled daily market history, separately from your trade journal.")
     else:
-        st.caption('Independent daily market learner: no challenger has passed promotion checks yet, or the worker is not configured.')
+        st.caption('Independent daily market learner: no promoted challenger yet.' if independent_research['configured'] else 'Independent daily market learner is not configured or cannot be read.')
     st.markdown(dark_header('AI Learning — one trade at a time',
         'Individual results, observations and tests the model could learn from · no graphs'),
         unsafe_allow_html=True)
