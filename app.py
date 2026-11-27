@@ -3830,81 +3830,125 @@ def minimal_sidebar_panels(idea_lines: list[str], health: list[tuple[str,str,str
 # single file. It does not modify the scanner, paper ledger, or AI worker.
 # -----------------------------------------------------------------------------
 def lse_nse_css() -> str:
+    """Match the UK ALPHA-LSE cards, typography, tabs and compact spacing."""
     return r"""
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
     :root {--lx-bg:#111214;--lx-card:#1d1f23;--lx-border:#33373d;--lx-text:#f2f4f7;
-           --lx-sub:#aeb6c3;--lx-green:#60d9a2;--lx-red:#f57583;--lx-blue:#70b9f5;}
-    .stApp,[data-testid='stAppViewContainer']{background:var(--lx-bg) !important;color:var(--lx-text);}
-    html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif !important;}
-    .block-container{max-width:1430px;padding-top:1rem;padding-bottom:3rem;}
-    [data-testid='stSidebar']{background:#17181a;border-right:1px solid #33373d;}
-    .lx-hero{border:1px solid #343943;border-top:2px solid #537d69;border-radius:16px;
-       padding:20px 24px 18px;background:linear-gradient(113deg,#25283f 0%,#232e33 64%,#1c292b 100%);
-       margin:4px 0 12px;}
-    .lx-brand{font-size:clamp(21px,2vw,29px);font-weight:800;letter-spacing:-.035em;color:#eef3ff;line-height:1.18;}
-    .lx-brand .bolt{color:#8eb1ff;margin-right:9px;}
-    .lx-description{color:#b9c5d4;font-size:12px;margin:8px 0 10px;}
+           --lx-sub:#aeb6c3;--lx-green:#5dd4a4;--lx-red:#ed7079;--lx-blue:#6db6ec;}
+    html,body,.stApp{font-family:'Inter',system-ui,-apple-system,sans-serif!important;}
+    .stApp,[data-testid='stAppViewContainer']{background:#111214!important;color:#eaeef3!important;}
+    .block-container{padding-top:1.15rem;padding-bottom:2.6rem;max-width:1380px;}
+    footer{visibility:hidden;}
+    [data-testid='stSidebar']{background:#17181b!important;border-right:1px solid #303238;}
+    .lx-hero{border:1px solid #363a45;border-radius:20px;padding:19px 22px;
+       background:linear-gradient(112deg,rgba(99,102,241,.22),rgba(6,182,212,.13),rgba(40,66,58,.22));
+       background-size:200% 200%;margin:3px 0 12px;}
+    .lx-brand{font-size:clamp(21px,2.3vw,31px);font-weight:800;letter-spacing:-.038em;
+       color:#f4f5ff;line-height:1.23;}
+    .lx-brand .bolt{color:#9baaff;margin-right:8px;}
+    .lx-description{color:#c0c8d5;font-size:12px;margin:7px 0 4px;}
     .lx-chips{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:12px;}
-    .lx-chip{border:1px solid #485064;color:#cad6e3;border-radius:999px;padding:5px 10px;font-size:10px;font-weight:650;background:#252b35;}
-    .lx-chip.live{color:#81e3ac;border-color:#355a48;background:#22362f;}
-    .lx-chip.warn{color:#ffdb8d;border-color:#735835;background:#382f24;}
-    .lx-brief{background:#1e2025;border:1px solid #393d46;border-radius:15px;padding:16px 19px;margin:12px 0 17px;color:#d8e0ea;line-height:1.6;font-size:13px;}
-    .lx-brief b{color:#f7f8fc;}.lx-brief-title{font-size:10px;font-weight:800;letter-spacing:.075em;color:#decfa5;margin-bottom:7px;}
-    .ml-stats{gap:12px;margin:8px 0 19px;}.ml-stat{min-height:98px;padding:14px 16px;border:1px solid var(--lx-border) !important;
-        background:#1c1d20 !important;border-radius:15px;position:relative;overflow:hidden;box-shadow:none;}
-    .ml-stat:before{content:'';height:3px;position:absolute;left:0;right:0;top:0;background:#5dd7a3;}
-    .ml-stat:nth-child(2):before{background:#68b9e6;}.ml-stat:nth-child(3):before{background:#8587e4;}
-    .ml-stat:nth-child(4):before{background:#b7a1e4;}
-    .ml-stat-icon{display:none;}.ml-stat-heading{font-size:10px;color:#bdc1c9;text-transform:uppercase;letter-spacing:.045em;}
-    .ml-stat-value{font-size:clamp(19px,1.8vw,26px);margin:9px 0 4px;color:#f6f7fa;}
-    .ml-stat-sub{font-size:10px;color:#a6a8b3;}
-    .stTabs [data-baseweb='tab-list']{gap:5px;border-bottom:1px solid #3b3e47;margin-top:4px;}
-    .stTabs button[role='tab'][aria-selected='true']{border-bottom-color:#e46b78 !important;color:#f7ecee !important;}
-    .stTabs button[role='tab']{padding:10px 12px !important;}
-    .lx-section{display:flex;align-items:center;gap:8px;margin:19px 0 10px;color:#f5f6fa;font-size:15px;font-weight:800;letter-spacing:-.015em;}
-    .lx-bar{display:inline-block;width:3px;height:21px;border-radius:4px;background:#6d9ff9;}
-    .lx-side-count{color:#a5b1bf;font-size:11px;font-weight:500;margin-left:5px;}
-    .lx-positions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;}
-    .lx-position{background:#1c1d20;border:1px solid #383b42;border-radius:13px;padding:12px 13px;min-width:0;}
-    .lx-position:hover,.lx-pick:hover{border-color:#617082;}
-    .lx-position-top{display:flex;justify-content:space-between;align-items:baseline;gap:8px;}
-    .lx-ticker{font-size:13px;font-weight:800;color:#eef3fa;overflow-wrap:anywhere;}
-    .lx-percent{font-size:12px;font-weight:800;white-space:nowrap;}.lx-positive{color:var(--lx-green);}.lx-negative{color:var(--lx-red);}.lx-unknown{color:#e3c384;}
-    .lx-sub{font-size:10px;color:#aab2bd;margin:5px 0 8px;overflow-wrap:anywhere;}
-    .lx-prices{display:flex;gap:9px;flex-wrap:wrap;color:#c4cdda;font-size:10px;line-height:1.6;}
+    .lx-chip{border:1px solid #40444f;color:#cbd5e2;border-radius:999px;padding:5px 10px;
+       font-size:10px;font-weight:650;background:rgba(125,135,153,.11);}
+    .lx-chip.live{color:#88e5b9;border-color:#35664f;background:rgba(21,101,66,.19);}
+    .lx-chip.warn{color:#f7cc85;border-color:#775f38;background:rgba(111,86,39,.20);}
+    .lx-chip.bad{color:#f9afb7;border-color:#80414b;background:rgba(132,53,61,.20);}
+    .lx-guide [data-testid='stExpander']{border-radius:10px!important;}
+    .stTabs [data-baseweb='tab-list']{gap:8px!important;flex-wrap:wrap!important;
+       border-bottom:1px solid #343840!important;padding:0!important;margin:5px 0 13px!important;
+       background:transparent!important;min-height:39px!important;}
+    .stTabs button[role='tab'],.stTabs [data-baseweb='tab']{
+       background:transparent!important;border-radius:9px 9px 0 0!important;
+       color:#b5b7c1!important;border:0!important;border-bottom:2px solid transparent!important;
+       height:auto!important;min-height:37px!important;padding:8px 11px!important;box-shadow:none!important;}
+    .stTabs button[role='tab'] p,.stTabs [data-baseweb='tab'] p{
+       font-family:'Inter',sans-serif!important;font-size:12px!important;font-weight:650!important;}
+    .stTabs button[role='tab'][aria-selected='true']{
+       color:#ffd6d9!important;border-bottom:2px solid #ed6c7d!important;background:rgba(237,108,125,.07)!important;}
+    .lx-brief{background:linear-gradient(115deg,#1c1f28,#1a2129);border:1px solid #393f4b;
+       border-radius:17px;padding:17px 20px;margin:5px 0 13px;
+       color:#d7dfe8;line-height:1.68;font-size:13px;}
+    .lx-brief b{color:#f5f7fb;}.lx-brief-title{font-size:10px;font-weight:800;
+       letter-spacing:.075em;color:#e8c6ac;margin-bottom:7px;}
+    .ml-stats{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;
+       gap:12px!important;margin:8px 0 17px!important;}
+    .ml-stat{min-height:102px!important;padding:16px 17px!important;border:1px solid #363a42!important;
+       background:#1d1e22!important;border-radius:17px!important;position:relative!important;
+       overflow:hidden!important;box-shadow:none!important;}
+    .ml-stat:before{content:'';height:3px;position:absolute;left:0;right:0;top:0;background:#63ce95;}
+    .ml-stat:nth-child(2):before{background:#69b4e8;}.ml-stat:nth-child(3):before{background:#dba65d;}
+    .ml-stat:nth-child(4):before{background:#8987e9;}
+    .ml-stat-icon{display:none!important;}.ml-stat-heading{color:#b9bdc7!important;font-size:10px!important;
+       letter-spacing:.065em!important;text-transform:uppercase!important;font-weight:700!important;}
+    .ml-stat-value{font-family:'Inter',sans-serif!important;font-size:clamp(19px,2vw,27px)!important;
+       line-height:1.15!important;font-weight:800!important;color:#f5f7fc!important;margin:10px 0 5px!important;}
+    .ml-stat-value.gain{color:#6ce1ac!important;}.ml-stat-value.loss{color:#f48d95!important;}
+    .ml-stat-sub{font-size:10px!important;line-height:1.5!important;color:#aab1bd!important;}
+    .lx-section{display:flex;align-items:center;gap:8px;margin:21px 0 11px;color:#f1f3f8;
+       font-size:14px;font-weight:800;letter-spacing:-.01em;}
+    .lx-bar{display:inline-block;width:3px;height:20px;border-radius:4px;background:#73a7ec;}
+    .lx-side-count{color:#a5abb7;font-size:11px;font-weight:500;margin-left:4px;}
+    .lx-positions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;}
+    .lx-position,.lx-pick{background:#1d1e22;border:1px solid #383c43;border-radius:14px;
+       padding:12px 13px;min-width:0;transition:border-color .16s ease;}
+    .lx-position:hover,.lx-pick:hover{border-color:#73747e;}
+    .lx-position-top,.lx-pick-top{display:flex;justify-content:space-between;align-items:center;gap:8px;}
+    .lx-ticker{font-size:12px;font-weight:800;color:#eef3fa;overflow-wrap:anywhere;}
+    .lx-percent{font-size:12px;font-weight:800;white-space:nowrap;}
+    .lx-positive{color:#67daa4;}.lx-negative{color:#f17c86;}.lx-unknown{color:#e9c482;}
+    .lx-sub{font-size:10px;color:#a9b1be;margin:5px 0 9px;overflow-wrap:anywhere;}
+    .lx-rail{height:7px;margin:9px 1px 6px;border-radius:999px;
+       background:linear-gradient(90deg,rgba(233,84,95,.72),rgba(229,179,80,.50),rgba(56,172,112,.72));position:relative;}
+    .lx-dot{position:absolute;top:-4px;height:15px;width:15px;border-radius:50%;background:white;
+       border:3px solid #727bef;box-shadow:0 1px 6px rgba(0,0,0,.4);transform:translateX(-50%);}
+    .lx-prices{display:flex;gap:6px 11px;flex-wrap:wrap;color:#c4cdda;font-size:10px;line-height:1.6;}
     .lx-prices span b{color:#e2e9f4;font-weight:650;}
-    .lx-pick{border:1px solid #373b44;border-radius:13px;background:#1d1f23;padding:12px 13px;margin:8px 0;}
-    .lx-pick-top{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;}
-    .lx-pill{font-size:9px;font-weight:800;border-radius:6px;padding:4px 8px;background:#214536;color:#a1f2c9;white-space:nowrap;}
-    .lx-pill.watch{background:#263a58;color:#abd5ff;}.lx-pill.avoid{background:#5b3039;color:#ffc5c9;}
-    .lx-pick-prices{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:11px 0 8px;}
-    .lx-pick-value{font-size:13px;font-weight:750;color:#edf2f8;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;}
+    .lx-pick{margin:0 0 9px;}.lx-pill{font-size:9px;font-weight:800;border-radius:6px;
+       padding:4px 7px;background:#204532;color:#9aeabd;white-space:nowrap;}
+    .lx-pill.watch{background:#283b58;color:#b3d7ff;}.lx-pill.avoid{background:#57323a;color:#ffd0d3;}
+    .lx-pick-prices{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:10px 0 8px;}
+    .lx-pick-value{font-size:12px;font-weight:750;color:#edf2f8;overflow-wrap:anywhere;font-variant-numeric:tabular-nums;}
     .lx-pick-value.up{color:#76e3b5;}.lx-pick-value.down{color:#f78b94;}
-    .lx-mini-label{display:block;color:#a8b1be;font-size:10px;margin-bottom:4px;}
-    .lx-pick-bottom{font-size:10px;color:#acb7c6;display:flex;gap:10px;align-items:center;justify-content:space-between;}
-    .lx-empty{font-size:12px;border:1px dashed #4c5059;border-radius:12px;padding:16px;color:#adb8c8;background:#191b1e;}
-    [data-testid='stExpander']{background:#191b1f;border:1px solid #353a44;border-radius:10px;}
+    .lx-mini-label{display:block;color:#a8b1be;font-size:10px;margin-bottom:3px;}
+    .lx-pick-bottom{font-size:10px;color:#acb7c6;display:flex;gap:9px;align-items:center;
+       justify-content:space-between;flex-wrap:wrap;}
+    .lx-empty{font-size:12px;border:1px dashed #4b4e56;border-radius:12px;
+       padding:14px;color:#b4bbc7;background:#191b1f;}
+    .lx-foot{font-size:10px;color:#9299a5;margin:11px 0 20px;}
+    .lx-learning-status{border:1px solid #3b4249;background:linear-gradient(120deg,rgba(91,100,148,.16),rgba(28,69,58,.17));
+       border-radius:16px;padding:18px 20px;margin:10px 0 16px;color:#d9e2ed;font-size:13px;line-height:1.65;}
+    .lx-learning-status strong{color:#f2f5f9;}
+    .lx-learn-step{display:grid;grid-template-columns:28px minmax(0,1fr);gap:9px;margin:10px 0;}
+    .lx-learn-step b{color:#d8e0f1;}.lx-learn-step span{color:#aab4c4;}
+    .lx-tiny-note{font-size:11px;color:#9da8b6;line-height:1.55;}
+    [data-testid='stExpander']{background:#191b1f;border:1px solid #34383f;border-radius:10px;}
     [data-testid='stAlert']{border-radius:11px;padding:9px 13px;}
     [data-testid='stDataFrame']{border-color:#444a54;}
-    .stButton>button[kind='primary']{background:#426a55 !important;color:white !important;border-color:#53866c !important;}
-    @media(max-width:960px){.lx-positions{grid-template-columns:1fr;}}
-    @media(max-width:740px){.lx-hero{padding:15px 16px;}.lx-positions{grid-template-columns:repeat(2,minmax(0,1fr));}}
-    @media(max-width:490px){.lx-positions{grid-template-columns:1fr;}.lx-pick-value{font-size:11px;}.block-container{padding:1rem .7rem 2rem;}}
+    .stButton>button[kind='primary']{background:#c05265!important;color:white!important;
+       border:1px solid #db7585!important;}
+    .stButton>button[kind='primary']:hover{background:#d15e72!important;}
+    @media(max-width:990px){.ml-stats{grid-template-columns:repeat(2,minmax(0,1fr))!important;}
+       .lx-positions{grid-template-columns:repeat(2,minmax(0,1fr));}}
+    @media(max-width:640px){.lx-hero{padding:16px;}.lx-positions{grid-template-columns:1fr;}
+       .ml-stats{gap:8px!important;}.ml-stat{min-height:92px!important;padding:12px!important;}}
+    @media(max-width:390px){.ml-stat-value{font-size:18px!important;}}
     """
 
 
 def lse_nse_hero(stamp: str, is_open: bool) -> str:
+    """UK ALPHA-LSE-style compact market hero: one banner, factual chips."""
+    esc_ui = lambda v: html.escape(str(v), quote=True)
     state = '🟢 NSE market OPEN' if is_open else '🌙 NSE market CLOSED'
-    status_cls = 'live' if is_open else 'warn'
-    escape = lambda v: html.escape(str(v), quote=True)
+    status_class = 'live' if is_open else 'warn'
     return (
-        '<header class="lx-hero"><div class="lx-brand"><span class="bolt">✦</span>NSE AI · Market Intelligence</div>'
-        '<div class="lx-description">Indian shares · Calls &amp; puts · Evidence-based forecasts · Automated research</div>'
+        '<header class="lx-hero"><div class="lx-brand"><span class="bolt">✦</span>'
+        'NSE AI · Market Intelligence</div>'
+        '<div class="lx-description">Indian shares · Calls &amp; puts · Research performance · Automated learning</div>'
         '<div class="lx-chips"><span class="lx-chip">◉ PAPER ACCOUNT</span>'
-        f'<span class="lx-chip {status_cls}">{escape(state)}</span>'
-        '<span class="lx-chip">☁ Autonomous daily learner</span>'
+        f'<span class="lx-chip {status_class}">{esc_ui(state)}</span>'
+        '<span class="lx-chip">☁ Autonomous market learner</span>'
         '<span class="lx-chip">🔒 No broker orders</span>'
-        f'<span class="lx-chip">Last checked {escape(stamp)} IST</span></div></header>'
+        f'<span class="lx-chip">Last checked {esc_ui(stamp)} IST</span></div></header>'
     )
 
 
@@ -3913,15 +3957,15 @@ def lse_briefing(*, is_open: bool, open_count: int, open_details: str,
                  option_count: int, learning_state: str) -> str:
     safe = lambda v: html.escape(str(v), quote=True)
     market = 'open' if is_open else 'closed'
-    pnl_clause = ('is incomplete because some current prices are unavailable' if pnl_partial else 'uses the last saved paper marks')
+    caution = ' (some prices are missing)' if pnl_partial else ''
     return (
         '<section class="lx-brief"><div class="lx-brief-title">☀ YOUR DAILY BRIEFING · NSE PAPER RESEARCH</div>'
-        f'The NSE is <b>{market}</b>. Your ledger currently shows <b>{int(open_count)} open positions</b> '
-        f'({safe(open_details)}); estimated open paper P/L is <b>{safe(pnl_text)}</b> and {pnl_clause}. '
-        f'Your latest saved scan has <b>{int(idea_count)} CONSIDER share ideas</b> and '
-        f'<b>{int(option_count)} CONSIDER CE/PE contracts</b>. '
-        f'Independent daily learning: <b>{safe(learning_state)}</b>. '
-        'Signals are research only, not verified future returns.</section>'
+        f'The Indian market is <b>{market}</b>. You have <b>{int(open_count)} paper positions</b> '
+        f'({safe(open_details)}) with estimated open P/L of <b>{safe(pnl_text)}</b>{caution}. '
+        f'The latest scan recorded <b>{int(idea_count)} share ideas</b> and '
+        f'<b>{int(option_count)} eligible CE/PE ideas</b>. '
+        f'Daily independent learning: <b>{safe(learning_state)}</b>. '
+        'These are research signals, not guaranteed returns.</section>'
     )
 
 
@@ -3934,40 +3978,49 @@ def _lse_finite(value):
 
 
 def lse_open_cards(shares: pd.DataFrame, options: pd.DataFrame, *, limit: int = 8) -> str:
-    """Read-only position tiles; never infer quote prices, P/L or closed outcomes."""
+    """UK-style open-position mini cards with a purely decorative entry-to-target rail."""
     cards = []
-    esc_ui = lambda val: html.escape(str(val), quote=True)
+    esc_ui = lambda value: html.escape(str(value), quote=True)
+    def append_position(symbol, subtitle, entry, target, stop, last, pct):
+        tone = ('lx-positive' if pct is not None and pct > 0 else
+                'lx-negative' if pct is not None and pct < 0 else 'lx-unknown')
+        text = f'{pct:+.2f}%' if pct is not None else 'Price unverified'
+        # Purely visual: rail is based on stored prices, never a simulated fill.
+        pct_position = 50.0
+        if all(v is not None and v > 0 for v in (entry, target, stop, last)) and target > stop:
+            pct_position = min(96, max(4, (last - stop) / (target - stop) * 100))
+        price_text = (f'Entry <b>{esc_ui(short_money(entry))}</b> · '
+                      f'Target <b>{esc_ui(short_money(target))}</b> · '
+                      f'Stop <b>{esc_ui(short_money(stop))}</b>')
+        cards.append(
+            '<article class="lx-position"><div class="lx-position-top">'
+            f'<span class="lx-ticker">{esc_ui(symbol)}</span>'
+            f'<span class="lx-percent {tone}">{esc_ui(text)}</span></div>'
+            f'<div class="lx-sub">{esc_ui(subtitle)}</div>'
+            f'<div class="lx-rail"><span class="lx-dot" style="left:{pct_position:.1f}%"></span></div>'
+            f'<div class="lx-prices"><span>{price_text}</span></div></article>'
+        )
     if isinstance(shares, pd.DataFrame) and not shares.empty and 'status' in shares.columns:
-        selected = shares.loc[shares['status'].map(lambda x: classify_outcome(x)=='ACTIVE')]
+        selected = shares.loc[shares['status'].map(lambda value: classify_outcome(value) == 'ACTIVE')]
         for row in selected.to_dict('records'):
-            ticker = str(row.get('ticker') or 'Unknown stock')
             last = _lse_finite(row.get('latest_price'))
-            pct = _lse_finite(row.get('pnl_pct')) if last and last > 0 else None
-            tone = 'lx-positive' if pct is not None and pct > 0 else 'lx-negative' if pct is not None and pct < 0 else 'lx-unknown'
-            pct_text = f'{pct:+.2f}%' if pct is not None else 'Quote unverified'
-            entry, target, stop = [short_money(row.get(k)) for k in ('entry_price','target_price','stop_loss')]
-            cards.append((ticker, f'Last {short_money(last) if last else "unverified"} · {int(_lse_finite(row.get("shares")) or 0)} shares',
-                          pct_text,tone,entry,target,stop))
-    if isinstance(options,pd.DataFrame) and not options.empty and 'status' in options.columns:
-        selected=options.loc[options['status'].map(lambda x: classify_outcome(x)=='ACTIVE')]
+            pct = _lse_finite(row.get('pnl_pct')) if last is not None and last > 0 else None
+            append_position(str(row.get('ticker') or 'Unknown share'),
+                            f"Share · last {short_money(last) if last and last > 0 else 'unverified'}",
+                            _lse_finite(row.get('entry_price')), _lse_finite(row.get('target_price')),
+                            _lse_finite(row.get('stop_loss')), last, pct)
+    if isinstance(options, pd.DataFrame) and not options.empty and 'status' in options.columns:
+        selected = options.loc[options['status'].map(lambda value: classify_outcome(value) == 'ACTIVE')]
         for row in selected.to_dict('records'):
-            ticker=str(row.get('option_contract') or 'CE/PE contract')
-            last=_lse_finite(row.get('current_option_price'))
-            pct=_lse_finite(row.get('pnl_pct')) if last and last>0 else None
-            tone='lx-positive' if pct is not None and pct>0 else 'lx-negative' if pct is not None and pct<0 else 'lx-unknown'
-            pct_text=f'{pct:+.2f}%' if pct is not None else 'Quote unverified'
-            entry,target,stop=[short_money(row.get(k)) for k in ('entry_premium','target_premium','stop_loss_premium')]
-            cards.append((ticker,'CE/PE paper contract · premium marks',pct_text,tone,entry,target,stop))
+            last = _lse_finite(row.get('current_option_price'))
+            pct = _lse_finite(row.get('pnl_pct')) if last is not None and last > 0 else None
+            append_position(str(row.get('option_contract') or 'Unknown option'),
+                            'Option premium · last quote ' + (short_money(last) if last and last > 0 else 'unverified'),
+                            _lse_finite(row.get('entry_premium')),_lse_finite(row.get('target_premium')),
+                            _lse_finite(row.get('stop_loss_premium')),last,pct)
     if not cards:
-        return '<div class="lx-empty">No open paper positions recorded; new positions appear here only after verified entry.</div>'
-    parts=[]
-    for ticker,subtitle,pct,tone,entry,target,stop in cards[:max(1,int(limit))]:
-        parts.append('<article class="lx-position"><div class="lx-position-top">'
-                     f'<span class="lx-ticker">{esc_ui(ticker)}</span><span class="lx-percent {tone}">{esc_ui(pct)}</span></div>'
-                     f'<div class="lx-sub">{esc_ui(subtitle)}</div><div class="lx-prices">'
-                     f'<span>Entry <b>{esc_ui(entry)}</b></span><span>Target <b>{esc_ui(target)}</b></span>'
-                     f'<span>Stop <b>{esc_ui(stop)}</b></span></div></article>')
-    return '<div class="lx-positions">'+''.join(parts)+'</div>'
+        return '<div class="lx-empty">No open paper positions recorded yet.</div>'
+    return '<div class="lx-positions">' + ''.join(cards[:max(1,int(limit))]) + '</div>'
 
 
 def lse_pick_card(name: str, decision: str, sector: str, entry: str, target: str,
@@ -4000,11 +4053,11 @@ st.markdown(f'<style>{dark_theme_css(palette_choice)}\n{minimal_dark_css()}\n{ls
 now_ist = ist_now()
 market_open = is_nse_market_open()
 with st.sidebar:
-    st.caption('SESSION CONTROLS')
-    auto_refresh = st.toggle('Auto-scan during NSE hours', value=True, key='dark_auto_scan')
-    refresh_mins = st.selectbox('Refresh interval', [15,30,60], index=0,
-        format_func=lambda v:f'{v} minutes', key='dark_refresh_minutes')
-    st.caption('Scans run while this Streamlit session is active. They are not an unattended background service.')
+    with st.expander('⚙️ Dashboard settings', expanded=False):
+        auto_refresh = st.toggle('Auto-scan during NSE hours', value=True, key='dark_auto_scan')
+        refresh_mins = st.selectbox('Refresh interval', [15,30,60], index=0,
+            format_func=lambda v:f'{v} minutes', key='dark_refresh_minutes')
+        st.caption('Streamlit auto-scan needs an active session; scheduled daily AI learning runs separately.')
     with st.expander('⚙️ Trading assumptions'):
         st.write('Shared research budget: **₹10,00,000**')
         st.write(f'Share slots: **{MAX_OPEN_POSITIONS}** · Stock time-exit: **{MAX_HOLD_CALENDAR_DAYS} calendar days**')
@@ -4027,6 +4080,8 @@ if auto_refresh and st_autorefresh:
     st_autorefresh(interval=int(refresh_mins)*60*1000, key='dark_session_refresh')
 
 st.markdown(lse_nse_hero(now_ist.strftime('%d %b %Y · %H:%M'), market_open),unsafe_allow_html=True)
+with st.expander('💡 New here? 30-second guide', expanded=False):
+    st.markdown('**Today** shows your open paper positions and possible stock/CE/PE ideas; **Learning progress** shows real daily worker outcomes and model validation; **Trade ledger** preserves every saved trade. Targets and stops are estimates, not guaranteed executions. No broker orders are placed.')
 
 # Render three views only; never create additional top-level tabs with verbose tables.
 # Expensive scans run at most once each refresh interval per browser session.
@@ -4097,29 +4152,6 @@ elif open_summary['open_total'] == 0:
 else:
     pnl_value = ('+' if open_summary['paper_pnl_inr'] > 0 else '-' if open_summary['paper_pnl_inr'] < 0 else '') + short_money(abs(open_summary['paper_pnl_inr']), 0)
     pnl_note = 'Last recorded paper marks · unrealised, not live fills'
-st.markdown(minimal_stats([
-    ('Open positions',str(open_summary['open_total']),option_details),
-    ('Open paper P/L',pnl_value,pnl_note),
-    ('Allocated',short_money(used,0),'Across all active shares, CE and PE'),
-    ('Unallocated',short_money(cap['remaining_inr'],0) if integrity['verified_count'] else 'Unverified',
-     'Not necessarily deployable · ₹10 lakh combined cap'),
-]), unsafe_allow_html=True)
-if open_summary['missing_count']:
-    st.warning(f"Paper P/L is incomplete: {open_summary['missing_count']} open records have no reliable latest price, "
-               "allocation or marked return. The displayed total excludes them.")
-
-if not integrity['verified_count']:
-    st.markdown(dark_note('History integrity is not verified. New paper entries are paused until older records are restored. The figures may be incomplete.',True),unsafe_allow_html=True)
-elif cap['fresh_slot_limit_reached']:
-    st.markdown(dark_note(f"New share paper entries paused: {cap['open']} open positions versus {MAX_OPEN_POSITIONS} available slots. Existing history is preserved; research still runs."),unsafe_allow_html=True)
-if st.session_state.get('price_feed_problem'):
-    st.warning('⚠️ Price-feed outage: one or more paper positions could not be reconciled. Their capital stays reserved; no assumed sale was recorded.')
-if st.session_state.get('intraday_feed_problem'):
-    affected = ', '.join(st.session_state.get('intraday_feed_missing_tickers',[])[:5])
-    st.warning(f'⚠️ Minute-price coverage is incomplete for open paper positions ({affected or "some shares"}). '
-               'A temporary stop/target touch may not be detectable; affected positions remain unverified until quotes recover.')
-if not ANNOUNCEMENTS_AVAILABLE:
-    st.caption('⚠️ Corporate filing/news checker unavailable. Technical recommendations are incomplete without those checks.')
 
 # Independent background daily learner (read-only). It never updates existing
 # historical journals or replaces the old live model. If setup is incomplete,
@@ -4163,32 +4195,71 @@ def read_independent_nse_research() -> dict:
         return {"configured": False, "forecasts": [], "champion": {}, "run": {}}
 
 independent_research = read_independent_nse_research()
-if independent_research['configured']:
-    background_health = worker_status(independent_research['run'])
-    st.caption('🧠 Independent daily learning: ' + background_health['label'] +
-               ' · Research-only; never a broker execution')
-    if background_health['state'] in ('STALE','FAILED'):
-        st.warning('Scheduled daily learning is stale or failed. Check GitHub Actions and Supabase worker-run history; do not assume forecasts have refreshed.')
-else:
-    st.caption('🧠 Independent background learning: unavailable. Add SUPABASE_AI_READ_KEY to Streamlit Secrets for private-table access, or check the NSE project/key and worker logs. Existing research remains unchanged.')
+background_health = (worker_status(independent_research.get('run'))
+                     if independent_research['configured'] else
+                     {'state':'NOT_CONFIGURED','label':'Not connected'})
 
-page_preds, page_learning, page_ledger = st.tabs(['☀️ Today’s predictions','🧠 Learning progress','📒 Trade ledger'])
+page_preds, page_learning, page_ledger = st.tabs(["☀️ Today's choices", '🧠 Learning progress', '📖 All paper trades'])
 
 with page_preds:
-    if not market_open:
-        st.markdown(dark_note('NSE is closed: reference prices may be stale; new paper entries are paused.'),unsafe_allow_html=True)
-    if st.session_state.get('dark_stock_error'):
-        st.warning('Last share scan failed: '+str(st.session_state['dark_stock_error']))
-    if st.session_state.get('dark_options_error'):
-        st.warning('Last options scan failed: '+str(st.session_state['dark_options_error']))
-    p1,p2,p3 = st.columns([1.55, 1.0, 1.45],gap="small")
-    with p1:
-        product_filter = st.segmented_control('Market', ['All','Stocks','Calls (CE)','Puts (PE)'], default='All', key='dark_product_filter')
-    with p2:
-        decision_filter = st.selectbox('Signal', ['CONSIDER','ALL','WATCH','AVOID'], key='dark_decision_filter')
-    with p3:
-        keyword = st.text_input('Search',placeholder='Symbol or sector…', key='dark_prediction_search')
-    with st.expander('⚙️ Scan controls and timing', expanded=False):
+    # Scan diagnostics remain accessible below; avoid cluttering the daily overview.
+    stock_consider_total = (int((share_results['Decision']=='CONSIDER').sum())
+                            if not share_results.empty else 0)
+    option_consider_total = (int((option_results['Decision']=='CONSIDER').sum())
+                             if not option_results.empty else 0)
+    learning_status = (worker_status(independent_research.get('run')).get('label','Unknown')
+                       if independent_research['configured'] else 'Not connected')
+    st.markdown(lse_briefing(is_open=market_open,open_count=open_summary['open_total'],
+        open_details=option_details,pnl_text=pnl_value,pnl_partial=bool(open_summary['missing_count']),
+        idea_count=stock_consider_total,option_count=option_consider_total,
+        learning_state=learning_status),unsafe_allow_html=True)
+    st.markdown(minimal_stats([
+        ('Open positions',str(open_summary['open_total']),option_details),
+        ('Open paper P/L',pnl_value,pnl_note),
+        ('Allocated',short_money(used,0),'Across all active shares, CE and PE'),
+        ('Unallocated',short_money(cap['remaining_inr'],0) if integrity['verified_count'] else 'Unverified',
+         'Not necessarily deployable · ₹10 lakh combined cap'),
+    ]), unsafe_allow_html=True)
+    if not integrity['verified_count']:
+        st.error('History integrity cannot be confirmed. New paper entries remain paused; restore the original ledger before relying on balances.')
+    with st.expander('⚠️ Data quality and safety checks', expanded=False):
+        if not market_open:
+            st.caption('NSE is closed: reference prices may be stale and new paper entries are paused.')
+        if st.session_state.get('dark_stock_error'):
+            st.warning('Last share scan failed: ' + str(st.session_state['dark_stock_error']))
+        if st.session_state.get('dark_options_error'):
+            st.warning('Last CE/PE scan failed: ' + str(st.session_state['dark_options_error']))
+        if open_summary['missing_count']:
+            st.warning(f"Paper P/L is incomplete: {open_summary['missing_count']} open records are missing a verified price, allocation or return.")
+        if cap['fresh_slot_limit_reached']:
+            st.caption(f"New share paper entries are paused: {cap['open']}/{MAX_OPEN_POSITIONS} slots used; existing records are preserved.")
+        if st.session_state.get('price_feed_problem'):
+            st.warning('Price-feed problem: open positions could not all be reconciled. No missing sale was assumed.')
+        if st.session_state.get('intraday_feed_problem'):
+            affected = ', '.join(st.session_state.get('intraday_feed_missing_tickers', [])[:6])
+            st.warning('Minute-price history is incomplete for ' + (affected or 'some shares') + '; a brief target or stop touch could be missed.')
+        if not ANNOUNCEMENTS_AVAILABLE:
+            st.caption('Corporate filings/news checker is unavailable; technical research is incomplete.')
+    # UK-style companion section: options are visibly distinct from stocks,
+    # but no quote is invented to populate these counts.
+    st.markdown('<div class="lx-section"><span class="lx-bar"></span>🪙 Calls & puts at a glance</div>', unsafe_allow_html=True)
+    st.markdown(minimal_stats([
+        ('Open CE / PE', str(open_summary['calls'] + open_summary['puts']),
+            f"{open_summary['calls']} calls · {open_summary['puts']} puts"),
+        ('CE / PE research', str(len(option_results)), 'Verified contracts evaluated in last scan'),
+        ('Option records', str(len(journal_opt)), 'All saved paper option ideas'),
+        ('Option capital', short_money(cap['option_inr'], 0), 'Paper capital reserved in options'),
+    ]), unsafe_allow_html=True)
+
+    with st.expander('🔎 Filters and scan controls', expanded=False):
+        p1,p2,p3 = st.columns([1.55, 1.0, 1.45],gap="small")
+        with p1:
+            product_filter = st.segmented_control('Market', ['All','Stocks','Calls (CE)','Puts (PE)'], default='All', key='dark_product_filter')
+        with p2:
+            decision_filter = st.selectbox('Signal', ['CONSIDER','ALL','WATCH','AVOID'], key='dark_decision_filter')
+        with p3:
+            keyword = st.text_input('Search',placeholder='Symbol or sector…', key='dark_prediction_search')
+        st.caption('Manual scan and timing controls')
         a,b,c = st.columns([1,1,1])
         with a:
             if st.button('🔍 Scan stocks',key='dark_scan_stocks',width="stretch"):
@@ -4205,7 +4276,6 @@ with page_preds:
                 st.rerun()
         horizon = st.selectbox('Stock timing study', [3,5,7], index=1,
                                format_func=lambda x:f'{x} trading sessions', key='dark_horizon')
-
     stock_view = (share_results.copy() if not share_results.empty else pd.DataFrame())
     if not stock_view.empty and product_filter not in ('All','Stocks'):
         stock_view = stock_view.iloc[0:0]
@@ -4228,20 +4298,7 @@ with page_preds:
     if not opt_view.empty and keyword.strip():
         opt_view = opt_view[opt_view['Stock'].astype(str).str.contains(re.escape(keyword.strip()),case=False,na=False)]
 
-    st.caption(f"Latest scans · Shares {st.session_state.get('last_stock_scan','not scanned')} · "
-               f"CE/PE {st.session_state.get('last_options_scan','not scanned')} · "
-               f"{len(stock_view)} stocks / {len(opt_view)} option contracts match filters")
-    stock_consider_total = (int((share_results['Decision']=='CONSIDER').sum())
-                            if not share_results.empty else 0)
-    option_consider_total = (int((option_results['Decision']=='CONSIDER').sum())
-                             if not option_results.empty else 0)
-    learning_status = (worker_status(independent_research.get('run')).get('label','Unknown')
-                       if independent_research['configured'] else 'Not connected')
-    st.markdown(lse_briefing(is_open=market_open,open_count=open_summary['open_total'],
-        open_details=option_details,pnl_text=pnl_value,pnl_partial=bool(open_summary['missing_count']),
-        idea_count=stock_consider_total,option_count=option_consider_total,
-        learning_state=learning_status),unsafe_allow_html=True)
-    positions_panel, main_predictions = st.columns([1.0,1.12],gap='medium')
+    positions_panel, main_predictions = st.columns([1.02,1.0],gap='medium')
     with positions_panel:
         st.markdown(f'<div class="lx-section"><span class="lx-bar"></span>🟢 Your positions'
                     f'<span class="lx-side-count">{open_summary["open_total"]} open · saved marks</span></div>',
@@ -4249,8 +4306,12 @@ with page_preds:
         st.markdown(lse_open_cards(journal_eq,journal_opt),unsafe_allow_html=True)
         if open_summary['open_total']>8:
             st.caption(f'Showing 8 of {open_summary["open_total"]} open records; see Trade ledger for all.')
-        st.caption('Open paper P/L and last prices are estimates; a missing or stale option quote is never treated as a fill.')
+        st.caption('Dot = latest saved price relative to stop/target · delayed quotes are not guaranteed fills.')
     with main_predictions:
+        if st.button('🔎 Find new picks now', key='uk_find_new_picks', type='primary', width='stretch'):
+            st.session_state['dark_force_shares'] = True
+            st.session_state['dark_force_options'] = True
+            st.rerun()
         st.markdown('<div class="lx-section"><span class="lx-bar"></span>🎯 Today’s predictions'
                     f'<span class="lx-side-count">{len(stock_view)} stocks · {len(opt_view)} options</span></div>',
                     unsafe_allow_html=True)
@@ -4276,7 +4337,7 @@ with page_preds:
                          '· Expected value after modelled costs:',f"{_num(r.get('Expected value')):+.2f}%")
                 st.caption('Entry and stop prices may gap past their levels; slippage and fees affect realised outcomes. The app currently exits stock ideas after 7 CALENDAR days, which may be shorter than a 7-session study.')
         if product_filter in ('All','Stocks') and stock_view.empty:
-            st.info('No stocks match this filter. Run the stock scan to refresh research; a missing idea is not a buy signal.')
+            st.info('No share ideas meet these filters right now; doing nothing is a valid outcome.')
         if len(stock_view)>len(shown_stocks):
             st.caption(f'Showing the first {len(shown_stocks)} ranked shares of {len(stock_view)}. Narrow your search or open the table below.')
 
@@ -4380,83 +4441,208 @@ with page_preds:
         if not ANNOUNCEMENTS_AVAILABLE:
             st.warning('NSE corporate filings module is unavailable. News checks are incomplete; treat technical CONSIDER scores cautiously.')
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _autonomous_learning_evidence() -> dict:
+    """Read real EOD worker evidence from private Supabase tables; no fabricated updates.
+
+    The secret key remains server-side. For new sb_secret_ keys, use only apikey;
+    legacy JWT service-role tokens also require Authorization bearer.
+    """
+    result = {'available': False, 'samples': None, 'models': None,
+              'daily': {}, 'last_training': {}, 'error': 'Private learning data not readable'}
+    project_url = str(_secret('SUPABASE_URL') or '').strip().rstrip('/')
+    private_key = str(_secret('SUPABASE_AI_READ_KEY') or '').strip()
+    if not (project_url.startswith('https://') and private_key):
+        return result
+    headers = {'apikey': private_key, 'Accept': 'application/json'}
+    if not private_key.startswith('sb_secret_'):
+        headers['Authorization'] = 'Bearer ' + private_key
+    base = project_url + '/rest/v1/'
+    def fetch(table, params, count=False):
+        local_headers = dict(headers)
+        if count:
+            local_headers['Prefer'] = 'count=exact'
+        response = requests.get(base + table, params=params, headers=local_headers, timeout=9)
+        response.raise_for_status()
+        if count:
+            value = response.headers.get('Content-Range', '').rsplit('/',1)
+            return int(value[-1]) if len(value)==2 and value[-1].isdigit() else None
+        data = response.json()
+        return data if isinstance(data, list) else []
+    try:
+        # Count, don't fetch the historic features themselves into the browser.
+        result['samples'] = fetch('nse_ai_samples', {'select':'ticker','limit':1}, True)
+        result['models'] = fetch('nse_ai_models', {'select':'model_id','limit':1}, True)
+        daily = fetch('nse_ai_runs',
+            {'select':'status,kind,started_at,finished_at,details,error_class',
+             'kind':'eq.daily','order':'started_at.desc','limit':1})
+        result['daily'] = daily[0] if daily else {}
+        last = fetch('nse_ai_settings', {'select':'value','key':'eq.last_training','limit':1})
+        result['last_training'] = (last[0].get('value') or {}) if last and isinstance(last[0],dict) else {}
+        result['available'] = True
+        result['error'] = ''
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        # Return partial evidence if one check fails, but never invent counts.
+        result['error'] = 'Detailed worker counts unavailable; see GitHub Actions and Supabase'
+    return result
+
+
+def _learning_explanation(worker: dict, evidence: dict, champion: dict) -> str:
+    """Plain-English truth about what the independent model actually did."""
+    if not evidence.get('available'):
+        return 'Daily worker details are not readable; check the private AI credentials or Supabase connection.'
+    daily = evidence.get('daily') or {}
+    status = str(daily.get('status') or '').upper()
+    details = daily.get('details') or {}
+    if not isinstance(details, dict):
+        details = {}
+    if status != 'SUCCESS':
+        return 'No confirmed successful daily learning run is available from the worker log.'
+    model_details = details.get('model') or {}
+    if not isinstance(model_details, dict):
+        model_details = {}
+    state = str(model_details.get('status') or '').upper()
+    samples = evidence.get('samples')
+    if champion.get('model_id'):
+        return ('The background learner has a validated promoted model. Daily data continues to be evaluated; '
+                'promotion does not imply future prediction accuracy.')
+    if state == 'COLLECTING':
+        value = model_details.get('samples',samples)
+        minimum = model_details.get('minimum',350)
+        return (f'The worker is gathering labelled historical market examples ({value if value is not None else "count unavailable"} '
+                f'of at least {minimum}). No replacement model has passed the promotion checks yet.')
+    if state == 'REJECTED':
+        return 'A challenger was tested and rejected because it did not meet the validation rules; the existing model stays unchanged.'
+    if state == 'WEEKLY_COOLDOWN':
+        return 'The daily worker is collecting data; retraining is on its scheduled cooldown.'
+    if state == 'INSUFFICIENT_VALIDATION':
+        return 'Historical samples were collected, but there is not enough reliable later-period validation data yet.'
+    if state == 'AWAITING_FRESH_OUTCOMES':
+        return 'The model is awaiting sufficient new, unseen outcomes before another upgrade attempt.'
+    return 'The daily worker completed; no promoted replacement model is recorded. See the saved run evidence below.'
+
 with page_learning:
-    champion_live = independent_research.get('champion') or {}
-    if champion_live:
-        stats = champion_live.get('metrics') or {}
-        st.caption(f"Independent daily market AI · champion {str(champion_live.get('model_id','?'))[:24]} · "
-                   f"trained through {champion_live.get('trained_until','?')} · "
-                   f"held-out Brier {stats.get('brier','?')} (lower is better). "
-                   "This uses newly labelled daily market history, separately from your trade journal.")
-    else:
-        st.caption('Independent daily market learner: no promoted challenger yet.' if independent_research['configured'] else 'Independent daily market learner is not configured or cannot be read.')
-    st.markdown(dark_header('AI Learning — one trade at a time',
-        'Individual results, observations and tests the model could learn from · no graphs'),
-        unsafe_allow_html=True)
-    if journal_eq.empty:
-        st.info('No stock training history is available locally. Check the Ledger recovery tools.')
-    else:
-        totals = stock_history_summary(journal_eq)
-        state_raw = get_meta('retrain_state','{}')
-        try:
-            train_state = json.loads(state_raw or '{}')
-        except (ValueError,TypeError):
-            train_state = {}
-        st.caption(f"{totals['finished']} completed recorded outcomes · "
-                   f"{totals['potential_training']} possible entry-feature examples (not all validated) · "
-                   f"Last model promotion: {train_state.get('last_promoted','None recorded')}")
-        st.caption('Each tile is based on one journal record. It explains a possible future test, not a proven reason for a win/loss or an automatic model update.')
-        # One automatic feed covering different shares: no symbol picker, filters
-        # or card-count dropdown. A card describes a genuine finished journal
-        # outcome; an open trade cannot be described as a learned win/loss.
-        completed_feed = latest_completed_by_stock(journal_eq)
-        if not completed_feed:
-            st.info('No completed stock outcomes yet. Current open trades will appear here after their recorded outcomes are confirmed.')
-        else:
-            if 'learning_feed_visible' not in st.session_state:
-                st.session_state['learning_feed_visible'] = 15
-            visible_count = min(max(15, int(st.session_state['learning_feed_visible'])), len(completed_feed))
-            records = completed_feed[:visible_count]
-            st.markdown(dark_header('Latest stock learning observations',
-                f'{visible_count} of {len(completed_feed)} distinct stocks · latest completed result per stock · newest first'),
+    st.markdown('<div class="lx-section"><span class="lx-bar"></span>🧠 Learning progress'
+                '<span class="lx-side-count">actual daily worker activity, not guessed lessons</span></div>',
                 unsafe_allow_html=True)
-            st.caption('Each card shows one actual closed paper trade for a different stock. These are observations and proposed future tests, not proof the AI has already learned the pattern.')
-            cards = [dark_learning_tile(build_learning_tile(rec)) for rec in records]
-            st.markdown('<div class="learning-tiles">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
-            if visible_count < len(completed_feed):
-                if st.button('↓ Show 15 more stocks', key='show_more_learning_feed', width='stretch'):
-                    st.session_state['learning_feed_visible'] = min(visible_count + 15, len(completed_feed))
-                    st.rerun()
-            with st.expander('Exact trade prices and saved forecasts for the cards above'):
-                for n, rec in enumerate(records):
-                    obs = describe_trade(rec)
-                    stock_name = str(rec.get('ticker') or 'Unknown stock')
-                    st.markdown(f"**{esc(stock_name)} · {str(rec.get('date_str') or '')[:10]} · {obs['outcome']}**")
-                    st.caption(f"Entry {short_money(rec.get('entry_price'))} · "
-                               f"Target {short_money(rec.get('target_price'))} · "
-                               f"Stop {short_money(rec.get('stop_loss'))} · "
-                               f"Held {obs['days_held'] if obs['days_held'] is not None else 'unknown'} calendar days")
-                    st.caption('Original forecast: ' + forecast_review(rec))
-                    if n < len(records)-1:
-                        st.divider()
-        with st.expander('🧠 Model training status and validation'):
-            st.write(f'Minimum: **{MIN_SETTLED_TO_RETRAIN}** suitable, validated share outcomes. '
-                     f'Next retraining attempts after roughly **{RETRAIN_STEP_INTERVAL}** additional eligible cases.')
-            st.write('Last retraining attempt:', train_state.get('last_attempt_date','Not eligible yet'))
-            st.write('Last challenger promotion:', train_state.get('last_promoted','None recorded'))
-            st.caption('One paper trade does not prove which factor caused its result. Missing original features or forecasts are not recreated. '
-                       'A replacement model is promoted only after time-ordered validation against the existing model.')
+    evidence = _autonomous_learning_evidence() if independent_research['configured'] else {'available':False}
+    champion_live = independent_research.get('champion') or {}
+    run = independent_research.get('run') or {}
+    status = (worker_status(run) if independent_research['configured']
+              else {'state':'NOT_CONFIGURED','label':'Not connected'})
+    samples = evidence.get('samples')
+    model_count = evidence.get('models')
+    forecast_rows = independent_research.get('forecasts') or []
+    promoted = bool(champion_live.get('model_id'))
+    # The numbers below are from Supabase. Unreadable is displayed as —, not 0.
+    st.markdown(minimal_stats([
+        ('Daily learning worker', str(status.get('state','UNKNOWN')),
+            str(status.get('label') or 'Run status unavailable')),
+        ('Labelled market examples', f'{samples:,}' if isinstance(samples,int) else '—',
+            'Matured NSE daily historical price outcomes'),
+        ('Promoted AI model', 'Validated' if promoted else 'Not yet',
+            str(champion_live.get('model_id') or 'No challenger has passed validation')[:70]),
+        ('Saved daily forecasts', str(len(forecast_rows)) if promoted else '0',
+            'Latest-date visible forecasts; zero is normal before promotion'),
+    ]), unsafe_allow_html=True)
+    explanation = _learning_explanation(status,evidence,champion_live)
+    safe_explanation = html.escape(str(explanation),quote=True)
+    safe_status = html.escape(str(status.get('label') or status.get('state') or 'Unknown'),quote=True)
+    st.markdown('<div class="lx-learning-status"><strong>What the AI has actually learned</strong>'
+                f'<div style="margin-top:7px">{safe_explanation}</div>'
+                f'<div class="lx-tiny-note" style="margin-top:10px">Background worker: {safe_status}. '
+                'The journal learning cards below are observations, not proof that model weights changed.</div></div>',
+                unsafe_allow_html=True)
+    if str(status.get('state')).upper() in ('FAILED','STALE','NOT_CONFIGURED'):
+        st.warning('Scheduled learning is not verified as healthy; check GitHub Actions and the nse_ai_runs table.')
+    daily = evidence.get('daily') or {}
+    run_details = daily.get('details') or {}
+    if not isinstance(run_details,dict):
+        run_details = {}
+    trained_state = (run_details.get('model') or {}) if isinstance(run_details.get('model'),dict) else {}
+    st.markdown('<div class="lx-section"><span class="lx-bar"></span>🔎 What happened in the latest daily check</div>',
+                unsafe_allow_html=True)
+    if evidence.get('available') and daily:
+        review = [
+            ('Run completed', str(daily.get('finished_at') or 'Timestamp unavailable')[:25]),
+            ('Daily scan coverage', str(run_details.get('usable','—')) + ' usable price histories from ' + str(run_details.get('symbols_attempted','—')) + ' checked'),
+            ('Historical examples added/attempted', str(run_details.get('historical_samples_attempted','—')) + ' (attempted; not the total saved count)'),
+            ('Model evaluation result', str(trained_state.get('status') or 'Not reported')),
+            ('New daily forecasts attempted', str(run_details.get('new_forecasts_attempted','—'))),
+        ]
+        for heading, value in review:
+            st.markdown('<div class="lx-learn-step"><span>•</span><div><b>'
+                        + html.escape(heading,quote=True) + '</b><div class="lx-tiny-note">'
+                        + html.escape(value,quote=True) + '</div></div></div>', unsafe_allow_html=True)
+        if run_details.get('errors'):
+            st.caption('Some symbols were skipped; see GitHub Actions for feed and validation diagnostics.')
+        last_training = evidence.get('last_training') or {}
+        if isinstance(last_training,dict) and last_training.get('attempt_date'):
+            st.caption(f"Last challenger evaluation: {str(last_training['attempt_date'])[:10]} · "
+                       "Model changes are promoted only after later-period holdout tests.")
+    else:
+        st.info('Detailed independent-learning results could not be read. This does not mean the historical journal was lost.')
+    st.caption('The independent model trains on matured daily market-price outcomes; existing paper trade lessons and the original stock ranker are separate.')
+    if st.toggle('Show recent completed trade lessons', value=False, key='uk_show_previous_lessons'):
+        if journal_eq.empty:
+            st.info('No stock training history is available locally. Check the Ledger recovery tools.')
+        else:
+            totals = stock_history_summary(journal_eq)
+            state_raw = get_meta('retrain_state','{}')
+            try:
+                train_state = json.loads(state_raw or '{}')
+            except (ValueError,TypeError):
+                train_state = {}
+            st.caption(f"{totals['finished']} completed recorded outcomes · "
+                       f"{totals['potential_training']} possible entry-feature examples (not all validated) · "
+                       f"Last model promotion: {train_state.get('last_promoted','None recorded')}")
+            st.caption('Each tile is based on one journal record. It explains a possible future test, not a proven reason for a win/loss or an automatic model update.')
+            # One automatic feed covering different shares: no symbol picker, filters
+            # or card-count dropdown. A card describes a genuine finished journal
+            # outcome; an open trade cannot be described as a learned win/loss.
+            completed_feed = latest_completed_by_stock(journal_eq)
+            if not completed_feed:
+                st.info('No completed stock outcomes yet. Current open trades will appear here after their recorded outcomes are confirmed.')
+            else:
+                if 'learning_feed_visible' not in st.session_state:
+                    st.session_state['learning_feed_visible'] = 15
+                visible_count = min(max(15, int(st.session_state['learning_feed_visible'])), len(completed_feed))
+                records = completed_feed[:visible_count]
+                st.markdown(dark_header('Latest stock learning observations',
+                    f'{visible_count} of {len(completed_feed)} distinct stocks · latest completed result per stock · newest first'),
+                    unsafe_allow_html=True)
+                st.caption('Each card shows one actual closed paper trade for a different stock. These are observations and proposed future tests, not proof the AI has already learned the pattern.')
+                cards = [dark_learning_tile(build_learning_tile(rec)) for rec in records]
+                st.markdown('<div class="learning-tiles">' + ''.join(cards) + '</div>', unsafe_allow_html=True)
+                if visible_count < len(completed_feed):
+                    if st.button('↓ Show 15 more stocks', key='show_more_learning_feed', width='stretch'):
+                        st.session_state['learning_feed_visible'] = min(visible_count + 15, len(completed_feed))
+                        st.rerun()
+                with st.expander('Exact trade prices and saved forecasts for the cards above'):
+                    for n, rec in enumerate(records):
+                        obs = describe_trade(rec)
+                        stock_name = str(rec.get('ticker') or 'Unknown stock')
+                        st.markdown(f"**{esc(stock_name)} · {str(rec.get('date_str') or '')[:10]} · {obs['outcome']}**")
+                        st.caption(f"Entry {short_money(rec.get('entry_price'))} · "
+                                   f"Target {short_money(rec.get('target_price'))} · "
+                                   f"Stop {short_money(rec.get('stop_loss'))} · "
+                                   f"Held {obs['days_held'] if obs['days_held'] is not None else 'unknown'} calendar days")
+                        st.caption('Original forecast: ' + forecast_review(rec))
+                        if n < len(records)-1:
+                            st.divider()
+            with st.expander('🧠 Model training status and validation'):
+                st.write(f'Minimum: **{MIN_SETTLED_TO_RETRAIN}** suitable, validated share outcomes. '
+                         f'Next retraining attempts after roughly **{RETRAIN_STEP_INTERVAL}** additional eligible cases.')
+                st.write('Last retraining attempt:', train_state.get('last_attempt_date','Not eligible yet'))
+                st.write('Last challenger promotion:', train_state.get('last_promoted','None recorded'))
+                st.caption('One paper trade does not prove which factor caused its result. Missing original features or forecasts are not recreated. '
+                           'A replacement model is promoted only after time-ordered validation against the existing model.')
 
 with page_ledger:
     st.markdown(dark_header('Trade ledger','All paper stocks, calls and puts · open and closed'),unsafe_allow_html=True)
     if journal_eq.empty and journal_opt.empty:
         st.warning('No trading history available from this local database. Use recovery below. Do not reset your existing database.')
-    st.markdown(dark_stats([
-        ('Share records',str(len(journal_eq)),'Includes old and current entries'),
-        ('Active shares',str(cap['open']),f"Current entry limit {MAX_OPEN_POSITIONS}"),
-        ('Option records',str(len(journal_opt)),'Live-quoted and older estimated-price ideas'),
-        ('Reviews saved',str(len(journal_reviews)),'Newer CE/PE quote checks'),
-    ]),unsafe_allow_html=True)
+    st.caption(f'{len(journal_eq)} share records · {len(journal_opt)} option records · {open_summary["open_total"]} open paper positions · Full history retained')
     ledger_kind = st.segmented_control('Ledger type', ['Stocks','Calls & Puts','Option research reviews'],default='Stocks', key='dark_ledger_type')
     l1,l2,l3 = st.columns([1.1,1.5,1])
     with l1:
