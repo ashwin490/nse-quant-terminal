@@ -23,9 +23,12 @@ class ReconciliationPolicyTests(unittest.TestCase):
         self.assertFalse(preserve_local_row('ACTIVE', 'ACTIVE',
             '2026-11-23 14:20:00', '2026-11-23 14:45:00'))
 
-    def test_differing_closed_timestamps_flagged(self):
-        self.assertTrue(closed_record_conflict('🛑 LOSS (STOPPED OUT)',
+    def test_differing_closed_audit_timestamps_not_a_status_conflict(self):
+        self.assertFalse(closed_record_conflict('🛑 LOSS (STOPPED OUT)',
             '🛑 LOSS (STOPPED OUT)', '2026-11-23 14:15:04', '2026-11-23 14:47:26'))
+
+    def test_distinct_final_outcomes_are_flagged(self):
+        self.assertTrue(closed_record_conflict('🎯 WIN (TARGET HIT)', '🛑 LOSS (STOPPED OUT)', '', ''))
 
     def test_matching_closed_records_not_flagged(self):
         self.assertFalse(closed_record_conflict('🎯 WIN (TARGET HIT)',

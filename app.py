@@ -975,8 +975,8 @@ def hydrate_duckdb_from_supabase():
             con.close()
     if info["bad_rows"]:
         record_db_error("Restore from cloud", Exception(f"{info['bad_rows']} backup row(s) were unreadable and skipped ({info['first_error']})"))
-    if info["closed_conflicts"]:
-        st.session_state["history_close_conflicts"] = info["closed_conflicts"]
+    # Clear obsolete conflict warnings after a fresh cloud comparison.
+    st.session_state["history_close_conflicts"] = info["closed_conflicts"]
 
 if "hydrated_once" not in st.session_state:
     hydrate_duckdb_from_supabase()
@@ -3605,6 +3605,86 @@ def short_money(n, d=2) -> str:
         return '—'
 
 
+def verify_option_cloud_backup(local_options: pd.DataFrame, *, insert_missing: bool = False) -> dict:
+    """Compare immutable option date_key IDs and optionally INSERT missing ones.
+
+    This never overwrites an existing remote row and rechecks the remote IDs
+    after insertion; a declined insert or restricted RLS is reported, not hidden.
+    Do not change live paper trading status/quotes to make counts match.
+    """
+    report = {'ok': False, 'local': 0, 'cloud': None, 'missing': [],
+              'added': 0, 'error': '', 'invalid': 0}
+    if not supabase:
+        report['error'] = 'Supabase is not configured'
+        return report
+    try:
+        local = {}
+        if isinstance(local_options, pd.DataFrame) and not local_options.empty:
+            for row in local_options.to_dict('records'):
+                key = str(row.get('date_key') or '')[:10]
+                try:
+                    datetime.strptime(key, '%Y-%m-%d')
+                except ValueError:
+                    report['invalid'] += 1
+                    continue
+                if not str(row.get('option_contract') or '').strip() or _num(row.get('entry_premium')) <= 0:
+                    report['invalid'] += 1
+                    continue
+                local[key] = row
+        report['local'] = len(local)
+        if report['local'] < HISTORY_EXPECTED_MIN_OPTIONS:
+            report['error'] = 'Local option history is below its protected minimum; restore history first'
+            return report
+        def remote_keys():
+            result, offset, batch = set(), 0, 500
+            while True:
+                data = (supabase.table('options_journal').select('date_key')
+                        .range(offset, offset + batch - 1).execute().data or [])
+                result.update(str(r.get('date_key') or '')[:10] for r in data)
+                if len(data) < batch:
+                    return result
+                offset += batch
+                if offset > 100000:
+                    raise RuntimeError('Cloud option journal limit exceeded')
+        old = remote_keys()
+        report['cloud'] = len(old)
+        report['missing'] = sorted(local.keys() - old)
+        if insert_missing and report['missing']:
+            # Bounded and idempotent: never mass copy if a wrong project is selected.
+            if len(report['missing']) > 5:
+                report['error'] = 'More than five missing option IDs; manual review required'
+                return report
+            for key in report['missing']:
+                row = local[key]
+                payload = {}
+                for column in ('date_key','timestamp','share_name','option_contract',
+                    'strike_price','expiry_days','underlying_spot','lot_size',
+                    'entry_premium','current_option_price','target_premium',
+                    'stop_loss_premium','total_capital','ai_confidence',
+                    'implied_vol','status','pnl_pct','last_audited'):
+                    val = row.get(column)
+                    if val is None or (not isinstance(val, (list,dict)) and pd.isna(val)):
+                        continue
+                    if hasattr(val, 'item'):
+                        val = val.item()
+                    if isinstance(val, (pd.Timestamp,datetime)):
+                        val = val.isoformat(sep=' ')
+                    payload[column] = val
+                # New rows ONLY, never UPSERT or UPDATE existing cloud history.
+                try:
+                    supabase.table('options_journal').insert(payload).execute()
+                    report['added'] += 1
+                except Exception as exc:
+                    report['error'] = type(exc).__name__
+            new_ids = remote_keys()
+            report['cloud'] = len(new_ids)
+            report['missing'] = sorted(local.keys() - new_ids)
+        report['ok'] = not report['missing'] and not report['invalid'] and not report['error']
+    except Exception as exc:
+        report['error'] = type(exc).__name__
+    return report
+
+
 def render_history_recovery() -> None:
     """Move the original history repair workflow into the Ledger without data loss."""
     with st.expander('🛠️ Backup and recover history', expanded=False):
@@ -3617,6 +3697,26 @@ def render_history_recovery() -> None:
             hi = st.session_state.get('hydrate_info',{})
             st.caption(f"Last cloud check: {hi.get('remote',0)} share rows, {hi.get('remote_options',0)} option rows, "
                        f"{hi.get('restored',0)} share rows restored, {hi.get('bad_rows',0)} skipped")
+            if st.button('🔎 Verify option backup IDs', key='verify_options_cloud', width="stretch"):
+                st.session_state['option_backup_verification'] = verify_option_cloud_backup(
+                    load_options_journal_df(), insert_missing=False)
+            option_check = st.session_state.get('option_backup_verification')
+            if option_check:
+                if option_check['error']:
+                    st.warning('Option-backup verification: ' + option_check['error'])
+                elif option_check['invalid']:
+                    st.warning(f"{option_check['invalid']} local option record(s) could not be checked; "
+                               'review their IDs and entry premiums before any cloud repair.')
+                elif option_check['missing']:
+                    st.warning(f"{len(option_check['missing'])} option ID(s) missing in cloud: " +
+                               ', '.join(option_check['missing'][:5]))
+                    if st.button('📤 Insert missing option IDs only', key='repair_option_cloud', width="stretch"):
+                        st.session_state['option_backup_verification'] = verify_option_cloud_backup(
+                            load_options_journal_df(), insert_missing=True)
+                        st.rerun()
+                else:
+                    st.success(f"Option backup verified: {option_check['local']} local IDs / "
+                               f"{option_check['cloud']} cloud IDs. No missing IDs identified.")
             if st.button('📤 Sync up to 200 missing records to Supabase', key='dark_cloud_sync', width="stretch"):
                 with st.spinner('Uploading only rows absent from cloud...'):
                     result = sync_local_history_to_supabase(200, st.session_state.get('history_sync_offset',0))
@@ -3977,50 +4077,71 @@ def _lse_finite(value):
         return None
 
 
-def lse_open_cards(shares: pd.DataFrame, options: pd.DataFrame, *, limit: int = 8) -> str:
-    """UK-style open-position mini cards with a purely decorative entry-to-target rail."""
+def lse_open_cards(shares: pd.DataFrame, options: pd.DataFrame) -> str:
+    """Render *every* active share and option paper position, with CE/PE first.
+
+    Quotes and P/L are deliberately shown as UNVERIFIED if a stored mark is
+    missing; this display function never requests a quote, closes a trade, or
+    changes its recorded prices. No arbitrary eight-position display limit.
+    """
     cards = []
     esc_ui = lambda value: html.escape(str(value), quote=True)
+
+    def active_rows(frame, day_column):
+        if not isinstance(frame, pd.DataFrame) or frame.empty or 'status' not in frame.columns:
+            return []
+        active = frame.loc[frame['status'].map(lambda v: bool(re.search(
+            r'(?<![A-Z])ACTIVE(?![A-Z])', str(v or '').upper())))]
+        return sorted(active.to_dict('records'),
+                      key=lambda row: str(row.get(day_column) or ''), reverse=True)
+
     def append_position(symbol, subtitle, entry, target, stop, last, pct):
         tone = ('lx-positive' if pct is not None and pct > 0 else
                 'lx-negative' if pct is not None and pct < 0 else 'lx-unknown')
-        text = f'{pct:+.2f}%' if pct is not None else 'Price unverified'
-        # Purely visual: rail is based on stored prices, never a simulated fill.
+        result_text = f'{pct:+.2f}%' if pct is not None else 'P/L unverified'
+        # The rail is decorative only; it never represents a verified fill.
         pct_position = 50.0
         if all(v is not None and v > 0 for v in (entry, target, stop, last)) and target > stop:
             pct_position = min(96, max(4, (last - stop) / (target - stop) * 100))
-        price_text = (f'Entry <b>{esc_ui(short_money(entry))}</b> · '
-                      f'Target <b>{esc_ui(short_money(target))}</b> · '
-                      f'Stop <b>{esc_ui(short_money(stop))}</b>')
+        prices = (f'Entry <b>{esc_ui(short_money(entry))}</b> · '
+                  f'Target <b>{esc_ui(short_money(target))}</b> · '
+                  f'Stop <b>{esc_ui(short_money(stop))}</b>')
         cards.append(
             '<article class="lx-position"><div class="lx-position-top">'
             f'<span class="lx-ticker">{esc_ui(symbol)}</span>'
-            f'<span class="lx-percent {tone}">{esc_ui(text)}</span></div>'
+            f'<span class="lx-percent {tone}">{esc_ui(result_text)}</span></div>'
             f'<div class="lx-sub">{esc_ui(subtitle)}</div>'
             f'<div class="lx-rail"><span class="lx-dot" style="left:{pct_position:.1f}%"></span></div>'
-            f'<div class="lx-prices"><span>{price_text}</span></div></article>'
+            f'<div class="lx-prices"><span>{prices}</span></div></article>'
         )
-    if isinstance(shares, pd.DataFrame) and not shares.empty and 'status' in shares.columns:
-        selected = shares.loc[shares['status'].map(lambda value: classify_outcome(value) == 'ACTIVE')]
-        for row in selected.to_dict('records'):
-            last = _lse_finite(row.get('latest_price'))
-            pct = _lse_finite(row.get('pnl_pct')) if last is not None and last > 0 else None
-            append_position(str(row.get('ticker') or 'Unknown share'),
-                            f"Share · last {short_money(last) if last and last > 0 else 'unverified'}",
-                            _lse_finite(row.get('entry_price')), _lse_finite(row.get('target_price')),
-                            _lse_finite(row.get('stop_loss')), last, pct)
-    if isinstance(options, pd.DataFrame) and not options.empty and 'status' in options.columns:
-        selected = options.loc[options['status'].map(lambda value: classify_outcome(value) == 'ACTIVE')]
-        for row in selected.to_dict('records'):
-            last = _lse_finite(row.get('current_option_price'))
-            pct = _lse_finite(row.get('pnl_pct')) if last is not None and last > 0 else None
-            append_position(str(row.get('option_contract') or 'Unknown option'),
-                            'Option premium · last quote ' + (short_money(last) if last and last > 0 else 'unverified'),
-                            _lse_finite(row.get('entry_premium')),_lse_finite(row.get('target_premium')),
-                            _lse_finite(row.get('stop_loss_premium')),last,pct)
+
+    # Options FIRST: a lone open CE/PE must not be hidden after many shares.
+    for row in active_rows(options, 'date_key'):
+        contract = str(row.get('option_contract') or 'Unknown option')
+        side = 'CE' if re.search(r'(?<![A-Z])CE(?![A-Z])', contract.upper()) else (
+            'PE' if re.search(r'(?<![A-Z])PE(?![A-Z])', contract.upper()) else 'CE/PE')
+        last = _lse_finite(row.get('current_option_price'))
+        marked = last is not None and last > 0
+        pct = _lse_finite(row.get('pnl_pct')) if marked else None
+        subtitle = (f'{side} · saved premium {short_money(last)} · paper only' if marked
+                    else f'{side} · PREMIUM UNVERIFIED · paper only')
+        append_position(contract, subtitle,
+                        _lse_finite(row.get('entry_premium')),
+                        _lse_finite(row.get('target_premium')),
+                        _lse_finite(row.get('stop_loss_premium')),last,pct)
+
+    for row in active_rows(shares, 'date_str'):
+        last = _lse_finite(row.get('latest_price'))
+        marked = last is not None and last > 0
+        pct = _lse_finite(row.get('pnl_pct')) if marked else None
+        append_position(str(row.get('ticker') or 'Unknown share'),
+                        f"Share · last {short_money(last) if marked else 'UNVERIFIED'}",
+                        _lse_finite(row.get('entry_price')),
+                        _lse_finite(row.get('target_price')),
+                        _lse_finite(row.get('stop_loss')),last,pct)
     if not cards:
         return '<div class="lx-empty">No open paper positions recorded yet.</div>'
-    return '<div class="lx-positions">' + ''.join(cards[:max(1,int(limit))]) + '</div>'
+    return '<div class="lx-positions">' + ''.join(cards) + '</div>'
 
 
 def lse_pick_card(name: str, decision: str, sector: str, entry: str, target: str,
@@ -4304,8 +4425,7 @@ with page_preds:
                     f'<span class="lx-side-count">{open_summary["open_total"]} open · saved marks</span></div>',
                     unsafe_allow_html=True)
         st.markdown(lse_open_cards(journal_eq,journal_opt),unsafe_allow_html=True)
-        if open_summary['open_total']>8:
-            st.caption(f'Showing 8 of {open_summary["open_total"]} open records; see Trade ledger for all.')
+        st.caption('All currently open shares, calls and puts are shown above; closed trades remain in the Ledger.')
         st.caption('Dot = latest saved price relative to stop/target · delayed quotes are not guaranteed fills.')
     with main_predictions:
         if st.button('🔎 Find new picks now', key='uk_find_new_picks', type='primary', width='stretch'):
@@ -4701,16 +4821,31 @@ with page_ledger:
     # Cloud sync check is informational: the restore counter may be older
     # than newly written local records. Never delete local history to match it.
     cloud_info = st.session_state.get('hydrate_info') or {}
-    if supabase and 'remote_options' in cloud_info and len(journal_opt) > _int(cloud_info.get('remote_options')):
+    # The restore-time count can be stale. Verify actual IDs once, read-only,
+    # when the local journal is larger than the last cloud snapshot.
+    if (supabase and 'remote_options' in cloud_info and
+            len(journal_opt) > _int(cloud_info.get('remote_options')) and
+            'option_backup_verification' not in st.session_state):
+        st.session_state['option_backup_verification'] = verify_option_cloud_backup(journal_opt)
+    option_check = st.session_state.get('option_backup_verification')
+    if option_check and option_check.get('ok'):
+        st.caption(f"Option backup independently verified: {option_check['local']} local IDs present in Supabase.")
+    elif option_check and option_check.get('missing'):
+        st.warning(f"{len(option_check['missing'])} option journal ID(s) are absent from Supabase; "
+                   'open Backup and recover history to verify or insert missing IDs only.')
+    elif option_check and option_check.get('error'):
+        st.warning('Option backup could not be verified (' + str(option_check['error']) +
+                   '). No existing cloud history was changed.')
+    elif supabase and 'remote_options' in cloud_info and len(journal_opt) > _int(cloud_info.get('remote_options')):
         st.warning(
             f"The local ledger contains {len(journal_opt):,} option ideas, while the last Supabase "
-            f"check saw {_int(cloud_info.get('remote_options')):,}. This may reflect an unsynced "
-            "idea or an older cloud snapshot. Export a backup and verify cloud sync before a restart."
+            f"check saw {_int(cloud_info.get('remote_options')):,}. This can be a stale snapshot. "
+            'Open Backup and recover history, then select Verify option backup IDs.'
         )
     if st.session_state.get('history_close_conflicts'):
-        st.info(f"Cloud and local timestamps/statuses differ on "
+        st.info(f"Cloud and local completed trade outcomes disagree on "
                 f"{st.session_state['history_close_conflicts']} closed record(s). "
-                "Local completed outcomes were preserved; verify the original execution times from the ledger or source backups.")
+                "Local outcomes were preserved; compare cloud backup statuses before any manual repair.")
     render_history_recovery()
     st.caption('No broker orders. Stop-loss fills and estimated model targets are uncertain. Streamlit session auto-refresh is NOT an unattended 10-year service.')
 
